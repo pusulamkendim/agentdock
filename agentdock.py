@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("AGENTDOCK_PORT", "8765"))
-STATE_ROOT = Path.home() / ".agentdock"
+STATE_ROOT = Path(os.environ.get("AGENTDOCK_STATE_ROOT", str(Path.home() / ".agentdock"))).expanduser()
 DB = Path(os.environ.get("AGENTDOCK_DB", str(STATE_ROOT / "agentdock.sqlite3"))).expanduser()
 LEGACY_DB = ROOT / "agentdock.sqlite3"
 WORKTREE_ROOT = STATE_ROOT / "worktrees"
@@ -1027,6 +1027,11 @@ def _app_server_request(method, params=None, timeout=10):
         except Exception:
             try: proc.kill()
             except Exception: pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
 
 
 def _normalize_rate_limits(result):
@@ -1276,6 +1281,14 @@ def write_mission_docs(plan_id):
 
 def parse_codex_final(stdout):
     final = []
+
+    def normalize(value):
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""
+        return json.dumps(value, ensure_ascii=False)
+
     for line in stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -1286,7 +1299,7 @@ def parse_codex_final(stdout):
             continue
         item = obj.get("item") or {}
         if obj.get("type") == "item.completed" and item.get("type") == "agent_message":
-            text = item.get("text") or item.get("message") or ""
+            text = normalize(item.get("text") or item.get("message"))
             if text:
                 final.append(text)
         if obj.get("type") in ("message.completed", "response.completed"):

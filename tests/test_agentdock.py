@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -159,6 +160,71 @@ class ExecutionTests(AgentDockTestCase):
         self.assertEqual(applied["status"], "done")
         self.assertEqual(applied["applied"], 1)
         self.assertEqual(applied["apply_status"], "applied")
+
+    def test_full_mission_pipeline_with_fake_codex(self):
+        repo = self.tmp / "mission-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+        (repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        fake_codex = self.tmp / "codex"
+        fake_codex.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+prompt = args[-1] if args else ""
+print(json.dumps({"type": "thread.started", "thread_id": "fake-thread"}), flush=True)
+print(json.dumps({"type": "turn.started"}), flush=True)
+if "Return ONLY valid JSON with this exact shape" in prompt:
+    result = {"tasks": [
+        {"title": "Inspect repository", "agent_id": "architect", "mode": "read", "depends_on": [], "contract": {"objective": "Inspect repository", "allowed_paths": ["workspace/**"]}},
+        {"title": "Write focused marker", "agent_id": "coder", "mode": "write", "depends_on": [0], "contract": {"objective": "Write focused marker", "allowed_paths": ["src/**"]}},
+    ]}
+elif "final orchestrator synthesis" in prompt.lower():
+    result = "Fake Codex synthesis completed after integration."
+else:
+    if "--sandbox" in args and "workspace-write" in args:
+        os.makedirs("src", exist_ok=True)
+        with open("src/agentdock-fake.txt", "w") as handle:
+            handle.write("integrated\\n")
+    result = "Fake Codex worker completed the contracted task."
+print(json.dumps({"type": "item.completed", "item": {"id": "fake-message", "type": "agent_message", "text": result}}), flush=True)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}), flush=True)
+"""
+        )
+        fake_codex.chmod(0o755)
+        previous_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.tmp}:{previous_path}"
+        plan_id = "plan-full"
+        agentdock.execute(
+            "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,"
+            "max_parallel,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (plan_id, "fake mission", str(repo), "fake", "planning", agentdock.now(), "gpt-5.6-sol", "gpt-5.6-luna", 2, "high", "medium", "default", "default", json.dumps(agentdock.RECOVERY_DEFAULTS)),
+        )
+        try:
+            with patch.object(agentdock, "quota_status", return_value={"status": "ok", "available": True}):
+                agentdock.build_plan(plan_id)
+                agentdock.execute("UPDATE plans SET status='approved',approved_at=? WHERE id=?", (agentdock.now(), plan_id))
+                agentdock.run_plan(plan_id)
+            self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "awaiting_apply")
+            agentdock.apply_plan(plan_id)
+            plan = agentdock.one("SELECT status,applied,apply_status FROM plans WHERE id=?", (plan_id,))
+            self.assertEqual(plan["status"], "done")
+            self.assertEqual(plan["applied"], 1)
+            self.assertEqual(plan["apply_status"], "applied")
+            self.assertEqual((repo / "src" / "agentdock-fake.txt").read_text(), "integrated\n")
+        finally:
+            os.environ["PATH"] = previous_path
 
 
 if __name__ == "__main__":

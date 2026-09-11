@@ -131,6 +131,12 @@ Runtime state:
 ~/.agentdock/agentdock.sqlite3
 ```
 
+For an isolated installation or smoke test, override the state directory:
+
+```bash
+AGENTDOCK_STATE_ROOT=/tmp/agentdock-state ./run-agentdock.sh
+```
+
 Human-readable mission mirror:
 
 ```text
