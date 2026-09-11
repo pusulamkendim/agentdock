@@ -44,7 +44,15 @@ class AgentDockTestCase(unittest.TestCase):
             (plan_id, goal, str(workspace), "test", "planning", agentdock.now(), "gpt-5.6-sol", "gpt-5.6-luna", 2, "high", "medium", "default", "default"),
         )
         with patch.object(agentdock, "quota_status", return_value={"status": "ok", "available": True}), patch.object(
-            agentdock, "run_orchestrator", return_value=(json.dumps(result), "gpt-5.6-sol")
+            agentdock,
+            "run_mission_orchestrator_turn",
+            return_value={
+                "text": json.dumps(result),
+                "model": "gpt-5.6-sol",
+                "thread_id": "test-orchestrator-thread",
+                "turn_id": "test-orchestrator-turn",
+                "turn_record_id": "test-orchestrator-turn-record",
+            },
         ):
             agentdock.build_plan(plan_id)
         return agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,))
@@ -72,6 +80,44 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "attention")
         self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", ("task-1",))["status"], "attention")
         self.assertEqual(agentdock.one("SELECT status FROM agent_sessions WHERE id=?", ("session-1",))["status"], "interrupted")
+        self.assertEqual(agentdock.one("SELECT restart_recovery_pending FROM plans WHERE id=?", (plan_id,))["restart_recovery_pending"], 1)
+
+    def test_restart_retry_preserves_completed_task_checkpoints(self):
+        plan_id = self.add_plan("checkpoint-plan", status="running")
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,status,output) VALUES(?,?,?,?,?,?,?)",
+            ("done-task", plan_id, 0, "Done", "Done", "done", "preserved result"),
+        )
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,status) VALUES(?,?,?,?,?,?)",
+            ("running-task", plan_id, 1, "Running", "Running", "running"),
+        )
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,mode,status,commit_hash) VALUES(?,?,?,?,?,?,?,?)",
+            ("unintegrated-write", plan_id, 2, "Unintegrated write", "Unintegrated write", "write", "executed", "worker-commit"),
+        )
+        agentdock.recover_orphaned_runs()
+        plan = agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,))
+        agentdock.reset_plan_for_retry(plan, preserve_completed=True)
+        done = agentdock.one("SELECT status,output FROM tasks WHERE id=?", ("done-task",))
+        pending = agentdock.one("SELECT status,output FROM tasks WHERE id=?", ("running-task",))
+        unintegrated = agentdock.one("SELECT status,commit_hash FROM tasks WHERE id=?", ("unintegrated-write",))
+        self.assertEqual(done, {"status": "done", "output": "preserved result"})
+        self.assertEqual(pending, {"status": "pending", "output": ""})
+        self.assertEqual(unintegrated, {"status": "pending", "commit_hash": ""})
+        self.assertEqual(agentdock.one("SELECT restart_recovery_pending FROM plans WHERE id=?", (plan_id,))["restart_recovery_pending"], 0)
+
+    def test_restart_requeues_an_interrupted_consultation(self):
+        plan_id = self.add_plan("consult-restart", status="running")
+        agentdock.execute(
+            "INSERT INTO consultations(id,plan_id,status,question,created_at) VALUES(?,?,?,?,?)",
+            ("restart-consult", plan_id, "resolving", "Which choice?", agentdock.now()),
+        )
+        agentdock.recover_orphaned_runs()
+        consultation = agentdock.one("SELECT status,resolved_at,orchestrator_response_json FROM consultations WHERE id=?", ("restart-consult",))
+        self.assertEqual(consultation["status"], "queued")
+        self.assertIsNone(consultation["resolved_at"])
+        self.assertEqual(consultation["orchestrator_response_json"], "{}")
 
     def test_plan_lock_is_idempotent(self):
         self.assertTrue(agentdock.claim_plan_run("plan-1"))
@@ -103,6 +149,15 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         self.assertFalse(contract["additionalProperties"])
         self.assertEqual(set(contract["required"]), set(contract["properties"]))
         self.assertFalse(contract["properties"]["scope"]["additionalProperties"])
+
+    def test_consultation_schema_is_strict_and_supports_null_contract(self):
+        payload = json.loads(agentdock.consultation_schema_path().read_text())
+        self.assertEqual(payload["required"], ["action", "reason", "worker_message", "revised_contract", "questions", "evidence"])
+        self.assertFalse(payload["additionalProperties"])
+        revised = payload["properties"]["revised_contract"]["anyOf"]
+        self.assertEqual(revised[1], {"type": "object", "maxProperties": 0, "additionalProperties": False})
+        self.assertEqual(revised[2], {"type": "null"})
+        self.assertFalse(revised[0]["additionalProperties"])
 
     def test_planner_disposition_invariants_reject_invalid_task_counts(self):
         with self.assertRaisesRegex(ValueError, "requires at least one task"):
@@ -145,6 +200,148 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         self.assertEqual(snapshot["remotes"][0]["name"], "sites-origin")
         self.assertTrue(snapshot["working_tree_clean"])
         self.assertEqual((repo / ".git" / "info" / "exclude").read_text(), before)
+
+    def test_read_fingerprint_uses_the_existing_dirty_state_as_baseline(self):
+        repo = self.tmp / "fingerprint-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+        (repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"],
+            check=True, capture_output=True, text=True,
+        )
+        (repo / "README.md").write_text("user change\n")
+        (repo / "notes.txt").write_text("user file\n")
+        baseline = agentdock.workspace_fingerprint(repo)
+        after = agentdock.validate_read_workspace(repo, baseline=baseline)
+        self.assertEqual(agentdock.fingerprint_diff(baseline, after), [])
+        (repo / "notes.txt").write_text("agent changed the user file\n")
+        with self.assertRaisesRegex(RuntimeError, "değişen alan/dosyalar"):
+            agentdock.validate_read_workspace(repo, baseline=baseline)
+
+
+class OrchestratorCoordinationTests(AgentDockTestCase):
+    def _orchestrator_plan(self, plan_id="orchestrator-plan"):
+        agentdock.execute(
+            "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,orchestrator_thread_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (plan_id, "coordinate a task", str(self.tmp), "test", "running", agentdock.now(), "gpt-5.6-sol", "gpt-5.6-luna", 2, "high", "medium", "default", "default", ""),
+        )
+        return agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,))
+
+    def test_mission_gateway_reuses_one_orchestrator_thread(self):
+        plan = self._orchestrator_plan()
+        calls = []
+
+        def fake_orchestrator(*args, **kwargs):
+            resume = kwargs.get("resume_thread_id") or ""
+            calls.append(resume)
+            sid = agentdock.create_agent_session(
+                plan["id"], agentdock.orchestrator_log_id(plan["id"]), "orchestrator",
+                "gpt-5.6-sol", "high", "default", "read", self.tmp,
+            )
+            thread = "mission-thread"
+            agentdock.execute("UPDATE agent_sessions SET thread_id=?,turn_id=? WHERE id=?", (thread, f"turn-{len(calls)}", sid))
+            return "orchestrator result", "gpt-5.6-sol"
+
+        with patch.object(agentdock, "run_orchestrator", side_effect=fake_orchestrator):
+            first = agentdock.run_mission_orchestrator_turn(plan["id"], "initial_disposition", "initial")
+            second = agentdock.run_mission_orchestrator_turn(plan["id"], "manual_message", "continue")
+
+        self.assertEqual(calls, ["", "mission-thread"])
+        self.assertEqual(first["thread_id"], second["thread_id"])
+        stored = agentdock.one("SELECT orchestrator_thread_id,orchestrator_last_turn_id,orchestrator_turn_status FROM plans WHERE id=?", (plan["id"],))
+        self.assertEqual(stored["orchestrator_thread_id"], "mission-thread")
+        self.assertEqual(stored["orchestrator_last_turn_id"], "turn-2")
+        self.assertEqual(stored["orchestrator_turn_status"], "completed")
+        self.assertEqual(agentdock.one("SELECT COUNT(*) c FROM orchestrator_turns WHERE plan_id=?", (plan["id"],))["c"], 2)
+
+    def test_worker_consultation_resumes_the_same_worker_thread_with_handoff(self):
+        plan = self._orchestrator_plan("consult-plan")
+        task_id = "consult-task"
+        contract = {
+            "objective": "Choose the bounded contact behavior",
+            "allowed_paths": ["src/**"],
+            "scope": {"in_scope": ["contact behavior"], "out_of_scope": ["unrelated UI"]},
+        }
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json,worker_thread_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, plan["id"], 0, "Implement contact behavior", "Choose the bounded contact behavior", "coder", "read", "[]", "pending", json.dumps(contract), "worker-thread"),
+        )
+        agentdock.execute(
+            "INSERT INTO agent_sessions(id,plan_id,task_id,kind,thread_id,status,started_at) VALUES(?,?,?,?,?,?,?)",
+            ("worker-session", plan["id"], task_id, "worker", "worker-thread", "completed", agentdock.now()),
+        )
+        task = agentdock.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        output = json.dumps({
+            "type": "needs_orchestrator",
+            "question": "Which contact behavior is allowed?",
+            "reason": "No verified contact details exist.",
+            "evidence": ["No mailto or tel links found."],
+            "options": ["Omit the field", "Link to the existing tool"],
+        })
+        consultation = agentdock.create_worker_consultation(plan, task, output)
+        response = {
+            "action": "answer_worker",
+            "reason": "Use the existing tool link.",
+            "worker_message": "Do not invent contact details; link only to the existing tool.",
+            "revised_contract": None,
+            "questions": [],
+            "evidence": ["The existing tool is present."],
+        }
+        with patch.object(
+            agentdock,
+            "run_mission_orchestrator_turn",
+            return_value={"text": json.dumps(response), "model": "gpt-5.6-sol", "thread_id": "mission-thread", "turn_id": "turn-2"},
+        ):
+            resolved = agentdock.resolve_worker_consultation(plan, task, result={"waiting_for_orchestrator": True, "consultation": consultation})
+        self.assertTrue(resolved["retry"])
+        updated = agentdock.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        self.assertEqual(updated["status"], "pending")
+        self.assertEqual(updated["worker_thread_id"], "worker-thread")
+        self.assertIn("ROOT ORCHESTRATOR DECISION", updated["worker_resume_message"])
+        self.assertEqual(updated["consultation_id"], "")
+
+        captured = {}
+
+        def fake_worker(prompt, workspace, mode, model, task_id, effort, tier, **kwargs):
+            captured.update(prompt=prompt, resume=kwargs.get("resume_thread_id"))
+            return "continued worker result"
+
+        with patch.object(agentdock, "run_codex", side_effect=fake_worker):
+            result = agentdock.run_task_once(plan, updated, self.tmp)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(captured["resume"], "worker-thread")
+        self.assertIn("Do not invent contact details", captured["prompt"])
+        self.assertEqual(agentdock.one("SELECT worker_resume_message,status FROM tasks WHERE id=?", (task_id,))["status"], "executed")
+
+    def test_user_answer_is_persisted_before_same_thread_resolution(self):
+        plan = self._orchestrator_plan("user-answer-plan")
+        task_id = "user-answer-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json,worker_thread_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, plan["id"], 0, "Need a product choice", "Need a product choice", "researcher", "read", "[]", "waiting_for_user", json.dumps({}), "worker-thread"),
+        )
+        agentdock.execute(
+            "INSERT INTO consultations(id,plan_id,task_id,status,question,reason,evidence_json,options_json,worker_thread_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("consult-user", plan["id"], task_id, "waiting_for_user", "Which link should be shown?", "No verified contact exists.", json.dumps(["No mailto link found"]), json.dumps(["Existing tool"]), "worker-thread", agentdock.now()),
+        )
+        agentdock.execute(
+            "UPDATE plans SET pending_question_id=?,pending_question_json=?,status=? WHERE id=?",
+            ("consult-user", json.dumps({"kind": "execution_question", "consultation_id": "consult-user", "question": "Which link should be shown?"}), "waiting_for_user", plan["id"]),
+        )
+        response = {"action": "answer_worker", "reason": "Use the existing tool.", "worker_message": "Link only to the existing tool.", "revised_contract": None, "questions": [], "evidence": []}
+        with patch.object(
+            agentdock,
+            "run_mission_orchestrator_turn",
+            return_value={"text": json.dumps(response), "model": "gpt-5.6-sol", "thread_id": "mission-thread", "turn_id": "turn-answer"},
+        ), patch.object(agentdock, "claim_plan_run", return_value=False):
+            result = agentdock.answer_consultation(plan["id"], "consult-user", "Use the existing tool only.")
+        self.assertTrue(result["ok"], result)
+        saved = agentdock.one("SELECT status,user_answer_json FROM consultations WHERE id=?", ("consult-user",))
+        self.assertEqual(saved["status"], "resolved")
+        self.assertIn("Use the existing tool only.", saved["user_answer_json"])
+        self.assertEqual(agentdock.one("SELECT status,pending_question_id FROM plans WHERE id=?", (plan["id"],)), {"status": "approved", "pending_question_id": ""})
 
 
 class MissionDispositionTests(AgentDockTestCase):
@@ -348,6 +545,40 @@ class ExecutionTests(AgentDockTestCase):
         self.assertEqual(plan["status"], "waiting_for_user")
         self.assertEqual(plan["preflight_status"], "ready")
         self.assertIn("Write tasks remain paused", plan["summary"])
+
+    def test_waiting_consultation_does_not_pause_independent_read_task(self):
+        plan_id = self.add_plan("parallel-consult", status="approved")
+        consultation_task = "consult-waiting"
+        independent_task = "independent-read"
+        for values in [
+            (consultation_task, plan_id, 0, "Needs a decision", "Needs a decision", "architect", "read", "[]", "waiting_for_orchestrator", "{}"),
+            (independent_task, plan_id, 1, "Independent inspection", "Independent inspection", "researcher", "read", "[]", "pending", "{}"),
+        ]:
+            agentdock.execute(
+                "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json,consultation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (*values, "queued-consult" if values[0] == consultation_task else ""),
+            )
+        agentdock.execute(
+            "INSERT INTO consultations(id,plan_id,task_id,status,question,created_at) VALUES(?,?,?,?,?,?)",
+            ("queued-consult", plan_id, consultation_task, "queued", "Which behavior?", agentdock.now()),
+        )
+        events = []
+
+        def fake_parallel(plan, task, ctx, wave_base_commit):
+            events.append("task")
+            return {"task": task, "ok": True, "write": False, "output": "independent result"}
+
+        def fake_resolve(plan, task, result=None, ctx=None, user_answer=None):
+            events.append("consultation")
+            return {"waiting_for_user": True}
+
+        with patch.object(agentdock, "run_preflight", return_value={}), patch.object(
+            agentdock, "run_parallel_task", side_effect=fake_parallel
+        ), patch.object(agentdock, "resolve_worker_consultation", side_effect=fake_resolve):
+            agentdock.run_plan(plan_id)
+
+        self.assertEqual(events, ["task", "consultation"])
+        self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", (independent_task,))["status"], "done")
 
     def test_write_preflight_waits_without_mutating_user_files_or_ignore_rules(self):
         repo = self.tmp / "dirty-repo"

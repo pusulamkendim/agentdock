@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import concurrent.futures
 import base64
+import hashlib
 import mimetypes
 import json
 import os
@@ -46,6 +47,8 @@ MODEL_CATALOG_CACHE = {"ts": 0.0, "value": []}
 MODEL_CATALOG_LOCK = threading.RLock()
 QUOTA_CACHE = {"ts": 0.0, "value": {"status": "idle", "available": False}, "refreshing": False}
 QUOTA_LOCK = threading.RLock()
+ORCHESTRATOR_TURN_LOCKS = {}
+ORCHESTRATOR_TURN_LOCKS_LOCK = threading.RLock()
 
 DEFAULT_ORCHESTRATOR = "gpt-5.6-sol"
 DEFAULT_WORKER = "gpt-5.6-luna"
@@ -63,6 +66,18 @@ MISSION_DECISIONS = {
     "execute",
 }
 NO_TASK_DECISIONS = {"already_satisfied", "answer_only", "needs_user_input", "blocked"}
+ORCHESTRATOR_PURPOSES = {
+    "initial_disposition",
+    "user_answer",
+    "worker_consultation",
+    "failure_recovery",
+    "contract_revision",
+    "checkpoint_summary",
+    "final_synthesis",
+    "manual_message",
+    "reconstruct",
+}
+ORCHESTRATOR_ACTIONS = {"answer_worker", "revise_contract", "ask_user", "block_mission"}
 CODEX_TRANSPORT = os.environ.get("AGENTDOCK_CODEX_TRANSPORT", "exec").strip().lower()
 RECOVERY_DEFAULTS = {
     # Preflight is intentionally observational. These keys remain in the
@@ -159,11 +174,47 @@ PLANNER_SCHEMA = {
     "additionalProperties": False,
 }
 
+CONSULTATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["answer_worker", "revise_contract", "ask_user", "block_mission"],
+        },
+        "reason": {"type": "string"},
+        "worker_message": {"type": "string"},
+        "revised_contract": {"type": "object", "additionalProperties": True},
+        "questions": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+        "evidence": {"type": "array", "items": {"type": "string"}, "maxItems": 32},
+    },
+    "required": ["action", "reason", "worker_message", "revised_contract", "questions", "evidence"],
+    "additionalProperties": False,
+}
+# Structured-output providers require every object to declare its property
+# policy. Reuse the planner's complete task contract and allow null when the
+# response is an answer-only or user-question action.
+CONSULTATION_SCHEMA["properties"]["revised_contract"] = {
+    "anyOf": [
+        json.loads(json.dumps(PLANNER_SCHEMA["properties"]["tasks"]["items"]["properties"]["contract"])),
+        {"type": "object", "maxProperties": 0, "additionalProperties": False},
+        {"type": "null"},
+    ]
+}
+
 
 def planner_schema_path():
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     path = STATE_ROOT / "planner.schema.json"
     expected = json.dumps(PLANNER_SCHEMA, ensure_ascii=False, indent=2) + "\n"
+    if not path.exists() or path.read_text(errors="replace") != expected:
+        path.write_text(expected)
+    return path
+
+
+def consultation_schema_path():
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = STATE_ROOT / "orchestrator.consultation.schema.json"
+    expected = json.dumps(CONSULTATION_SCHEMA, ensure_ascii=False, indent=2) + "\n"
     if not path.exists() or path.read_text(errors="replace") != expected:
         path.write_text(expected)
     return path
@@ -256,6 +307,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS agent_sessions(
           id TEXT PRIMARY KEY, plan_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
           kind TEXT NOT NULL DEFAULT 'worker', thread_id TEXT NOT NULL DEFAULT '',
+          turn_id TEXT NOT NULL DEFAULT '',
           model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '',
           service_tier TEXT NOT NULL DEFAULT 'default', mode TEXT NOT NULL DEFAULT 'read',
           cwd TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'running',
@@ -279,6 +331,26 @@ def init_db():
           status TEXT NOT NULL DEFAULT 'queued', error TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS task_messages_task_idx ON task_messages(task_id,ts);
+        CREATE TABLE IF NOT EXISTS orchestrator_turns(
+          id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '',
+          turn_id TEXT NOT NULL DEFAULT '', purpose TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued', context_json TEXT NOT NULL DEFAULT '{}',
+          response_text TEXT NOT NULL DEFAULT '', response_json TEXT NOT NULL DEFAULT '{}',
+          usage_json TEXT NOT NULL DEFAULT '{}',
+          error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+          started_at INTEGER, finished_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS orchestrator_turns_plan_idx ON orchestrator_turns(plan_id,created_at,id);
+        CREATE TABLE IF NOT EXISTS consultations(
+          id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, task_id TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'queued', question TEXT NOT NULL DEFAULT '',
+          reason TEXT NOT NULL DEFAULT '', evidence_json TEXT NOT NULL DEFAULT '[]',
+          options_json TEXT NOT NULL DEFAULT '[]', orchestrator_response_json TEXT NOT NULL DEFAULT '{}',
+          user_questions_json TEXT NOT NULL DEFAULT '[]', user_answer_json TEXT NOT NULL DEFAULT '{}',
+          worker_thread_id TEXT NOT NULL DEFAULT '', orchestrator_thread_id TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL, resolved_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS consultations_plan_idx ON consultations(plan_id,created_at,id);
         """
     )
     con.commit()
@@ -324,6 +396,16 @@ def init_db():
         ("final_response", "TEXT NOT NULL DEFAULT ''"),
         ("workspace_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("replan_note", "TEXT NOT NULL DEFAULT ''"),
+        ("orchestrator_thread_id", "TEXT NOT NULL DEFAULT ''"),
+        ("orchestrator_generation", "INTEGER NOT NULL DEFAULT 1"),
+        ("orchestrator_turn_status", "TEXT NOT NULL DEFAULT ''"),
+        ("orchestrator_last_turn_id", "TEXT NOT NULL DEFAULT ''"),
+        ("orchestrator_last_error", "TEXT NOT NULL DEFAULT ''"),
+        ("pending_question_id", "TEXT NOT NULL DEFAULT ''"),
+        ("pending_question_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("legacy_orchestrator_status", "TEXT NOT NULL DEFAULT ''"),
+        ("workspace_choice_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("restart_recovery_pending", "INTEGER NOT NULL DEFAULT 0"),
     ]:
         ensure_column("plans", name, ddl)
     for name, ddl in [
@@ -341,8 +423,15 @@ def init_db():
         ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
         ("last_failure_kind", "TEXT NOT NULL DEFAULT ''"),
         ("repair_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("worker_thread_id", "TEXT NOT NULL DEFAULT ''"),
+        ("worker_resume_message", "TEXT NOT NULL DEFAULT ''"),
+        ("waiting_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("consultation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("baseline_fingerprint_json", "TEXT NOT NULL DEFAULT '{}'"),
     ]:
         ensure_column("tasks", name, ddl)
+    ensure_column("agent_sessions", "turn_id", "TEXT NOT NULL DEFAULT ''")
+    ensure_column("orchestrator_turns", "usage_json", "TEXT NOT NULL DEFAULT '{}'")
 
     con = db()
     cur = con.cursor()
@@ -361,6 +450,7 @@ def init_db():
     con.close()
 
     planner_schema_path()
+    consultation_schema_path()
     recover_orphaned_runs()
 
     # v0.7: materialize existing repository paths as first-class workspaces.
@@ -383,6 +473,7 @@ def init_db():
             con.execute("UPDATE plans SET workspace_id=? WHERE id=?", (wid,pl["id"]))
     con.commit()
     con.close()
+    migrate_legacy_orchestrator_state()
 
 
 def recover_orphaned_runs():
@@ -393,7 +484,14 @@ def recover_orphaned_runs():
         plans = con.execute(
             "SELECT id FROM plans WHERE status IN ('preflight','running')"
         ).fetchall()
+        # A process can stop after an answer is durably recorded but before the
+        # same orchestrator turn resolves it. Requeue that consultation while
+        # preserving the user's answer for the next attempt.
+        con.execute(
+            "UPDATE consultations SET status='queued',orchestrator_response_json='{}',resolved_at=NULL WHERE status='resolving'"
+        )
         if not plans:
+            con.commit()
             con.close()
             return 0
         plan_ids = [r["id"] for r in plans]
@@ -405,8 +503,12 @@ def recover_orphaned_runs():
             (message, interrupted_at, message, *plan_ids),
         )
         con.execute(
+            f"UPDATE plans SET restart_recovery_pending=1 WHERE id IN ({placeholders})",
+            plan_ids,
+        )
+        con.execute(
             f"UPDATE tasks SET status='attention', error=?, finished_at=? "
-            f"WHERE plan_id IN ({placeholders}) AND status IN ('running','executed')",
+            f"WHERE plan_id IN ({placeholders}) AND status='running'",
             (message, interrupted_at, *plan_ids),
         )
         con.execute(
@@ -414,12 +516,71 @@ def recover_orphaned_runs():
             f"WHERE plan_id IN ({placeholders}) AND status='running'",
             (interrupted_at, *plan_ids),
         )
+        con.execute(
+            f"UPDATE plans SET orchestrator_turn_status=?,orchestrator_last_error=? "
+            f"WHERE id IN ({placeholders}) AND orchestrator_turn_status='running'",
+            ("attention", message, *plan_ids),
+        )
+        con.execute(
+            f"UPDATE orchestrator_turns SET status=?,error=?,finished_at=? "
+            f"WHERE plan_id IN ({placeholders}) AND status='running'",
+            ("failed", message, interrupted_at, *plan_ids),
+        )
         con.commit()
         con.close()
     for plan_id in plan_ids:
         log(orchestrator_log_id(plan_id), "supervisor", message)
         write_mission_docs(plan_id)
     return len(plan_ids)
+
+
+def migrate_legacy_orchestrator_state():
+    """Bind old missions to an existing thread without silently creating one."""
+    plans = rows("SELECT * FROM plans ORDER BY created_at")
+    for plan in plans:
+        sessions = rows(
+            """SELECT thread_id,kind,started_at FROM agent_sessions
+               WHERE plan_id=? AND kind LIKE '%orchestrator%' AND thread_id!=''
+               ORDER BY started_at,id""",
+            (plan["id"],),
+        )
+        distinct = []
+        for session in sessions:
+            if session["thread_id"] not in distinct:
+                distinct.append(session["thread_id"])
+        current = str(plan.get("orchestrator_thread_id") or "")
+        legacy = str(plan.get("legacy_orchestrator_status") or "")
+        if current and legacy:
+            continue
+        if distinct:
+            preferred = next(
+                (s["thread_id"] for s in sessions if s.get("kind") == "orchestrator"),
+                distinct[0],
+            )
+            if len(distinct) == 1:
+                status = "adopted"
+                message = "Legacy mission: existing orchestrator thread adopted."
+            else:
+                status = "reconciliation_required"
+                message = (
+                    "Legacy mission had multiple orchestrator threads; the earliest planner "
+                    "thread was adopted and history reconciliation is required."
+                )
+            execute(
+                """UPDATE plans SET orchestrator_thread_id=?,orchestrator_generation=?,
+                   legacy_orchestrator_status=?,orchestrator_last_error=? WHERE id=?""",
+                (current or preferred, int(plan.get("orchestrator_generation") or 1), status, message, plan["id"]),
+            )
+            log(orchestrator_log_id(plan["id"]), "supervisor", message)
+            write_mission_docs(plan["id"])
+        elif not current and not legacy and plan.get("status") not in ("done", "cancelled"):
+            message = "Legacy mission: unified orchestrator session must be reconstructed explicitly."
+            execute(
+                "UPDATE plans SET legacy_orchestrator_status=?,orchestrator_last_error=? WHERE id=?",
+                ("reconstruct_required", message, plan["id"]),
+            )
+            log(orchestrator_log_id(plan["id"]), "supervisor", message)
+            write_mission_docs(plan["id"])
 
 
 def rows(sql, args=()):
@@ -605,6 +766,20 @@ def record_codex_event(session_id, task_id, plan_id, raw_line):
         thread_id = str(obj.get("thread_id") or thread.get("id") or "")
         if thread_id:
             execute("UPDATE agent_sessions SET thread_id=? WHERE id=?", (thread_id, session_id))
+            # Bind the mission as soon as the first planner event exposes the
+            # thread. Never replace an already-bound thread from an ordinary
+            # resume; the gateway performs the hard mismatch check after the
+            # turn completes.
+            if plan_id and str(task_id or "") == orchestrator_log_id(plan_id):
+                execute(
+                    "UPDATE plans SET orchestrator_thread_id=? WHERE id=? AND (orchestrator_thread_id='' OR orchestrator_thread_id=?)",
+                    (thread_id, plan_id, thread_id),
+                )
+    if typ in ("turn.started", "turn/started"):
+        turn = obj.get("turn") if isinstance(obj.get("turn"), dict) else params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        turn_id = str(obj.get("turn_id") or params.get("turnId") or turn.get("id") or "")
+        if turn_id:
+            execute("UPDATE agent_sessions SET turn_id=? WHERE id=?", (turn_id, session_id))
     return obj
 
 
@@ -614,7 +789,7 @@ def finish_agent_session(session_id, status, final_response=""):
 
 
 def latest_agent_session(task_id):
-    return one("SELECT * FROM agent_sessions WHERE task_id=? ORDER BY started_at DESC LIMIT 1", (task_id,))
+    return one("SELECT * FROM agent_sessions WHERE task_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1", (task_id,))
 
 
 def latest_log_segment(items, marker):
@@ -824,6 +999,155 @@ def workspace_snapshot(workspace):
         },
     })
     return snapshot
+
+
+FINGERPRINT_MAX_FILES = 2000
+FINGERPRINT_MAX_HASH_BYTES = 64 * 1024 * 1024
+FINGERPRINT_MAX_TOTAL_HASH_BYTES = 256 * 1024 * 1024
+FINGERPRINT_SKIP_DIRS = {".git", ".agentdock", "node_modules", ".venv", "venv"}
+
+
+def _is_agentdock_state_path(path):
+    target = Path(path).expanduser().resolve()
+    for base in (STATE_ROOT, MISSION_ROOT, WORKTREE_ROOT, ATTACHMENT_ROOT):
+        try:
+            target.relative_to(Path(base).expanduser().resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _sha256_file(path, max_bytes=None):
+    digest = hashlib.sha256()
+    remaining = max_bytes
+    try:
+        with Path(path).open("rb") as handle:
+            while True:
+                size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
+                if size <= 0:
+                    break
+                chunk = handle.read(size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+        return digest.hexdigest()
+    except (OSError, ValueError):
+        return ""
+
+
+def _path_metadata(root, path, hash_budget):
+    rel = str(Path(path).relative_to(root)).replace(os.sep, "/")
+    try:
+        stat = Path(path).lstat()
+    except OSError:
+        return {"path": rel, "missing": True}
+    item = {
+        "path": rel,
+        "type": "symlink" if Path(path).is_symlink() else ("directory" if Path(path).is_dir() else "file"),
+        "size": int(stat.st_size),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+    }
+    if item["type"] == "file" and item["size"] <= FINGERPRINT_MAX_HASH_BYTES and hash_budget[0] + item["size"] <= FINGERPRINT_MAX_TOTAL_HASH_BYTES:
+        item["sha256"] = _sha256_file(path)
+        hash_budget[0] += item["size"]
+    elif item["type"] == "file":
+        item["sha256"] = ""
+        item["sha256_skipped"] = True
+    return item
+
+
+def _git_patch_hash(repo_root, *args):
+    result = git_read(repo_root, "diff", *args, check=False)
+    return hashlib.sha256((result.stdout or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def workspace_fingerprint(workspace):
+    """Capture the workspace state before/after a read worker without requiring a clean tree."""
+    resolved = Path(workspace).expanduser().resolve()
+    info = repo_info(resolved)
+    fingerprint = {
+        "workspace": str(resolved),
+        "kind": "git" if info.get("is_git") else "filesystem",
+        "captured_at": now(),
+    }
+    budget = [0]
+    if info.get("is_git"):
+        root = Path(info["root"])
+        entries = [
+            entry for entry in git_status_entries(root)
+            if not _is_agentdock_state_path(root / entry.get("path", ""))
+        ]
+        manifest = []
+        for entry in entries:
+            if entry.get("xy") != "??":
+                continue
+            target = root / entry["path"]
+            if target.exists() or target.is_symlink():
+                manifest.append(_path_metadata(root, target, budget))
+            else:
+                manifest.append({"path": entry["path"], "missing": True})
+        manifest.sort(key=lambda x: x.get("path", ""))
+        fingerprint.update({
+            "root": str(root),
+            "head": info.get("head") or "",
+            "branch": info.get("branch") or "",
+            "staged_diff_hash": _git_patch_hash(root, "--cached", "--binary"),
+            "unstaged_diff_hash": _git_patch_hash(root, "--binary"),
+            "status_entries": sorted(
+                [{k: v for k, v in entry.items() if k in ("xy", "path", "old_path")} for entry in entries],
+                key=lambda x: (x.get("path", ""), x.get("xy", "")),
+            ),
+            "untracked_manifest": manifest[:FINGERPRINT_MAX_FILES],
+        })
+        return fingerprint
+
+    manifest = []
+    if resolved.is_dir():
+        for current, dirs, files in os.walk(resolved, followlinks=False):
+            dirs[:] = sorted(
+                d for d in dirs
+                if d not in FINGERPRINT_SKIP_DIRS and not _is_agentdock_state_path(Path(current) / d)
+            )
+            files = sorted(files)
+            for name in files:
+                if len(manifest) >= FINGERPRINT_MAX_FILES:
+                    break
+                path = Path(current) / name
+                if (path.is_symlink() or path.is_file()) and not _is_agentdock_state_path(path):
+                    manifest.append(_path_metadata(resolved, path, budget))
+            if len(manifest) >= FINGERPRINT_MAX_FILES:
+                break
+    fingerprint["manifest"] = sorted(manifest, key=lambda x: x.get("path", ""))
+    return fingerprint
+
+
+def _comparable_fingerprint(value):
+    if not isinstance(value, dict):
+        return value
+    return {key: val for key, val in value.items() if key != "captured_at"}
+
+
+def fingerprint_diff(before, after):
+    """Return human-readable changed paths/fields between two fingerprints."""
+    before = _comparable_fingerprint(before or {})
+    after = _comparable_fingerprint(after or {})
+    if before == after:
+        return []
+    changes = []
+    for key in ("kind", "root", "head", "branch", "staged_diff_hash", "unstaged_diff_hash", "status_entries"):
+        if before.get(key) != after.get(key):
+            changes.append(key)
+    before_manifest = {x.get("path"): x for x in (before.get("untracked_manifest") or before.get("manifest") or []) if isinstance(x, dict)}
+    after_manifest = {x.get("path"): x for x in (after.get("untracked_manifest") or after.get("manifest") or []) if isinstance(x, dict)}
+    for path in sorted(set(before_manifest) | set(after_manifest)):
+        if before_manifest.get(path) != after_manifest.get(path):
+            changes.append(path or "<unknown path>")
+    if not changes:
+        changes.append("workspace fingerprint")
+    return changes[:100]
 
 
 def safe_generated_target(repo_root, rel_path):
@@ -1041,9 +1365,15 @@ def run_preflight(plan, has_write, phase="execution"):
         unknown = [e["path"] for e in entries if e["xy"] == "??"]
         affected = [e["path"] for e in entries]
         report["affected_paths"] = affected[:100]
+        accepted_paths = set(safe_json(plan.get("workspace_choice_json"), []))
         if has_write and affected:
-            report["blockers"].append("User changes detected; isolated write execution needs an explicit workspace choice: " + "; ".join(affected[:12]))
-            report["action_options"] = preflight_action_options(has_write, affected, has_read)
+            if phase == "execution" and set(affected).issubset(accepted_paths):
+                report["warnings"].append("User explicitly accepted the current changed paths for isolated execution.")
+                report["checks"].append("Working tree choice recorded; isolated writes will use a clean worktree base")
+                log(doctor_log_id(plan_id), "system", "✓ explicit workspace choice recorded for current changes")
+            else:
+                report["blockers"].append("User changes detected; isolated write execution needs an explicit workspace choice: " + "; ".join(affected[:12]))
+                report["action_options"] = preflight_action_options(has_write, affected, has_read)
         elif has_write:
             report["checks"].append("Working tree clean")
             log(doctor_log_id(plan_id), "system", "✓ working tree clean")
@@ -1122,6 +1452,7 @@ def apply_preflight_action(plan_id, action, selected=None):
     root = Path(info["root"])
     selected_rows = selected_preflight_paths(root, plan_id, selected) if action in {"ignore", "stage", "move"} else []
     changed = []
+    accepted_paths = set(safe_json(plan.get("workspace_choice_json"), []))
     if action == "ignore":
         common = _git_dir(root, common=True)
         exclude = common / "info" / "exclude"
@@ -1142,6 +1473,11 @@ def apply_preflight_action(plan_id, action, selected=None):
     elif action == "stage":
         git(root, "add", "--", *[rel for rel, _, _ in selected_rows])
         changed = [rel for rel, _, _ in selected_rows]
+        accepted_paths.update(changed)
+        execute(
+            "UPDATE plans SET workspace_choice_json=? WHERE id=?",
+            (json.dumps(sorted(accepted_paths), ensure_ascii=False), plan_id),
+        )
         log(orchestrator_log_id(plan_id), "supervisor", "user explicitly staged files (no commit created): " + ", ".join(changed))
     elif action == "move":
         safe_root = ATTACHMENT_ROOT / plan_id / "preflight-preserved"
@@ -1190,32 +1526,90 @@ def apply_preflight_action(plan_id, action, selected=None):
     return {"ok": True, "status": "awaiting_apply", "report": latest_report, "changed": changed}
 
 
-def reset_plan_for_retry(plan):
+def reset_plan_for_retry(plan, preserve_completed=False):
     plan_id = plan["id"]
-    log(orchestrator_log_id(plan_id), "supervisor", "retry requested; resetting task runtime state while preserving contracts")
+    log(
+        orchestrator_log_id(plan_id),
+        "supervisor",
+        "retry requested; " + ("preserving completed task checkpoints" if preserve_completed else "resetting task runtime state while preserving contracts"),
+    )
     info = repo_info(plan["workspace"])
     if info["is_git"]:
         repo_root = Path(info["root"])
         base_dir, integration_dir = plan_paths(plan_id)
-        remove_worktree(repo_root, integration_dir)
-        # Remove any task worktrees registered under this plan.
-        if base_dir.exists():
-            for child in list(base_dir.iterdir()):
-                if child == integration_dir:
-                    continue
-                remove_worktree(repo_root, child)
-        for t in rows("SELECT branch FROM tasks WHERE plan_id=?", (plan_id,)):
-            if t.get("branch"):
-                delete_branch(repo_root, t["branch"])
-        delete_branch(repo_root, f"agentdock/{plan_id}/integration")
-        git(repo_root, "worktree", "prune", check=False)
-        if base_dir.exists():
-            shutil.rmtree(base_dir, ignore_errors=True)
-    execute(
-        "UPDATE tasks SET status='pending', output='', error='', started_at=NULL, finished_at=NULL, workspace='', branch='', commit_hash='', integration_status='', retry_count=0, last_failure_kind='', repair_count=0 WHERE plan_id=?",
-        (plan_id,),
-    )
-    execute("UPDATE plans SET base_commit='', integration_workspace='', summary='', applied=0, error='', apply_status='', apply_error='', started_at=NULL, finished_at=NULL WHERE id=?", (plan_id,))
+        task_rows = rows("SELECT status,mode,integration_status,branch FROM tasks WHERE plan_id=?", (plan_id,))
+        if preserve_completed:
+            # Keep the integration worktree: it contains the commits from
+            # completed write tasks. Only discard worktrees/branches belonging
+            # to tasks that still need to run.
+            if base_dir.exists():
+                for child in list(base_dir.iterdir()):
+                    if child == integration_dir:
+                        continue
+                    remove_worktree(repo_root, child)
+            for task_row in task_rows:
+                preserved = task_row.get("status") == "done" or (
+                    task_row.get("status") == "executed" and (
+                        task_row.get("mode") == "read"
+                        or task_row.get("integration_status") in (
+                            "integrated", "no_changes", "resolved_by_orchestrator", "read_complete"
+                        )
+                    )
+                )
+                if not preserved and task_row.get("branch"):
+                    delete_branch(repo_root, task_row["branch"])
+            git(repo_root, "worktree", "prune", check=False)
+        else:
+            remove_worktree(repo_root, integration_dir)
+            # Remove any task worktrees registered under this plan.
+            if base_dir.exists():
+                for child in list(base_dir.iterdir()):
+                    if child == integration_dir:
+                        continue
+                    remove_worktree(repo_root, child)
+            for task_row in task_rows:
+                if task_row.get("branch"):
+                    delete_branch(repo_root, task_row["branch"])
+            delete_branch(repo_root, f"agentdock/{plan_id}/integration")
+            git(repo_root, "worktree", "prune", check=False)
+            if base_dir.exists():
+                shutil.rmtree(base_dir, ignore_errors=True)
+    if preserve_completed:
+        execute(
+            """UPDATE tasks SET status='pending', output='', error='', started_at=NULL,
+               finished_at=NULL, workspace='', branch='', commit_hash='', integration_status='',
+               retry_count=0, last_failure_kind='', repair_count=0, waiting_reason='',
+               consultation_id='', worker_resume_message='', baseline_fingerprint_json='{}'
+               WHERE plan_id=? AND NOT (
+                 status='done'
+                 OR status IN ('waiting_for_orchestrator','waiting_for_user')
+                 OR (status='executed' AND (
+                   mode='read' OR integration_status IN ('integrated','no_changes','resolved_by_orchestrator','read_complete')
+                 ))
+               )""",
+            (plan_id,),
+        )
+        execute(
+            """UPDATE plans SET summary='', applied=0, error='', apply_status='', apply_error='',
+               pending_question_id='', pending_question_json='{}', started_at=NULL,
+               finished_at=NULL, restart_recovery_pending=0 WHERE id=?""",
+            (plan_id,),
+        )
+    else:
+        execute(
+            """UPDATE tasks SET status='pending', output='', error='', started_at=NULL,
+               finished_at=NULL, workspace='', branch='', commit_hash='', integration_status='',
+               retry_count=0, last_failure_kind='', repair_count=0, waiting_reason='',
+               consultation_id='', worker_resume_message='', baseline_fingerprint_json='{}' WHERE plan_id=?""",
+            (plan_id,),
+        )
+        execute(
+            """UPDATE plans SET base_commit='', integration_workspace='', summary='', applied=0,
+               error='', apply_status='', apply_error='', pending_question_id='',
+               pending_question_json='{}', started_at=NULL, finished_at=NULL,
+               restart_recovery_pending=0 WHERE id=?""",
+            (plan_id,),
+        )
     write_mission_docs(plan_id)
 
 
@@ -1437,6 +1831,33 @@ def safe_json(text, default=None):
         return {} if default is None else default
 
 
+def consultation_attachment_paths(task_id):
+    """Return still-present image attachments supplied for a task consultation."""
+    if not task_id:
+        return []
+    paths = []
+    consultation_rows = rows(
+        "SELECT user_answer_json FROM consultations WHERE task_id=? ORDER BY created_at,id",
+        (task_id,),
+    )
+    for item in consultation_rows:
+        answer = safe_json(item.get("user_answer_json"), {})
+        for raw in answer.get("attachments") or [] if isinstance(answer, dict) else []:
+            path = Path(str(raw)).expanduser().resolve()
+            if path.is_file() and str(path) not in paths:
+                paths.append(str(path))
+    return paths[:8]
+
+
+def task_input_attachment_paths(plan, task):
+    paths = []
+    for raw in plan_attachment_paths(plan) + consultation_attachment_paths((task or {}).get("id")):
+        value = str(Path(raw).expanduser().resolve())
+        if value not in paths and Path(value).is_file():
+            paths.append(value)
+    return paths[:16]
+
+
 def format_contract_md(contract):
     if not isinstance(contract, dict):
         contract = {}
@@ -1526,6 +1947,8 @@ def write_mission_docs(plan_id):
     evidence = safe_json(plan.get("evidence_json"), [])
     questions = safe_json(plan.get("questions_json"), [])
     snapshot = safe_json(plan.get("workspace_snapshot_json"), {})
+    pending_question = safe_json(plan.get("pending_question_json"), {})
+    consultations = plan_consultations(plan_id)
     mission = f"""# AgentDock Mission {plan_id}
 
 - Status: `{plan['status']}`
@@ -1538,6 +1961,11 @@ def write_mission_docs(plan_id):
 - Finished: `{plan.get('finished_at') or ''}`
 - Apply: `{plan.get('apply_status') or 'not applicable'}`
 - Mission disposition: `{plan.get('decision') or 'not decided'}`
+- Orchestrator thread: `{plan.get('orchestrator_thread_id') or 'not bound'}`
+- Orchestrator generation: `{plan.get('orchestrator_generation') or 1}`
+- Last turn: `{plan.get('orchestrator_last_turn_id') or ''}`
+- Turn status: `{plan.get('orchestrator_turn_status') or ''}`
+- Legacy state: `{plan.get('legacy_orchestrator_status') or 'none'}`
 
 ## Goal
 
@@ -1561,6 +1989,18 @@ def write_mission_docs(plan_id):
 
 ```json
 {json.dumps(recovery, ensure_ascii=False, indent=2)}
+```
+
+## Orchestrator consultations
+
+```json
+{json.dumps(consultations, ensure_ascii=False, indent=2)}
+```
+
+## Pending user question
+
+```json
+{json.dumps(pending_question, ensure_ascii=False, indent=2)}
 ```
 
 ## Preflight
@@ -1599,6 +2039,9 @@ def write_mission_docs(plan_id):
 - Automatic retries: `{t.get('retry_count') or 0}`
 - Orchestrator repair attempts: `{t.get('repair_count') or 0}`
 - Last failure kind: `{t.get('last_failure_kind') or ''}`
+- Worker thread: `{t.get('worker_thread_id') or 'not bound'}`
+- Waiting reason: `{t.get('waiting_reason') or ''}`
+- Orchestrator handoff: `{t.get('worker_resume_message') or ''}`
 
 {format_contract_md(contract)}
 
@@ -1871,7 +2314,7 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
     completed_status = "failed"
     try:
         request(1, "initialize", {
-            "clientInfo": {"name": "agentdock", "title": "AgentDock", "version": "0.11.0"},
+            "clientInfo": {"name": "agentdock", "title": "AgentDock", "version": "0.12.0"},
             "capabilities": {"experimentalApi": True},
         })
         send({"method": "initialized", "params": {}})
@@ -1884,6 +2327,11 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
         thread_id = str((thread or {}).get("id") or resume_thread_id or "")
         if thread_id:
             execute("UPDATE agent_sessions SET thread_id=? WHERE id=?", (thread_id, session_id))
+            if plan_id and session_kind.startswith("orchestrator"):
+                execute(
+                    "UPDATE plans SET orchestrator_thread_id=? WHERE id=? AND (orchestrator_thread_id='' OR orchestrator_thread_id=?)",
+                    (thread_id, plan_id, thread_id),
+                )
 
         turn_params = {
             "threadId": thread_id,
@@ -1903,6 +2351,8 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
         turn_result = request(3, "turn/start", turn_params)
         turn = turn_result.get("turn") if isinstance(turn_result, dict) else {}
         turn_id = str((turn or {}).get("id") or "")
+        if turn_id:
+            execute("UPDATE agent_sessions SET turn_id=? WHERE id=?", (turn_id, session_id))
         if task_id and thread_id and turn_id:
             with APP_SERVER_CONTROLS_LOCK:
                 APP_SERVER_CONTROLS[task_id] = {
@@ -1991,6 +2441,10 @@ def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_
         raise RuntimeError("codex CLI PATH içinde bulunamadı")
     plan_id = infer_plan_id(task_id)
     session_id = create_agent_session(plan_id, task_id or "", session_kind, model, reasoning_effort, service_tier, mode, workspace)
+    if resume_thread_id:
+        # The CLI's resume stream may not repeat a thread.started event. Keep
+        # the new turn record bound to the known conversation immediately.
+        execute("UPDATE agent_sessions SET thread_id=? WHERE id=?", (resume_thread_id, session_id))
     args = [
         exe,
         "exec",
@@ -2105,13 +2559,18 @@ def orchestrator_models(requested):
     return [requested or DEFAULT_ORCHESTRATOR]
 
 
-def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning_effort="", service_tier="default", mode="read", transient_retries=0, images=None, output_schema=""):
+def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning_effort="", service_tier="default", mode="read", transient_retries=0, images=None, output_schema="", resume_thread_id="", session_kind="orchestrator"):
     errors = []
+    bound_thread_id = resume_thread_id or ""
     for model in orchestrator_models(requested_model):
         attempt = 0
         while True:
             try:
-                return run_codex(prompt, workspace, mode, model, task_id, reasoning_effort, service_tier, images=images, session_kind="orchestrator", output_schema=output_schema), model
+                return run_codex(
+                    prompt, workspace, mode, model, task_id, reasoning_effort, service_tier,
+                    images=images, resume_thread_id=resume_thread_id, session_kind=session_kind,
+                    output_schema=output_schema,
+                ), model
             except Exception as e:
                 err = str(e)
                 if attempt < transient_retries and is_transient_error(err):
@@ -2121,10 +2580,192 @@ def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning
                     time.sleep(delay)
                     continue
                 errors.append(f"{model}: {e}")
+                if not bound_thread_id:
+                    latest = latest_orchestrator_session(infer_plan_id(task_id)) if task_id else None
+                    bound_thread_id = (latest or {}).get("thread_id") or ""
+                    resume_thread_id = bound_thread_id
                 break
         if requested_model != "auto-best":
             break
     raise RuntimeError("\n\n".join(errors))
+
+
+def _orchestrator_lock(plan_id):
+    with ORCHESTRATOR_TURN_LOCKS_LOCK:
+        lock = ORCHESTRATOR_TURN_LOCKS.get(plan_id)
+        if lock is None:
+            lock = threading.RLock()
+            ORCHESTRATOR_TURN_LOCKS[plan_id] = lock
+        return lock
+
+
+def _latest_orchestrator_thread(plan_id):
+    session = latest_orchestrator_session(plan_id)
+    return (session or {}).get("thread_id") or "", (session or {}).get("turn_id") or ""
+
+
+def _orchestrator_turn_prompt(purpose, context):
+    return f"""AGENTDOCK CONTROL-PLANE TURN
+
+TURN PURPOSE: {purpose}
+
+This is a continuation of the same mission-scoped orchestrator conversation.
+Do not create workers or a new task graph unless the turn purpose is initial_disposition.
+Respect persisted mission state and the exact output contract supplied by the caller.
+
+{context}
+"""
+
+
+def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_schema="", mode="read",
+                                  images=None, transient_retries=0, requested_model=None):
+    """The only production entry point for a mission's orchestrator turns.
+
+    A per-mission lock serializes turns while the database preserves the queue
+    and thread identity across process restarts.
+    """
+    if purpose not in ORCHESTRATOR_PURPOSES:
+        raise ValueError(f"Unknown orchestrator turn purpose: {purpose}")
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    lock = _orchestrator_lock(plan_id)
+    turn_record_id = str(uuid.uuid4())
+    context_payload = {
+        "purpose": purpose,
+        "context": str(context or "")[-120000:],
+        "expected_output_schema": str(expected_output_schema or ""),
+    }
+    with lock:
+        plan = one("SELECT * FROM plans WHERE id=?", (plan_id,)) or plan
+        existing_thread = "" if purpose == "reconstruct" else str(plan.get("orchestrator_thread_id") or "").strip()
+        if not existing_thread and purpose != "reconstruct":
+            adopted_thread, _ = _latest_orchestrator_thread(plan_id)
+            existing_thread = adopted_thread
+        if not existing_thread and purpose not in {"initial_disposition", "reconstruct"}:
+            message = "Mission orchestrator thread is unavailable; explicit context reconstruction is required."
+            execute("UPDATE plans SET orchestrator_turn_status=?,orchestrator_last_error=? WHERE id=?",
+                    ("attention", message, plan_id))
+            raise RuntimeError(message)
+        execute(
+            """INSERT INTO orchestrator_turns(
+                id,plan_id,thread_id,purpose,status,context_json,created_at
+            ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                turn_record_id, plan_id, existing_thread, purpose, "queued",
+                json.dumps(context_payload, ensure_ascii=False), now(),
+            ),
+        )
+        execute(
+            "UPDATE plans SET orchestrator_turn_status=?,orchestrator_last_error=? WHERE id=?",
+            ("running", "", plan_id),
+        )
+        log(
+            orchestrator_log_id(plan_id),
+            "supervisor",
+            f"orchestrator turn queued · purpose={purpose} · "
+            f"{'resume=' + existing_thread[:12] if existing_thread else 'new-thread'}",
+        )
+        execute(
+            "UPDATE orchestrator_turns SET status=?,started_at=? WHERE id=?",
+            ("running", now(), turn_record_id),
+        )
+        try:
+            prompt = _orchestrator_turn_prompt(purpose, context)
+            model = requested_model or plan.get("orchestrator_model") or DEFAULT_ORCHESTRATOR
+            recovery = recovery_settings(plan)
+            text, used_model = run_orchestrator(
+                prompt,
+                plan["workspace"],
+                model,
+                orchestrator_log_id(plan_id),
+                plan.get("orchestrator_effort") or DEFAULT_ORCHESTRATOR_EFFORT,
+                plan.get("orchestrator_tier") or DEFAULT_ORCHESTRATOR_TIER,
+                mode=mode,
+                transient_retries=transient_retries if transient_retries is not None else (1 if recovery.get("auto_retry_transient") else 0),
+                images=images or [],
+                output_schema=expected_output_schema,
+                resume_thread_id=existing_thread,
+                session_kind="orchestrator",
+            )
+            actual_thread, turn_id = _latest_orchestrator_thread(plan_id)
+            actual_thread = actual_thread or existing_thread
+            if not actual_thread:
+                raise RuntimeError("Orchestrator response completed without a resumable thread id.")
+            if existing_thread and actual_thread != existing_thread and purpose != "reconstruct":
+                raise RuntimeError(
+                    "Orchestrator resume returned a different thread; explicit context reconstruction is required."
+                )
+            session = latest_orchestrator_session(plan_id) or {}
+            usage = orchestrator_session_usage(session.get("id"))
+            response_json = "{}"
+            try:
+                parsed_response = extract_json(text)
+                if isinstance(parsed_response, dict):
+                    response_json = json.dumps(parsed_response, ensure_ascii=False)
+            except Exception:
+                pass
+            generation = int(plan.get("orchestrator_generation") or 1)
+            if purpose == "reconstruct":
+                generation = max(1, generation + 1)
+            elif not existing_thread:
+                generation = max(1, generation)
+            execute(
+                """UPDATE plans SET orchestrator_thread_id=?,orchestrator_generation=?,
+                   orchestrator_turn_status=?,orchestrator_last_turn_id=?,
+                   orchestrator_last_error=?,orchestrator_used=? WHERE id=?""",
+                (actual_thread, generation, "completed", turn_id, "", used_model, plan_id),
+            )
+            execute(
+                """UPDATE orchestrator_turns SET thread_id=?,turn_id=?,status=?,
+                   response_text=?,response_json=?,usage_json=?,finished_at=? WHERE id=?""",
+                (actual_thread, turn_id, "completed", str(text or "")[-120000:], response_json,
+                 json.dumps(usage, ensure_ascii=False), now(), turn_record_id),
+            )
+            log(
+                orchestrator_log_id(plan_id),
+                "supervisor",
+                f"orchestrator turn completed · purpose={purpose} · thread={actual_thread[:12]}",
+            )
+            record_control_event(plan_id, "agentdock.orchestrator_turn", {
+                "purpose": purpose,
+                "status": "completed",
+                "thread_id": actual_thread,
+                "turn_id": turn_id,
+            })
+            return {
+                "text": text,
+                "model": used_model,
+                "thread_id": actual_thread,
+                "turn_id": turn_id,
+                "turn_record_id": turn_record_id,
+                "usage": usage,
+            }
+        except Exception as exc:
+            message = str(exc)
+            actual_thread, turn_id = _latest_orchestrator_thread(plan_id)
+            session = latest_orchestrator_session(plan_id) or {}
+            usage = orchestrator_session_usage(session.get("id"))
+            # A failed resume is attention, never a silent new conversation.
+            execute(
+                """UPDATE plans SET orchestrator_thread_id=COALESCE(NULLIF(orchestrator_thread_id,''),?),
+                   orchestrator_turn_status=?,orchestrator_last_turn_id=?,
+                   orchestrator_last_error=? WHERE id=?""",
+                (actual_thread, "attention", turn_id, message, plan_id),
+            )
+            execute(
+                """UPDATE orchestrator_turns SET thread_id=?,turn_id=?,status=?,usage_json=?,error=?,finished_at=? WHERE id=?""",
+                (actual_thread or existing_thread, turn_id, "failed", json.dumps(usage, ensure_ascii=False), message[-12000:], now(), turn_record_id),
+            )
+            log(orchestrator_log_id(plan_id), "supervisor", f"orchestrator turn failed · purpose={purpose}: {message}")
+            record_control_event(plan_id, "agentdock.orchestrator_turn", {
+                "purpose": purpose,
+                "status": "failed",
+                "thread_id": actual_thread or existing_thread,
+                "turn_id": turn_id,
+                "error": message,
+            })
+            raise
 
 
 def planner_prompt(goal, agents, worker_model, worker_effort, worker_tier, max_parallel, snapshot=None, planner_instruction=""):
@@ -2273,6 +2914,90 @@ def normalize_planner_result(obj):
     }
 
 
+def extract_worker_consultation(output):
+    """Read the structured worker escalation, with a legacy-text fallback."""
+    text = str(output or "").strip()
+    candidate = None
+    marker = "BLOCKED_NEEDS_ORCHESTRATOR:"
+    if marker in text:
+        tail = text.split(marker, 1)[1].strip()
+        try:
+            candidate = extract_json(tail)
+        except Exception:
+            candidate = None
+        if not isinstance(candidate, dict):
+            candidate = {
+                "type": "needs_orchestrator",
+                "question": tail[:4000] or "Worker requires an orchestrator decision.",
+                "reason": "Worker reached a reserved decision boundary.",
+                "evidence": [tail[:4000]] if tail else [],
+                "options": [],
+            }
+    else:
+        try:
+            obj = extract_json(text)
+            if isinstance(obj, dict) and obj.get("type") == "needs_orchestrator":
+                candidate = obj
+        except Exception:
+            candidate = None
+    if not isinstance(candidate, dict) or candidate.get("type") != "needs_orchestrator":
+        return None
+    question = str(candidate.get("question") or "").strip()
+    reason = str(candidate.get("reason") or "").strip()
+    evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), list) else []
+    options = candidate.get("options") if isinstance(candidate.get("options"), list) else []
+    if not question:
+        question = "Worker requires an orchestrator decision before continuing."
+    if not reason:
+        reason = "Worker reported a material ambiguity and stopped before guessing."
+    return {
+        "type": "needs_orchestrator",
+        "question": question[:6000],
+        "reason": reason[:6000],
+        "evidence": [str(x) for x in evidence if str(x).strip()][:32],
+        "options": [str(x) for x in options if str(x).strip()][:12],
+    }
+
+
+def normalize_consultation_result(obj):
+    """Validate the bounded response the root orchestrator gives a worker."""
+    if not isinstance(obj, dict):
+        raise ValueError("Orchestrator consultation response must be an object")
+    action = str(obj.get("action") or "").strip()
+    # Accept the old escalation vocabulary only while migrating old missions.
+    if action == "retry":
+        action = "revise_contract"
+    elif action == "stop":
+        action = "block_mission"
+    if action not in ORCHESTRATOR_ACTIONS:
+        raise ValueError(f"Invalid orchestrator consultation action: {action or 'missing'}")
+    reason = str(obj.get("reason") or "").strip()
+    if not reason:
+        raise ValueError("Orchestrator consultation reason is required")
+    worker_message = str(obj.get("worker_message") or obj.get("note") or "").strip()
+    revised = obj.get("revised_contract")
+    if not isinstance(revised, dict):
+        revised = obj.get("contract") if isinstance(obj.get("contract"), dict) else {}
+    questions = obj.get("questions") if isinstance(obj.get("questions"), list) else []
+    evidence = obj.get("evidence") if isinstance(obj.get("evidence"), list) else []
+    questions = [str(x) for x in questions if str(x).strip()][:12]
+    evidence = [str(x) for x in evidence if str(x).strip()][:32]
+    if action in ("answer_worker", "revise_contract") and not worker_message:
+        worker_message = reason
+    if action == "revise_contract" and not revised:
+        raise ValueError("revise_contract requires a complete revised_contract")
+    if action == "ask_user" and not questions:
+        raise ValueError("ask_user requires at least one question")
+    return {
+        "action": action,
+        "reason": reason,
+        "worker_message": worker_message,
+        "revised_contract": revised,
+        "questions": questions,
+        "evidence": evidence,
+    }
+
+
 def task_dependency_context(task):
     deps = json.loads(task.get("depends_json") or "[]")
     if not deps:
@@ -2290,6 +3015,16 @@ def task_dependency_context(task):
 def make_task_prompt(plan, task, agent):
     dep_context = task_dependency_context(task)
     contract = safe_json(task.get("contract_json"), {})
+    resume_message = str(task.get("worker_resume_message") or "").strip()
+    resume_block = f"""
+
+ROOT ORCHESTRATOR DECISION — CONTINUE THIS SAME TASK:
+{resume_message}
+
+This is an authoritative control-plane instruction for the current task. Keep
+the existing worker conversation and continue from its previous context; do
+not create a new task or reinterpret the parent goal.
+""" if resume_message else ""
     return f"""You are an execution worker in AgentDock. The root orchestrator has already made the task-level decisions. Do NOT re-plan the parent goal.
 
 WORKER PROFILE: {agent['name']}
@@ -2304,6 +3039,7 @@ TASK:
 
 EXECUTION CONTRACT:
 {json.dumps(contract, ensure_ascii=False, indent=2)}
+{resume_block}
 
 DEPENDENCY RESULTS:
 {dep_context or 'None.'}
@@ -2314,7 +3050,9 @@ NON-NEGOTIABLE WORK RULES:
 - You are one parallel worker. Do not coordinate via Git branches/commits; the harness handles isolation and integration.
 - Do not make architecture, product, scope, prioritization, dependency, or destructive-operation decisions.
 - Low-level implementation choices are allowed only when the contract's decision_policy permits them and all stated interfaces/invariants remain unchanged.
-- If a reserved decision or material ambiguity is required, STOP before guessing and return exactly `BLOCKED_NEEDS_ORCHESTRATOR:` followed by the missing decision and 1-3 concrete options/evidence.
+- If a reserved decision or material ambiguity is required, STOP before guessing and return a single JSON object in this exact shape:
+  {{"type":"needs_orchestrator","question":"...","reason":"...","evidence":["..."],"options":["..."]}}
+  Do not invent product, architecture, legal, identity, contact or destructive-operation facts.
 - Do not claim a verification passed unless you actually ran or inspected it.
 - If the task is read-only, do not modify files.
 - Finish with a concise result covering deliverables, files changed/findings, verification performed, and remaining risks.
@@ -2359,7 +3097,10 @@ def prepare_integration(plan):
     if not info["is_git"]:
         raise RuntimeError("Paralel write agent'ları için workspace bir Git repository içinde olmalı.")
     if info["dirty"]:
-        raise RuntimeError("Preflight sonrası working tree yeniden değişti. AgentDock kullanıcı çalışmasını ezmemek için paralel write başlatmadı.")
+        # The explicit execution preflight choice protects these changes in the
+        # user's checkout. Worker isolation starts from HEAD and never writes
+        # into this dirty checkout; the final apply gate still rechecks it.
+        log(orchestrator_log_id(plan["id"]), "supervisor", "working tree is dirty but explicitly accepted; isolated workers start from HEAD")
     repo_root = Path(info["root"])
     base_dir, integration_dir = plan_paths(plan["id"])
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -2458,11 +3199,80 @@ def validate_worker_changes(worktree, task):
     return changed
 
 
-def validate_read_workspace(workspace, expected_head):
-    current_head = git_read(workspace, "rev-parse", "HEAD", check=False).stdout.strip()
-    dirty = git_read(workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False).stdout.strip()
-    if current_head != expected_head or dirty:
-        raise RuntimeError("Read-only task workspace'i değiştirdi; değişiklik güvenlik için entegre edilmedi.")
+def validate_read_workspace(workspace, expected_head=None, baseline=None):
+    """Validate that a read task preserved the exact pre-task workspace state."""
+    if baseline is None:
+        baseline = workspace_fingerprint(workspace)
+        if expected_head is not None and baseline.get("head") != expected_head:
+            raise RuntimeError("Read-only task workspace HEAD'i task başlamadan önce beklenen commit ile eşleşmiyor.")
+    after = workspace_fingerprint(workspace)
+    changes = fingerprint_diff(baseline, after)
+    if changes:
+        raise RuntimeError(
+            "Read-only task workspace'i değiştirdi; değişen alan/dosyalar: " + ", ".join(changes[:20])
+        )
+    return after
+
+
+def create_worker_consultation(plan, task, output):
+    request = extract_worker_consultation(output)
+    if not request:
+        return None
+    latest = latest_agent_session(task["id"]) or {}
+    worker_thread_id = latest.get("thread_id") or task.get("worker_thread_id") or ""
+    consultation_id = str(uuid.uuid4())
+    execute(
+        """INSERT INTO consultations(
+            id,plan_id,task_id,status,question,reason,evidence_json,options_json,
+            worker_thread_id,orchestrator_thread_id,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            consultation_id,
+            plan["id"],
+            task["id"],
+            "queued",
+            request["question"],
+            request["reason"],
+            json.dumps(request["evidence"], ensure_ascii=False),
+            json.dumps(request["options"], ensure_ascii=False),
+            worker_thread_id,
+            plan.get("orchestrator_thread_id") or "",
+            now(),
+        ),
+    )
+    execute(
+        """UPDATE tasks SET status=?,output=?,error=?,finished_at=NULL,
+           worker_thread_id=?,waiting_reason=?,consultation_id=? WHERE id=?""",
+        (
+            "waiting_for_orchestrator",
+            str(output or "")[-50000:],
+            "",
+            worker_thread_id,
+            request["question"],
+            consultation_id,
+            task["id"],
+        ),
+    )
+    log(
+        task["id"],
+        "supervisor",
+        f"worker consultation queued · {request['question'][:300]}",
+    )
+    log(
+        orchestrator_log_id(plan["id"]),
+        "supervisor",
+        f"TASK-{task['seq']+1:03d} waiting for orchestrator · consultation={consultation_id[:12]}",
+    )
+    record_control_event(plan["id"], "agentdock.consultation", {
+        "consultation_id": consultation_id,
+        "task_id": task["id"],
+        "question": request["question"],
+        "reason": request["reason"],
+        "evidence": request["evidence"],
+        "options": request["options"],
+    }, task_id=task["id"])
+    write_mission_docs(plan["id"])
+    return {**request, "id": consultation_id, "worker_thread_id": worker_thread_id}
 
 
 def run_task_once(plan, task, workspace, force_mode=None):
@@ -2471,17 +3281,52 @@ def run_task_once(plan, task, workspace, force_mode=None):
     model = task_model(plan, agent)
     effort = task_effort(plan, agent)
     tier = task_tier(plan, agent)
-    execute("UPDATE tasks SET status=?, started_at=?, error=?, workspace=? WHERE id=?", ("running", now(), "", str(workspace), task["id"]))
+    existing_worker_thread = task.get("worker_thread_id") or (latest_agent_session(task["id"]) or {}).get("thread_id") or ""
+    execute(
+        "UPDATE tasks SET status=?, started_at=?, error=?, workspace=?,waiting_reason=? WHERE id=?",
+        ("running", now(), "", str(workspace), "", task["id"]),
+    )
     write_mission_docs(plan["id"])
     try:
-        output = run_codex(make_task_prompt(plan, task, agent), workspace, mode, model, task["id"], effort, tier, images=plan_attachment_paths(plan), session_kind="worker")
-        if "BLOCKED_NEEDS_ORCHESTRATOR:" in output:
-            execute("UPDATE tasks SET status=?, output=?, error=?, finished_at=? WHERE id=?", ("blocked", output, "Worker escalated a reserved decision to the orchestrator", now(), task["id"]))
-            write_mission_docs(plan["id"])
-            return {"ok": False, "blocked": True, "output": output, "error": "Worker needs orchestrator decision"}
+        output = run_codex(
+            make_task_prompt(plan, task, agent),
+            workspace,
+            mode,
+            model,
+            task["id"],
+            effort,
+            tier,
+            images=task_input_attachment_paths(plan, task),
+            resume_thread_id=existing_worker_thread,
+            session_kind="worker",
+        )
+        if task.get("worker_resume_message"):
+            execute("UPDATE tasks SET worker_resume_message=? WHERE id=?", ("", task["id"]))
+        latest = latest_agent_session(task["id"]) or {}
+        worker_thread_id = latest.get("thread_id") or existing_worker_thread
+        if worker_thread_id:
+            execute("UPDATE tasks SET worker_thread_id=? WHERE id=?", (worker_thread_id, task["id"]))
+        consultation = create_worker_consultation(plan, task, output)
+        if consultation:
+            return {
+                "ok": False,
+                "waiting_for_orchestrator": True,
+                "consultation": consultation,
+                "output": output,
+                "error": "Worker needs an orchestrator decision",
+            }
         followups = consume_queued_messages(plan, task, workspace, model, effort, tier)
         if followups:
             output = followups[-1]
+            consultation = create_worker_consultation(plan, task, output)
+            if consultation:
+                return {
+                    "ok": False,
+                    "waiting_for_orchestrator": True,
+                    "consultation": consultation,
+                    "output": output,
+                    "error": "Worker needs an orchestrator decision",
+                }
         execute("UPDATE tasks SET status=?, output=?, error=?, finished_at=? WHERE id=?", ("executed", output, "", now(), task["id"]))
         write_mission_docs(plan["id"])
         return {"ok": True, "output": output}
@@ -2502,7 +3347,7 @@ def run_task_with_recovery(plan, task, workspace, force_mode=None):
     attempt = 0
     while True:
         result = run_task_once(plan, task, workspace, force_mode=force_mode)
-        if result.get("ok") or result.get("blocked"):
+        if result.get("ok") or result.get("blocked") or result.get("waiting_for_orchestrator") or result.get("waiting_for_user"):
             return result
         err = result.get("error") or ""
         kind = "transient" if is_transient_error(err) else "deterministic"
@@ -2537,17 +3382,20 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
                 execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", result["error"], now(), task["id"]))
         return {"task": task, "ok": result["ok"], "write": True, "phase": "worker", "wt": str(wt), "branch": branch, "commit": commit_hash, **result}
     else:
-        expected_head = None
-        if ctx.get("base_commit") and repo_info(ctx["integration_workspace"]).get("is_git"):
-            expected_head = git(ctx["integration_workspace"], "rev-parse", "HEAD", check=False).stdout.strip()
+        baseline = workspace_fingerprint(ctx["integration_workspace"])
+        execute(
+            "UPDATE tasks SET baseline_fingerprint_json=? WHERE id=?",
+            (json.dumps(baseline, ensure_ascii=False), task["id"]),
+        )
         result = run_task_with_recovery(plan, task, ctx["integration_workspace"], force_mode="read")
-        if result.get("ok") and expected_head is not None:
+        if result.get("ok"):
             try:
-                validate_read_workspace(ctx["integration_workspace"], expected_head)
+                after = validate_read_workspace(ctx["integration_workspace"], baseline=baseline)
+                result["fingerprint"] = after
             except Exception as e:
                 result = {"ok": False, "phase": "contract", "error": str(e)}
                 execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), now(), task["id"]))
-        return {"task": task, "ok": result["ok"], "write": False, "phase": "worker", **result}
+        return {"task": task, "ok": result.get("ok", False), "write": False, "phase": "worker", **result}
 
 
 
@@ -2589,16 +3437,14 @@ def resolve_merge_conflict(plan, ctx, result, cherry_error):
     execute("UPDATE plans SET recovery_count=recovery_count+1 WHERE id=?", (plan["id"],))
     try:
         retries = 1 if settings.get("auto_retry_transient") else 0
-        text, used = run_orchestrator(
+        turn = run_mission_orchestrator_turn(
+            plan["id"],
+            "failure_recovery",
             merge_conflict_prompt(plan, task, unresolved, cherry_error),
-            ctx["integration_workspace"],
-            plan["orchestrator_model"],
-            orchestrator_log_id(plan["id"]),
-            plan["orchestrator_effort"],
-            plan["orchestrator_tier"],
             mode="write",
             transient_retries=retries,
         )
+        text, used = turn["text"], turn["model"]
         if "BLOCKED_NEEDS_USER:" in text:
             return False, text
         marker_files = []
@@ -2670,6 +3516,8 @@ def mark_read_result_done(result):
 def ready_tasks(plan_id, pending):
     ready = []
     for seq, task in sorted(pending.items()):
+        if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user"):
+            continue
         deps = json.loads(task.get("depends_json") or "[]")
         if not deps:
             ready.append(task)
@@ -2682,6 +3530,35 @@ def ready_tasks(plan_id, pending):
         if all(d and d["status"] == "done" for d in dep_states):
             ready.append(task)
     return ready
+
+
+def resolve_waiting_consultations(plan, tasks, ctx=None):
+    """Drain queued worker questions before launching a task a second time.
+
+    A wave may produce more than one question. Only the first user-facing
+    question is surfaced at once; the remaining consultation records stay
+    durable and are resolved on the next resume instead of being rerun as
+    ordinary worker tasks.
+    """
+    resolved_any = False
+    for task in sorted(tasks or [], key=lambda item: item.get("seq", 0)):
+        if task.get("status") != "waiting_for_orchestrator" or not task.get("consultation_id"):
+            continue
+        fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
+        resolution = resolve_worker_consultation(
+            plan,
+            fresh,
+            result={
+                "waiting_for_orchestrator": True,
+                "consultation_id": fresh.get("consultation_id") or "",
+            },
+            ctx=ctx,
+        )
+        if resolution.get("retry"):
+            resolved_any = True
+            continue
+        return resolution
+    return {"resolved": True} if resolved_any else {}
 
 
 def synthesis_prompt(plan, task_rows):
@@ -2752,13 +3629,16 @@ def build_plan(plan_id):
         )
         log(orchestrator_log_id(plan_id), "supervisor", "workspace analysis complete · disposition is now being decided")
         recovery = recovery_settings(plan)
-        text, used_model = run_orchestrator(
-            prompt, plan["workspace"], plan["orchestrator_model"], orchestrator_log_id(plan_id),
-            plan["orchestrator_effort"], plan["orchestrator_tier"],
-            transient_retries=1 if recovery.get("auto_retry_transient") else 0,
+        turn = run_mission_orchestrator_turn(
+            plan_id,
+            "initial_disposition",
+            prompt,
+            expected_output_schema=planner_schema_path(),
+            mode="read",
             images=plan_attachment_paths(plan),
-            output_schema=planner_schema_path(),
+            transient_retries=1 if recovery.get("auto_retry_transient") else 0,
         )
+        text, used_model = turn["text"], turn["model"]
         obj = normalize_planner_result(extract_json(text))
         items = obj["tasks"]
         valid_ids = {a["id"] for a in agents}
@@ -2867,6 +3747,10 @@ def replan_mission(plan_id, mode="reconsider", user_note=""):
     if user_note:
         note += "\nUser note:\n" + str(user_note).strip()[:6000]
     execute(
+        "UPDATE consultations SET status=?,resolved_at=? WHERE plan_id=? AND status IN ('queued','resolving','waiting_for_user')",
+        ("superseded", now(), plan_id),
+    )
+    execute(
         "DELETE FROM tasks WHERE plan_id=?",
         (plan_id,),
     )
@@ -2927,7 +3811,8 @@ def simulate_demo_task(plan, task_id, reasoning, command, file_changes=None, dur
     sid = create_agent_session(plan["id"], task_id, "demo-worker", model, effort, tier, task.get("mode") or "read", plan["workspace"])
     fake_thread = f"demo-{task_id}-{sid[:6]}"
     demo_event(sid, task_id, plan["id"], {"type":"thread.started","thread_id":fake_thread})
-    demo_event(sid, task_id, plan["id"], {"type":"turn.started"})
+    execute("UPDATE tasks SET worker_thread_id=? WHERE id=?", (fake_thread, task_id))
+    demo_event(sid, task_id, plan["id"], {"type":"turn.started","turn_id":f"demo-turn-{sid[:8]}"})
     log(task_id, "stdout", f"demo launch model={model} effort={effort} speed={tier}")
     demo_event(sid, task_id, plan["id"], {"type":"item.completed","item":{"id":"reason-1","type":"reasoning","text":reasoning}})
     demo_event(sid, task_id, plan["id"], {"type":"item.started","item":{"id":"todo-1","type":"todo_list","items":[
@@ -2981,7 +3866,7 @@ def build_demo_plan(plan_id):
         log(oid, "supervisor", "DEMO MODE · no Codex quota will be used")
         sid = create_agent_session(plan_id, oid, "demo-orchestrator", plan["orchestrator_model"], plan["orchestrator_effort"], plan["orchestrator_tier"], "read", plan["workspace"])
         demo_event(sid, oid, plan_id, {"type":"thread.started","thread_id":f"demo-orchestrator-{plan_id}"})
-        demo_event(sid, oid, plan_id, {"type":"turn.started"})
+        demo_event(sid, oid, plan_id, {"type":"turn.started","turn_id":f"demo-orchestrator-turn-{plan_id}"})
         demo_event(sid, oid, plan_id, {"type":"item.completed","item":{"id":"orch-r1","type":"reasoning","text":"I will propose explicit task boundaries and dependencies first. Execution will not start until the user reviews assignments and approves the plan."}})
         log(oid, "supervisor", "building preview execution contracts")
         time.sleep(0.55)
@@ -3051,13 +3936,16 @@ def run_demo_manual_followup(task_id, prompt, image_paths=None):
     if not task or not plan:
         return
     old_status = task.get("status") or "done"
+    existing_thread = task.get("worker_thread_id") or (latest_agent_session(task_id) or {}).get("thread_id") or ""
     execute("UPDATE tasks SET status=?,error=? WHERE id=?", ("running", "", task_id))
     sid = create_agent_session(plan["id"], task_id, "demo-manual", plan["worker_model"], plan["worker_effort"], plan["worker_tier"], task.get("mode") or "read", plan["workspace"])
-    demo_event(sid, task_id, plan["id"], {"type":"thread.started","thread_id":f"demo-followup-{task_id}-{sid[:6]}"})
-    demo_event(sid, task_id, plan["id"], {"type":"turn.started"})
+    thread_id = existing_thread or f"demo-followup-{task_id}-{sid[:6]}"
+    demo_event(sid, task_id, plan["id"], {"type":"thread.started","thread_id":thread_id})
+    execute("UPDATE tasks SET worker_thread_id=? WHERE id=?", (thread_id, task_id))
+    demo_event(sid, task_id, plan["id"], {"type":"turn.started","turn_id":f"demo-manual-turn-{sid[:8]}"})
     log(task_id, "manual", f"demo manual input: {prompt or '[attachment only]'}")
     time.sleep(0.4)
-    note = "I received your manual instruction in Demo Mode. In a real mission this would continue the same Codex thread and apply your steering to the task."
+    note = "I received your manual instruction in Demo Mode and continued the same worker conversation while preserving the task contract."
     if image_paths:
         note += f" {len(image_paths)} image attachment(s) were accepted."
     demo_event(sid, task_id, plan["id"], {"type":"item.completed","item":{"id":"manual-reason","type":"reasoning","text":"The user has taken manual control, so I will prioritize the new instruction over the original execution preference while keeping the task contract boundaries."}})
@@ -3067,6 +3955,244 @@ def run_demo_manual_followup(task_id, prompt, image_paths=None):
     final_status = "done" if old_status in ("done","executed","failed","blocked","cancelled") else old_status
     execute("UPDATE tasks SET status=?,output=?,finished_at=? WHERE id=?", (final_status, note, now(), task_id))
     log(task_id, "manual", "demo manual follow-up completed · 0 quota used")
+
+
+def worker_consultation_prompt(plan, task, consultation, user_answer=None):
+    contract = safe_json(task.get("contract_json"), {})
+    answer_block = ""
+    if user_answer:
+        answer_block = f"""
+USER ANSWER TO THE WORKER'S QUESTION:
+{json.dumps(user_answer, ensure_ascii=False, indent=2)}
+
+Use this answer only for the unresolved decision. Do not ask the same question
+again unless the answer is genuinely insufficient and explain why.
+"""
+    return f"""You are the single root orchestrator for this mission. A worker
+paused because it reached a product, architecture, factual, legal, scope or
+destructive-operation decision that it is not allowed to invent.
+
+MISSION:
+{plan['goal']}
+
+TASK:
+TASK-{task['seq']+1:03d} — {task['title']}
+
+CURRENT TASK CONTRACT:
+{json.dumps(contract, ensure_ascii=False, indent=2)}
+
+WORKER THREAD:
+{task.get('worker_thread_id') or consultation.get('worker_thread_id') or '[not recorded]'}
+
+WORKER QUESTION:
+{consultation.get('question') or ''}
+
+WHY THE WORKER STOPPED:
+{consultation.get('reason') or ''}
+
+EVIDENCE:
+{json.dumps(safe_json(consultation.get('evidence_json'), consultation.get('evidence') or []), ensure_ascii=False, indent=2)}
+
+OPTIONS REPORTED BY WORKER:
+{json.dumps(safe_json(consultation.get('options_json'), consultation.get('options') or []), ensure_ascii=False, indent=2)}
+{answer_block}
+
+Return ONLY this JSON shape:
+{json.dumps(CONSULTATION_SCHEMA, ensure_ascii=False, indent=2)}
+
+Choose exactly one action:
+- answer_worker: give a concrete bounded instruction without changing the contract.
+- revise_contract: give a complete revised contract and the worker instruction.
+- ask_user: ask the user for missing product/factual information; do not guess.
+- block_mission: the requested work is unsafe, unauthorized or impossible to decide.
+
+Never create a new task or a new orchestrator thread in this turn.
+"""
+
+
+def _consultation_payload(row):
+    row = row or {}
+    return {
+        "id": row.get("id") or "",
+        "question": row.get("question") or "",
+        "reason": row.get("reason") or "",
+        "evidence": safe_json(row.get("evidence_json"), []),
+        "options": safe_json(row.get("options_json"), []),
+        "worker_thread_id": row.get("worker_thread_id") or "",
+        "status": row.get("status") or "",
+        "task_id": row.get("task_id") or "",
+    }
+
+
+def _set_pending_consultation(plan_id, task, consultation, response):
+    questions = response.get("questions") or [consultation.get("question") or "Additional information is required."]
+    pending = {
+        "kind": "execution_question",
+        "consultation_id": consultation["id"],
+        "task_id": task["id"],
+        "task_title": task["title"],
+        "question": questions[0],
+        "questions": questions,
+        "reason": response.get("reason") or consultation.get("reason") or "",
+        "evidence": consultation.get("evidence") or [],
+        "options": consultation.get("options") or [],
+        "orchestrator_evidence": response.get("evidence") or [],
+        "worker_thread_id": task.get("worker_thread_id") or consultation.get("worker_thread_id") or "",
+        "orchestrator_thread_id": "",
+    }
+    execute(
+        """UPDATE consultations SET status=?,orchestrator_response_json=?,
+           user_questions_json=? WHERE id=?""",
+        ("waiting_for_user", json.dumps(response, ensure_ascii=False), json.dumps(questions, ensure_ascii=False), consultation["id"]),
+    )
+    execute(
+        """UPDATE tasks SET status=?,waiting_reason=?,consultation_id=? WHERE id=?""",
+        ("waiting_for_user", pending["question"], consultation["id"], task["id"]),
+    )
+    execute(
+        """UPDATE plans SET status=?,pending_question_id=?,pending_question_json=?,
+           error=?,finished_at=NULL WHERE id=?""",
+        ("waiting_for_user", consultation["id"], json.dumps(pending, ensure_ascii=False), response.get("reason") or "", plan_id),
+    )
+    return pending
+
+
+def worker_resume_message(response, contract):
+    """Turn an orchestrator decision into an explicit same-thread worker handoff."""
+    return (
+        "ROOT ORCHESTRATOR DECISION\n\n"
+        f"{response.get('worker_message') or response.get('reason') or 'Continue the bounded task.'}\n\n"
+        "Updated contract:\n"
+        f"{json.dumps(contract or {}, ensure_ascii=False, indent=2)}\n\n"
+        "Continue the same task from your current state. Preserve the prior context and tool findings."
+    )
+
+
+def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=None):
+    """Ask the same orchestrator thread to resolve a worker's structured question."""
+    fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
+    consultation_id = fresh.get("consultation_id") or (result or {}).get("consultation_id") or ""
+    consultation = one("SELECT * FROM consultations WHERE id=?", (consultation_id,)) if consultation_id else None
+    if not consultation and result:
+        request = result.get("consultation") or extract_worker_consultation(result.get("output") or "")
+        if request:
+            consultation = create_worker_consultation(plan, fresh, result.get("output") or "")
+    if not consultation:
+        return {"ok": False, "error": "Worker consultation record not found."}
+    payload = _consultation_payload(consultation)
+    if ctx and (result or {}).get("write") and (result or {}).get("wt"):
+        remove_worktree(ctx["repo_root"], result["wt"])
+        if (result or {}).get("branch"):
+            delete_branch(ctx["repo_root"], result["branch"])
+    purpose = "user_answer" if user_answer else "worker_consultation"
+    answer_images = []
+    if isinstance(user_answer, dict):
+        answer_images = [
+            str(Path(path).expanduser().resolve())
+            for path in (user_answer.get("attachments") or [])
+            if Path(str(path)).expanduser().is_file()
+        ][:8]
+    log(
+        orchestrator_log_id(plan["id"]),
+        "supervisor",
+        f"TASK-{fresh['seq']+1:03d} consultation → orchestrator · purpose={purpose}",
+    )
+    try:
+        turn = run_mission_orchestrator_turn(
+            plan["id"],
+            purpose,
+            worker_consultation_prompt(plan, fresh, payload, user_answer=user_answer),
+            expected_output_schema=consultation_schema_path(),
+            mode="read",
+            images=answer_images,
+            transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
+        )
+        response = normalize_consultation_result(extract_json(turn["text"]))
+        response["orchestrator_thread_id"] = turn.get("thread_id") or ""
+        execute(
+            "UPDATE consultations SET orchestrator_response_json=?,orchestrator_thread_id=? WHERE id=?",
+            (json.dumps(response, ensure_ascii=False), response["orchestrator_thread_id"], consultation["id"]),
+        )
+        if response["action"] in ("answer_worker", "revise_contract"):
+            contract = response["revised_contract"] if response["action"] == "revise_contract" else safe_json(fresh.get("contract_json"), {})
+            execute(
+                """UPDATE tasks SET status=?,contract_json=?,instructions=?,error=?,
+                   waiting_reason='',consultation_id='',worker_resume_message=?,finished_at=NULL WHERE id=?""",
+                (
+                    "pending",
+                    json.dumps(contract, ensure_ascii=False),
+                    contract.get("objective") or fresh.get("instructions") or response["worker_message"],
+                    "",
+                    worker_resume_message(response, contract),
+                    fresh["id"],
+                ),
+            )
+            execute(
+                "UPDATE consultations SET status=?,resolved_at=? WHERE id=?",
+                ("resolved", now(), consultation["id"]),
+            )
+            execute(
+                "UPDATE plans SET pending_question_id=?,pending_question_json=?,error=?,status=? WHERE id=?",
+                ("", "{}", "", "running", plan["id"]),
+            )
+            log(
+                orchestrator_log_id(plan["id"]),
+                "supervisor",
+                f"TASK-{fresh['seq']+1:03d} decision received · same worker thread will resume",
+            )
+            record_control_event(plan["id"], "agentdock.worker_resume", {
+                "task_id": fresh["id"],
+                "consultation_id": consultation["id"],
+                "worker_thread_id": fresh.get("worker_thread_id") or payload.get("worker_thread_id") or "",
+                "orchestrator_thread_id": response["orchestrator_thread_id"],
+                "message": response["worker_message"],
+            }, task_id=fresh["id"])
+            write_mission_docs(plan["id"])
+            return {
+                "ok": True,
+                "retry": True,
+                "worker_message": response["worker_message"],
+                "task": one("SELECT * FROM tasks WHERE id=?", (fresh["id"],)),
+            }
+        if response["action"] == "ask_user":
+            pending = _set_pending_consultation(plan["id"], fresh, payload, response)
+            pending["orchestrator_thread_id"] = response["orchestrator_thread_id"]
+            execute(
+                "UPDATE plans SET pending_question_json=? WHERE id=?",
+                (json.dumps(pending, ensure_ascii=False), plan["id"]),
+            )
+            log(orchestrator_log_id(plan["id"]), "supervisor", "mission paused · worker requires user information")
+            write_mission_docs(plan["id"])
+            return {"ok": False, "waiting_for_user": True, "pending": pending}
+        reason = response["reason"] or "Orchestrator blocked the mission."
+        execute(
+            "UPDATE consultations SET status=?,resolved_at=? WHERE id=?",
+            ("blocked", now(), consultation["id"]),
+        )
+        execute(
+            "UPDATE tasks SET status=?,error=?,waiting_reason=? WHERE id=?",
+            ("blocked", reason, "", fresh["id"]),
+        )
+        execute(
+            "UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?",
+            ("blocked", reason, now(), plan["id"]),
+        )
+        log(orchestrator_log_id(plan["id"]), "supervisor", f"mission blocked by orchestrator decision · {reason}")
+        write_mission_docs(plan["id"])
+        return {"ok": False, "blocked": True, "error": reason}
+    except Exception as exc:
+        message = f"Worker consultation could not be resolved: {exc}"
+        execute(
+            "UPDATE tasks SET status=?,error=?,waiting_reason=? WHERE id=?",
+            ("attention", message, payload.get("question") or "", fresh["id"]),
+        )
+        execute("UPDATE consultations SET status=?,orchestrator_response_json=? WHERE id=?",
+                ("failed", json.dumps({"error": message}, ensure_ascii=False), consultation["id"]))
+        execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("attention", message, plan["id"]))
+        log(orchestrator_log_id(plan["id"]), "supervisor", message)
+        write_mission_docs(plan["id"])
+        return {"ok": False, "attention": True, "error": message}
+
 
 def escalation_prompt(plan, task, worker_output):
     contract = safe_json(task.get("contract_json"), {})
@@ -3107,31 +4233,20 @@ def resolve_worker_escalation(plan, task, result, workspace, ctx=None):
     if count >= 2:
         log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} escalation retry limit reached")
         return False
-    if result.get("write") and result.get("wt") and ctx:
-        remove_worktree(ctx["repo_root"], result["wt"])
-        if result.get("branch"):
-            delete_branch(ctx["repo_root"], result["branch"])
     log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} escalated a reserved decision; root orchestrator is resolving it")
     try:
-        text, used = run_orchestrator(
-            escalation_prompt(plan, fresh, result.get("output") or result.get("error") or ""),
-            workspace, plan["orchestrator_model"], orchestrator_log_id(plan["id"]),
-            plan["orchestrator_effort"], plan["orchestrator_tier"],
-            transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
-        )
-        obj = extract_json(text)
-        if obj.get("action") == "retry" and isinstance(obj.get("contract"), dict):
-            execute(
-                "UPDATE tasks SET contract_json=?, instructions=?, status=?, error=?, escalation_count=? WHERE id=?",
-                (json.dumps(obj["contract"], ensure_ascii=False), obj["contract"].get("objective") or fresh.get("instructions") or "", "pending", "", count + 1, task["id"]),
+        if not fresh.get("consultation_id"):
+            created = create_worker_consultation(
+                plan,
+                fresh,
+                result.get("output") or result.get("error") or "Worker needs an orchestrator decision.",
             )
-            log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} contract revised by {used}; worker will retry without making the decision")
-            write_mission_docs(plan["id"])
+            if created:
+                fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or fresh
+        resolved = resolve_worker_consultation(plan, fresh, result=result, ctx=ctx)
+        if resolved.get("retry"):
+            execute("UPDATE tasks SET escalation_count=? WHERE id=?", (count + 1, task["id"]))
             return True
-        reason = obj.get("reason") or "Orchestrator chose not to retry this escalation."
-        execute("UPDATE tasks SET status=?, error=?, escalation_count=? WHERE id=?", ("blocked", reason, count + 1, task["id"]))
-        log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} remains blocked: {reason}")
-        write_mission_docs(plan["id"])
         return False
     except Exception as e:
         execute("UPDATE tasks SET status=?, error=?, escalation_count=? WHERE id=?", ("blocked", f"Orchestrator escalation resolution failed: {e}", count + 1, task["id"]))
@@ -3161,14 +4276,13 @@ DEPENDENCY RESULTS:
 {task_dependency_context(task) or 'None.'}
 
 Diagnose only whether the worker can succeed with a more explicit version of the SAME task contract.
-Return ONLY JSON:
-{{"action":"retry","note":"brief diagnosis","contract":{{...complete revised contract...}}}}
-or
-{{"action":"stop","reason":"why automatic recovery is unsafe or cannot help"}}
+Return ONLY the consultation JSON object with action `revise_contract` or `block_mission`.
+For revise_contract, include the COMPLETE revised contract in `revised_contract` and
+a concrete `worker_message`. For block_mission, explain why automatic recovery is unsafe.
 
 Rules:
 - Do not broaden scope, change product behavior, add dependencies, alter public APIs, or make destructive changes.
-- A retry contract must be complete and more concrete: exact steps, paths, acceptance criteria and verification.
+- A revised contract must be complete and more concrete: exact steps, paths, acceptance criteria and verification.
 - Preserve the original task objective unless the failure proves it impossible.
 - If a user/product/architecture decision is required, stop rather than guessing.
 """
@@ -3188,16 +4302,18 @@ def resolve_worker_failure(plan, task, result, ctx=None):
     log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} failed; root orchestrator is diagnosing one bounded recovery attempt")
     execute("UPDATE plans SET recovery_count=recovery_count+1 WHERE id=?", (plan["id"],))
     try:
-        text, used = run_orchestrator(
+        turn = run_mission_orchestrator_turn(
+            plan["id"],
+            "failure_recovery",
             failure_recovery_prompt(plan, fresh, result),
-            ctx["integration_workspace"] if ctx else plan["workspace"],
-            plan["orchestrator_model"], orchestrator_log_id(plan["id"]),
-            plan["orchestrator_effort"], plan["orchestrator_tier"],
+            expected_output_schema=consultation_schema_path(),
+            mode="read",
             transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
         )
-        obj = extract_json(text)
-        if obj.get("action") == "retry" and isinstance(obj.get("contract"), dict):
-            contract = obj["contract"]
+        obj = normalize_consultation_result(extract_json(turn["text"]))
+        used = turn.get("model") or plan.get("orchestrator_used") or plan["orchestrator_model"]
+        if obj.get("action") in ("revise_contract", "answer_worker") and isinstance(obj.get("revised_contract"), dict) and obj.get("revised_contract"):
+            contract = obj["revised_contract"]
             execute(
                 "UPDATE tasks SET contract_json=?, instructions=?, status='pending', error='', output='', started_at=NULL, finished_at=NULL, repair_count=? WHERE id=?",
                 (json.dumps(contract, ensure_ascii=False), contract.get("objective") or fresh.get("instructions") or "", count + 1, task["id"]),
@@ -3325,6 +4441,10 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             log(orchestrator_log_id(plan_id), "supervisor", "no tasks in mission; execution preflight skipped")
             write_mission_docs(plan_id)
             return
+        if plan.get("status") == "waiting_for_user" and plan.get("pending_question_id"):
+            log(orchestrator_log_id(plan_id), "supervisor", "mission is waiting for a persisted user answer; execution remains paused")
+            write_mission_docs(plan_id)
+            return
         tasks = all_tasks
         if read_only_only:
             # A read-only continuation may run a safe read subgraph, but must
@@ -3351,8 +4471,11 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             log(orchestrator_log_id(plan_id), "supervisor", f"read-only continuation selected {len(tasks)} task(s); write tasks remain paused")
         has_write = any(t["mode"] == "write" for t in tasks)
         ctx = None
-        if plan.get("status") == "attention":
-            reset_plan_for_retry(plan)
+        preserve_restart_checkpoint = bool(
+            plan.get("status") == "attention" and int(plan.get("restart_recovery_pending") or 0)
+        )
+        if plan.get("status") == "attention" and not read_only_only:
+            reset_plan_for_retry(plan, preserve_completed=preserve_restart_checkpoint)
             plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
             tasks = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
             has_write = any(t["mode"] == "write" for t in tasks)
@@ -3374,7 +4497,24 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
         log(orchestrator_log_id(plan_id), "supervisor", "mission execution started")
         write_mission_docs(plan_id)
         if has_write:
-            ctx = prepare_integration(plan)
+            checkpoint_exists = bool(
+                plan.get("base_commit")
+                and plan.get("integration_workspace")
+                and Path(str(plan.get("integration_workspace"))).is_dir()
+                and any(
+                    task.get("status") in ("done", "executed", "waiting_for_orchestrator", "waiting_for_user")
+                    for task in tasks
+                )
+            )
+            if preserve_restart_checkpoint or checkpoint_exists:
+                # Do not recreate an integration worktree after a restart: it
+                # is the durable checkpoint containing completed write tasks or
+                # a paused consultation. The same rule also protects a user
+                # answer that resumes a partially integrated mission.
+                ctx = stored_integration_context(plan)
+                log(orchestrator_log_id(plan_id), "supervisor", "resuming from the persisted integration checkpoint; completed tasks will not rerun")
+            else:
+                ctx = prepare_integration(plan)
         else:
             info = repo_info(plan["workspace"])
             workspace = Path(plan["workspace"]).expanduser().resolve()
@@ -3394,6 +4534,24 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
         while pending:
             ready = ready_tasks(plan_id, pending)
             if not ready:
+                # Resolve queued worker consultations only after all currently
+                # runnable independent work has had a chance to execute. This
+                # keeps one worker's question from pausing unrelated workers.
+                queued_resolution = resolve_waiting_consultations(plan, list(pending.values()), ctx=ctx)
+                if queued_resolution.get("resolved"):
+                    tasks = [one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task for task in tasks]
+                    pending = {task["seq"]: task for task in tasks if task.get("status") not in ("done", "executed")}
+                    continue
+                if queued_resolution.get("waiting_for_user") or queued_resolution.get("attention") or queued_resolution.get("blocked"):
+                    write_mission_docs(plan_id)
+                    return
+                waiting = [
+                    task for task in pending.values()
+                    if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user")
+                ]
+                if waiting:
+                    log(orchestrator_log_id(plan_id), "supervisor", "no runnable tasks; waiting consultations remain durable")
+                    break
                 if pending:
                     for task in pending.values():
                         execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("blocked", "Dependency cycle or missing dependency", now(), task["id"]))
@@ -3411,17 +4569,40 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                 results = [f.result() for f in futs]
 
             # Integrate only after the whole wave has completed, so workers truly run from the same snapshot.
+            pause_for_user = False
             for result in sorted(results, key=lambda r: r["task"]["seq"]):
                 task = result["task"]
                 if result.get("cancelled"):
                     log(orchestrator_log_id(plan_id), "supervisor", f"TASK-{task['seq']+1:03d} stopped by user; mission will require attention")
                     pending.pop(task["seq"], None)
                     continue
-                if result.get("blocked"):
-                    retry = resolve_worker_escalation(plan, task, result, ctx["integration_workspace"], ctx)
-                    if retry:
+                if pause_for_user and result.get("waiting_for_orchestrator"):
+                    # Keep the durable consultation queued. It will be sent
+                    # to the same orchestrator thread after the first user
+                    # question is answered.
+                    continue
+                if result.get("waiting_for_orchestrator"):
+                    resolution = resolve_worker_consultation(plan, task, result=result, ctx=ctx)
+                    if resolution.get("retry"):
                         pending[task["seq"]] = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
-                        continue
+                    elif resolution.get("waiting_for_user"):
+                        pause_for_user = True
+                    elif resolution.get("attention"):
+                        pause_for_user = True
+                    else:
+                        pending.pop(task["seq"], None)
+                    continue
+                if result.get("blocked"):
+                    resolution = resolve_worker_consultation(plan, task, result=result, ctx=ctx)
+                    if resolution.get("retry"):
+                        pending[task["seq"]] = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+                    elif resolution.get("waiting_for_user"):
+                        pause_for_user = True
+                    elif resolution.get("attention"):
+                        pause_for_user = True
+                    else:
+                        pending.pop(task["seq"], None)
+                    continue
                 if not result.get("ok") and not result.get("blocked"):
                     retry = resolve_worker_failure(plan, task, result, ctx)
                     if retry:
@@ -3434,9 +4615,34 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                 pending.pop(task["seq"], None)
             log(orchestrator_log_id(plan_id), "supervisor", "wave complete; integrated successful results and resolved escalations")
             write_mission_docs(plan_id)
+            if pause_for_user:
+                log(orchestrator_log_id(plan_id), "supervisor", "mission paused until the user answers a worker consultation")
+                # Independent tasks from the same or a later wave may still
+                # run. waiting_for_user tasks are filtered out by ready_tasks;
+                # their dependents remain blocked until the answer arrives.
+                write_mission_docs(plan_id)
 
         task_rows = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
         all_done = bool(task_rows) and all(t["status"] in ("done", "executed") for t in task_rows)
+
+        waiting_rows = [
+            task for task in task_rows
+            if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user")
+        ]
+        if waiting_rows:
+            has_user_question = any(task.get("status") == "waiting_for_user" for task in waiting_rows)
+            summary = (
+                "Independent work completed. One or more workers are waiting for your information."
+                if has_user_question
+                else "Independent work completed. Worker consultations are queued for the orchestrator."
+            )
+            execute(
+                "UPDATE plans SET status=?,summary=?,finished_at=NULL WHERE id=?",
+                ("waiting_for_user" if has_user_question else "running", summary, plan_id),
+            )
+            log(orchestrator_log_id(plan_id), "supervisor", summary)
+            write_mission_docs(plan_id)
+            return
 
         if read_only_only and not all_done:
             selected_read_seqs = {t["seq"] for t in tasks}
@@ -3452,15 +4658,34 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                 log(orchestrator_log_id(plan_id), "supervisor", "read-only continuation complete; write tasks remain waiting for user")
                 write_mission_docs(plan_id)
                 return
+            summary = "Read-only phase complete. Dependent or write tasks remain paused."
+            execute("UPDATE plans SET status=?,summary=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", summary, "The selected read-only graph is complete; remaining tasks require the next execution phase.", plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", "read-only phase checkpoint saved; final synthesis deferred")
+            write_mission_docs(plan_id)
+            return
+
+        if not all_done:
+            summary = "Mission paused because one or more tasks did not complete; final synthesis was deferred."
+            current_error = (one("SELECT error FROM plans WHERE id=?", (plan_id,)) or {}).get("error") or ""
+            execute(
+                "UPDATE plans SET status=?,summary=?,error=?,finished_at=NULL WHERE id=?",
+                ("attention", summary, current_error, plan_id),
+            )
+            log(orchestrator_log_id(plan_id), "supervisor", "mission incomplete; final synthesis deferred until every required task completes")
+            write_mission_docs(plan_id)
+            return
 
         synth_workspace = ctx["integration_workspace"] if has_write else Path(plan["workspace"])
         try:
             log(orchestrator_log_id(plan_id), "supervisor", "starting final orchestrator synthesis")
-            summary, used_model = run_orchestrator(
-                synthesis_prompt(plan, task_rows), synth_workspace, plan["orchestrator_model"],
-                orchestrator_log_id(plan_id), plan["orchestrator_effort"], plan["orchestrator_tier"],
+            turn = run_mission_orchestrator_turn(
+                plan_id,
+                "final_synthesis",
+                synthesis_prompt(plan, task_rows),
+                mode="read",
                 transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
             )
+            summary, used_model = turn["text"], turn["model"]
             execute("UPDATE plans SET summary=?, orchestrator_used=? WHERE id=?", (summary, used_model, plan_id))
         except Exception as e:
             summary = f"Final orchestrator synthesis failed: {e}"
@@ -3505,7 +4730,47 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
 
 
 def latest_orchestrator_session(plan_id):
-    return one("SELECT * FROM agent_sessions WHERE plan_id=? AND kind LIKE '%orchestrator%' ORDER BY started_at DESC LIMIT 1", (plan_id,))
+    return one(
+        """SELECT * FROM agent_sessions
+           WHERE plan_id=? AND kind LIKE '%orchestrator%'
+           ORDER BY CASE WHEN thread_id!='' THEN 0 ELSE 1 END, started_at DESC, rowid DESC
+           LIMIT 1""",
+        (plan_id,),
+    )
+
+
+def orchestrator_session_usage(session_id):
+    """Extract the provider-reported token usage for the latest orchestrator turn."""
+    if not session_id:
+        return {}
+    events = rows(
+        "SELECT event_type,payload_json FROM agent_events WHERE session_id=? ORDER BY id DESC LIMIT 120",
+        (session_id,),
+    )
+    for event in events:
+        if event.get("event_type") not in ("turn.completed", "turn/completed", "response.completed"):
+            continue
+        payload = safe_json(event.get("payload_json"), {})
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        usage = payload.get("usage") or params.get("usage") or turn.get("usage") or {}
+        if isinstance(usage, dict):
+            return usage
+    return {}
+
+
+def plan_consultations(plan_id):
+    result = rows(
+        "SELECT * FROM consultations WHERE plan_id=? ORDER BY created_at DESC,id DESC LIMIT 50",
+        (plan_id,),
+    )
+    for item in result:
+        item["evidence"] = safe_json(item.get("evidence_json"), [])
+        item["options"] = safe_json(item.get("options_json"), [])
+        item["orchestrator_response"] = safe_json(item.get("orchestrator_response_json"), {})
+        item["user_questions"] = safe_json(item.get("user_questions_json"), [])
+        item["user_answer"] = safe_json(item.get("user_answer_json"), {})
+    return result
 
 
 def queued_messages(task_id):
@@ -3550,12 +4815,142 @@ def run_orchestrator_followup(plan_id, prompt, image_paths=None):
         time.sleep(0.35)
         log(oid, 'supervisor', 'demo orchestrator received the manual instruction; task assignments remain user-controlled in Plan Review')
         return
-    sess=latest_orchestrator_session(plan_id)
-    thread_id=(sess or {}).get('thread_id') or ''
-    if not thread_id:
-        raise ValueError('Orchestrator conversation is not resumable yet.')
-    text, used=run_orchestrator(prompt, plan['workspace'], plan['orchestrator_model'], orchestrator_log_id(plan_id), plan['orchestrator_effort'], plan['orchestrator_tier'], mode='read', images=image_paths or []) if not thread_id else (run_codex(prompt, plan['workspace'], 'read', plan.get('orchestrator_used') or plan['orchestrator_model'], orchestrator_log_id(plan_id), plan['orchestrator_effort'], plan['orchestrator_tier'], images=image_paths or [], resume_thread_id=thread_id, session_kind='orchestrator-manual'), plan.get('orchestrator_used') or plan['orchestrator_model'])
-    log(orchestrator_log_id(plan_id), 'manual', 'manual orchestrator follow-up completed')
+    turn = run_mission_orchestrator_turn(
+        plan_id,
+        "manual_message",
+        prompt,
+        mode="read",
+        images=image_paths or [],
+        requested_model=plan.get("orchestrator_used") or plan.get("orchestrator_model"),
+        transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
+    )
+    log(
+        orchestrator_log_id(plan_id),
+        "manual",
+        f"manual orchestrator follow-up completed on thread {turn.get('thread_id', '')[:12]}",
+    )
+
+
+def answer_consultation(plan_id, consultation_id, answer, attachments=None):
+    """Persist a user answer, resolve it on the same root thread, then resume work."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    consultation = one("SELECT * FROM consultations WHERE id=? AND plan_id=?", (consultation_id, plan_id))
+    if not plan or not consultation:
+        raise ValueError("Consultation bulunamadı")
+    if consultation.get("status") != "waiting_for_user":
+        raise ValueError("Bu consultation artık kullanıcı cevabı beklemiyor")
+    answer_text = str(answer or "").strip()
+    attachment_paths = [str(x) for x in (attachments or []) if x and Path(str(x)).is_file()]
+    if not answer_text and not attachment_paths:
+        raise ValueError("Bir cevap veya dosya eklenmelidir")
+    answer_payload = {
+        "text": answer_text,
+        "attachments": attachment_paths,
+        "answered_at": now(),
+    }
+    execute(
+        "UPDATE consultations SET status=?,user_answer_json=? WHERE id=?",
+        ("resolving", json.dumps(answer_payload, ensure_ascii=False), consultation_id),
+    )
+    record_control_event(plan_id, "agentdock.user_answer", {
+        "consultation_id": consultation_id,
+        "task_id": consultation.get("task_id") or "",
+        "answer": answer_payload,
+    }, task_id=consultation.get("task_id") or "")
+    log(orchestrator_log_id(plan_id), "supervisor", f"user answer recorded for consultation {consultation_id[:12]}")
+    task = one("SELECT * FROM tasks WHERE id=?", (consultation["task_id"],))
+    if not task:
+        raise ValueError("Consultation task bulunamadı")
+    resolved = resolve_worker_consultation(
+        plan,
+        task,
+        result={"consultation_id": consultation_id},
+        user_answer=answer_payload,
+    )
+    if resolved.get("retry"):
+        execute(
+            "UPDATE plans SET status=?,pending_question_id=?,pending_question_json=?,error=?,finished_at=NULL WHERE id=?",
+            ("approved", "", "{}", "", plan_id),
+        )
+        log(orchestrator_log_id(plan_id), "supervisor", "user answer accepted · resuming the same worker and remaining graph")
+        if claim_plan_run(plan_id):
+            threading.Thread(
+                target=run_plan,
+                args=(plan_id,),
+                kwargs={"claimed": True},
+                daemon=True,
+            ).start()
+        return {"ok": True, "status": "approved", "resuming": True}
+    if resolved.get("waiting_for_user"):
+        return {"ok": True, "status": "waiting_for_user", "pending": resolved.get("pending") or {}}
+    if resolved.get("blocked"):
+        return {"ok": False, "status": "blocked", "error": resolved.get("error") or ""}
+    return {"ok": False, "status": "attention", "error": resolved.get("error") or "Consultation could not be resolved."}
+
+
+def reconstruct_orchestrator_context(plan_id):
+    """Start a new orchestrator generation only after an explicit user action."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if plan.get("status") in ("planning", "preflight", "running"):
+        raise ValueError("Mission zaten çalışıyor")
+    task_rows = rows("SELECT seq,title,status,output,error,contract_json FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
+    context = f"""The user explicitly requested: Reconstruct orchestrator context.
+
+MISSION:
+{plan['goal']}
+
+Persisted mission state:
+{json.dumps({
+    "status": plan.get("status"),
+    "decision": plan.get("decision"),
+    "summary": plan.get("summary"),
+    "tasks": task_rows,
+    "legacy_state": plan.get("legacy_orchestrator_status"),
+}, ensure_ascii=False, indent=2)[:80000]}
+
+Reconstruct a single coherent control-plane context from the persisted mission
+records. Do not execute workers in this turn and do not silently discard any
+completed task output. Briefly acknowledge the reconstructed context and state
+what the next safe action is.
+"""
+    execute(
+        "UPDATE plans SET orchestrator_turn_status=?,orchestrator_last_error=?,legacy_orchestrator_status=? WHERE id=?",
+        ("reconstructing", "", "reconstructing", plan_id),
+    )
+    log(orchestrator_log_id(plan_id), "supervisor", "explicit orchestrator context reconstruction requested by user")
+    try:
+        turn = run_mission_orchestrator_turn(
+            plan_id,
+            "reconstruct",
+            context,
+            mode="read",
+            transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
+        )
+        execute(
+            "UPDATE plans SET legacy_orchestrator_status=?,orchestrator_last_error=?,summary=? WHERE id=?",
+            ("reconstructed", "", turn.get("text") or "", plan_id),
+        )
+        log(orchestrator_log_id(plan_id), "supervisor", "orchestrator context reconstructed; future turns use the new thread")
+        write_mission_docs(plan_id)
+        return {"ok": True, "thread_id": turn.get("thread_id") or "", "generation": one("SELECT orchestrator_generation FROM plans WHERE id=?", (plan_id,)).get("orchestrator_generation")}
+    except Exception:
+        execute(
+            "UPDATE plans SET legacy_orchestrator_status=?,orchestrator_turn_status=? WHERE id=?",
+            ("reconstruct_required", "attention", plan_id),
+        )
+        write_mission_docs(plan_id)
+        raise
+
+
+def _run_reconstruct_and_release(plan_id):
+    try:
+        reconstruct_orchestrator_context(plan_id)
+    except Exception as exc:
+        log(orchestrator_log_id(plan_id), "supervisor", f"orchestrator reconstruction failed: {exc}")
+    finally:
+        release_plan_run(plan_id)
 
 
 def open_terminal_at(path):
@@ -3669,7 +5064,7 @@ class Handler(SimpleHTTPRequestHandler):
             engines = engine_status()
             return self.send_json({
                 "ok": True,
-                "version": "0.11.0",
+                "version": "0.12.0",
                 "db": str(DB),
                 "engines": engines,
                 "codex_transport": CODEX_TRANSPORT,
@@ -3684,6 +5079,8 @@ class Handler(SimpleHTTPRequestHandler):
                 pl["evidence"] = safe_json(pl.get("evidence_json"), [])
                 pl["questions"] = safe_json(pl.get("questions_json"), [])
                 pl["workspace_snapshot"] = safe_json(pl.get("workspace_snapshot_json"), {})
+                pl["pending_question"] = safe_json(pl.get("pending_question_json"), {})
+                pl["consultations"] = plan_consultations(pl["id"])
             workspaces = [workspace_summary(w) for w in rows("SELECT * FROM workspaces ORDER BY last_opened_at DESC, created_at DESC")]
             return self.send_json(
                 {
@@ -3713,6 +5110,8 @@ class Handler(SimpleHTTPRequestHandler):
             plan["evidence"] = safe_json(plan.get("evidence_json"), [])
             plan["questions"] = safe_json(plan.get("questions_json"), [])
             plan["workspace_snapshot"] = safe_json(plan.get("workspace_snapshot_json"), {})
+            plan["pending_question"] = safe_json(plan.get("pending_question_json"), {})
+            consultations = plan_consultations(pid)
             tasks = rows(
                 """SELECT t.*, a.name AS agent_name, a.role AS agent_role, a.model AS agent_model,
                           a.reasoning_effort AS agent_effort, a.service_tier AS agent_tier
@@ -3737,6 +5136,13 @@ class Handler(SimpleHTTPRequestHandler):
                 "model": plan.get("orchestrator_used") or plan.get("orchestrator_model"),
                 "reasoning_effort": plan.get("orchestrator_effort"),
                 "service_tier": plan.get("orchestrator_tier"),
+                "thread_id": plan.get("orchestrator_thread_id") or "",
+                "generation": int(plan.get("orchestrator_generation") or 1),
+                "turn_status": plan.get("orchestrator_turn_status") or "",
+                "last_turn_id": plan.get("orchestrator_last_turn_id") or "",
+                "last_error": plan.get("orchestrator_last_error") or "",
+                "legacy_state": plan.get("legacy_orchestrator_status") or "",
+                "consultations": consultations,
                 "recent_logs": list(reversed(orch_logs)),
             }
             doctor_logs = rows("SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 80", (doctor_log_id(pid),))
@@ -3749,7 +5155,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "recent_logs": doctor_logs,
             }
             q = quota_status()
-            return self.send_json({"plan": plan, "tasks": tasks, "orchestrator": orchestrator, "doctor": doctor, "quota": q, "mission_usage": mission_usage(plan, q), "server_time": now()})
+            return self.send_json({"plan": plan, "tasks": tasks, "orchestrator": orchestrator, "consultations": consultations, "doctor": doctor, "quota": q, "mission_usage": mission_usage(plan, q), "server_time": now()})
         if p.startswith("/api/logs/"):
             tid = p.split("/api/logs/",1)[1]
             return self.send_json({"logs": rows("SELECT * FROM logs WHERE task_id=? ORDER BY id", (tid,))})
@@ -3943,6 +5349,50 @@ class Handler(SimpleHTTPRequestHandler):
                 note = (data.get("note") or "").strip()
                 return self.send_json(replan_mission(pid, mode=mode, user_note=note))
 
+            if p.startswith("/api/consultation-answer/"):
+                pid = p.split("/api/consultation-answer/", 1)[1]
+                consultation_id = (data.get("consultation_id") or "").strip()
+                if not consultation_id:
+                    raise ValueError("Consultation id gerekli")
+                consultation = one(
+                    "SELECT task_id FROM consultations WHERE id=? AND plan_id=?",
+                    (consultation_id, pid),
+                )
+                if not consultation:
+                    raise ValueError("Consultation bulunamadı")
+                saved = []
+                for item in (data.get("attachments") or [])[:8]:
+                    if isinstance(item, dict) and item.get("data_base64"):
+                        saved.append(
+                            save_attachment(
+                                pid,
+                                item.get("name") or "consultation.png",
+                                item.get("mime") or "image/png",
+                                item["data_base64"],
+                                task_id=consultation["task_id"],
+                            )
+                        )
+                answer = (data.get("answer") or "").strip()
+                option = (data.get("option") or "").strip()
+                if option:
+                    answer = f"{option}\n{answer}".strip()
+                return self.send_json(
+                    answer_consultation(pid, consultation_id, answer, [x["path"] for x in saved])
+                )
+
+            if p.startswith("/api/reconstruct-orchestrator/"):
+                pid = p.split("/api/reconstruct-orchestrator/", 1)[1]
+                plan = one("SELECT * FROM plans WHERE id=?", (pid,))
+                if not plan:
+                    raise ValueError("Mission bulunamadı")
+                if not claim_plan_run(pid):
+                    return self.send_json({"error": "Bu mission için başka bir işlem zaten çalışıyor."}, 409)
+                threading.Thread(
+                    target=lambda: _run_reconstruct_and_release(pid),
+                    daemon=True,
+                ).start()
+                return self.send_json({"ok": True, "status": "reconstructing"})
+
             if p.startswith("/api/preflight-action/"):
                 pid = p.split("/api/preflight-action/", 1)[1]
                 return self.send_json(apply_preflight_action(pid, data.get("action"), data.get("paths") or []))
@@ -4061,7 +5511,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     init_db()
     url = f"http://{HOST}:{PORT}"
-    print(f"AgentDock v0.11 running at {url}")
+    print(f"AgentDock v0.12 running at {url}")
     print("Auth mode: Codex CLI signed in with ChatGPT (Plus supported).")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

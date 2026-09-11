@@ -1,4 +1,4 @@
-# AgentDock v0.11 — Supervised Mission Control
+# AgentDock v0.12 — Supervised Mission Control
 
 AgentDock is a local multi-agent control plane for Codex. The orchestrator first decides what the mission needs; it creates worker tasks only when real execution is required. Write workers execute approved tasks in isolated Git worktrees. The normal path reuses the existing ChatGPT-authenticated Codex CLI and requires no API key.
 
@@ -138,6 +138,26 @@ AGENTDOCK_CODEX_TRANSPORT=app-server python3 agentdock.py
 
 The adapter records thread, turn, plan, reasoning, command, file-change, and completion events while preserving AgentDock's approval and workspace safety gates. See the [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
 
+## What changed in v0.12
+
+### One orchestrator conversation per mission
+
+Each mission has one durable, mission-scoped orchestrator thread. Initial disposition, manual orchestrator messages, worker consultations, recovery decisions, checkpoint summaries, and final synthesis all resume that same conversation. A failed resume moves the mission to attention; AgentDock never silently starts a second orchestrator thread. A new generation is created only through the explicit **Reconstruct context** action for legacy or unrecoverable missions.
+
+Workers keep their own durable `worker_thread_id`. When a worker reaches a reserved product, architecture, scope, factual, or safety decision, it returns a structured consultation. The orchestrator processes consultations serially per mission and either sends a bounded handoff to the same worker, revises its contract, asks the user, or blocks the mission. Independent workers continue while only the affected worker and its dependents wait.
+
+When user information is needed, the mission becomes `waiting_for_user` and the main mission view shows the question, evidence, options, free text, and image attachment controls. The answer is recorded before the orchestrator turn resumes; the updated contract and answer are then delivered to the same worker thread. Manual Control remains a separate orchestrator conversation action and is not used as a substitute for a pending execution answer.
+
+### Baseline-based read-only safety
+
+Read tasks compare a workspace fingerprint captured immediately before the task with the fingerprint after it. Existing staged, unstaged, and untracked user work is therefore a valid baseline. Only a new or changed path, content, index state, HEAD, or tracked diff fails the read task; no user change is automatically reverted. Git locks are warnings for read-only work and explicit blockers for writes.
+
+### Restart and partial execution recovery
+
+On restart, interrupted work moves to explicit attention while completed task checkpoints remain intact. Pending consultations are requeued from SQLite, completed read tasks are not rerun, and a persisted integration worktree is reused when safe. Partial read-only execution completes only independent read work; dependent write/test/review tasks and final synthesis wait for the next safe execution phase.
+
+The durable coordination records live in `orchestrator_turns` and `consultations`, while the mission mirror includes the orchestrator thread, generation, turn status, pending questions, consultation history, and worker handoff messages.
+
 ## Quick start
 
 ```bash
@@ -210,7 +230,7 @@ Then:
 ```bash
 pkill -f "agentdock.py" 2>/dev/null || true
 cd ~/Downloads
-unzip agentdock-v11-supervised-control.zip
+unzip agentdock-v12-supervised-control.zip
 cd agentdock
 python3 agentdock.py
 ```

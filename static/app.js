@@ -4,8 +4,8 @@ let selectedPlanId=null, selectedWorkspaceId=null, planning=false;
 let missionAttachments=[], manualAttachments=[], inspectorTaskId=null;
 let logTimer=null, stateTimer=null, liveTimer=null, inspectorTimer=null;
 const $=id=>document.getElementById(id);
-const decisionLabels={already_satisfied:'Already satisfied',answer_only:'Answer only',needs_user_input:'Waiting for your decision',blocked:'Blocked for safety or authority',execute:'Execution required'};
-const statusLabels={planning:'Planning',planned:'Plan ready',approved:'Approved',preflight:'Checking workspace',running:'Running',awaiting_apply:'Review changes',done:'Complete',attention:'Needs attention',waiting_for_user:'Waiting for you',blocked:'Blocked',cancelled:'Cancelled',failed:'Failed'};
+const decisionLabels={already_satisfied:'No work needed',answer_only:'Answer only',needs_user_input:'Needs your decision',blocked:'Blocked for safety or authority',execute:'Work required'};
+const statusLabels={planning:'Planning',planned:'Plan ready',approved:'Approved',preflight:'Checking workspace',running:'Running',awaiting_apply:'Review changes',done:'Complete',attention:'Needs attention',waiting_for_user:'Waiting for you',blocked:'Blocked',cancelled:'Cancelled',failed:'Failed',waiting_for_orchestrator:'Waiting for orchestrator',resuming:'Resuming worker'};
 
 async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});const j=await r.json();if(!r.ok)throw new Error(j.error||j.message||'Hata');return j}
 function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -56,7 +56,7 @@ async function refreshState(){
     if(selectedPlanId)await refreshLive();else renderNoMission();
   }catch(e){$('planMsg').textContent=e.message}
 }
-async function refreshLive(){if(!selectedPlanId)return;try{live=await api('/api/live/'+selectedPlanId);renderLive();if(inspectorTaskId)refreshInspector(false)}catch(e){if(String(e.message).includes('not found')){selectedPlanId=null;renderNoMission()}}}
+async function refreshLive(){if(!selectedPlanId)return;try{live=await api('/api/live/'+selectedPlanId);renderLive();if(inspectorTaskId)refreshInspector(false);if(String(inspectorTaskId||'').startsWith('orchestrator:'))setTimeout(()=>renderRootInspectorMeta(live.plan||{}),0)}catch(e){if(String(e.message).includes('not found')){selectedPlanId=null;renderNoMission()}}}
 
 function renderChrome(){const c=state.engines.codex||{},g=state.engines.git||{},q=state.quota||{};$('engineStatus').innerHTML=`<div class="engine-pill"><span>codex</span><span class="${c.installed?'on':'off'}">${c.installed?'online':'missing'}</span></div>${c.version?`<div class="tiny">${esc(c.version)}</div>`:''}<div class="engine-pill"><span>git</span><span class="${g.installed?'on':'off'}">${g.installed?'online':'missing'}</span></div>`;$('quotaStrip').innerHTML=q.status==='error'?`<div class="quota-error">quota unavailable</div>`:`${quotaBucket('5H',q.five_hour)}${quotaBucket('WEEK',q.weekly)}`}
 
@@ -135,6 +135,14 @@ function renderDecisionPanel(p){
   const evidenceHtml=evidence.length?`<div class="decision-evidence"><span>VERIFIED WITH</span><ul>${evidence.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`:'';
   box.hidden=false;box.innerHTML=`<div class="decision-head"><div><span class="eyebrow">MISSION DECISION</span><h3>${esc(resultTitle)}</h3><p>${esc(p.decision_reason||'The orchestrator has classified this mission.')}</p></div><span class="decision-badge ${statusClass(decision)}">${esc(decisionLabel(decision))}</span></div><div class="decision-body">${response?`<div class="decision-response">${esc(response).replace(/\n/g,'<br>')}</div>`:''}${evidenceHtml}${questionHtml}</div>${actionButtons}`;
 }
+function renderConsultationPanel(p){
+  const box=$('decisionPanel'),pending=p.pending_question||{};
+  if(!box||pending.kind!=='execution_question')return;
+  const evidence=Array.isArray(pending.evidence)?pending.evidence:[],opts=Array.isArray(pending.options)?pending.options:[];
+  const options=opts.length?'<label class="consultation-option"><span>OPTION</span><select id="consultationOption"><option value="">Choose an option or write your own</option>'+opts.map(x=>'<option value="'+esc(x)+'">'+esc(x)+'</option>').join('')+'</select></label>':'';
+  const html='<section class="consultation-card"><div class="consultation-head"><div><span class="eyebrow">INFORMATION NEEDED</span><h3>'+esc(pending.question||'The worker needs a decision.')+'</h3><p>'+esc(pending.reason||'The worker stopped before making an unsafe assumption.')+'</p></div><span class="decision-badge status-needs-user-input">Waiting for your answer</span></div><div class="consultation-evidence"><span>WHY THIS WAS ASKED</span>'+(evidence.length?'<ul>'+evidence.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':'<p>No additional evidence was reported.</p>')+'</div>'+options+'<textarea id="consultationAnswer" class="consultation-answer" placeholder="Add the missing product or factual information…"></textarea><input id="consultationFiles" class="consultation-files" type="file" accept="image/*" multiple><div class="consultation-actions"><button class="primary compact" onclick="submitConsultationAnswer(\''+p.id+'\',\''+(pending.consultation_id||'')+'\')">Use this information</button><button class="secondary compact" onclick="leaveConsultationField(\''+p.id+'\',\''+(pending.consultation_id||'')+'\')">Leave this field out</button><button class="text-button danger" onclick="cancelConsultationMission(\''+p.id+'\')">Cancel mission</button></div></section>';
+  box.hidden=false;box.insertAdjacentHTML('beforeend',html);
+}
 function renderLive(){
   const p=live.plan,tasks=live.tasks||[],counts={running:0,pending:0,done:0,failed:0};
   tasks.forEach(t=>{if(t.status==='running')counts.running++;else if(t.status==='pending')counts.pending++;else if(['done','executed'].includes(t.status))counts.done++;else if(['failed','blocked','cancelled','attention'].includes(t.status))counts.failed++});
@@ -149,12 +157,13 @@ function renderLive(){
   $('missionBar').innerHTML=`<span class="mission-state ${statusClass(p.status)}"></span><span class="mission-name">${esc(ws?.name||'workspace')} · ${esc(stageLabel)}</span>${p.decision?`<span class="mission-chip decision-chip">${esc(decisionLabel(p.decision))}</span>`:''}${p.error&&p.status!=='waiting_for_user'?`<span class="mission-chip status-attention" title="${esc(p.error)}">⚠ ${esc(short(p.error,80))}</span>`:''}${p.demo_mode?'<span class="demo-badge">DEMO · NO QUOTA</span>':''}<span class="mission-spacer"></span>${(p.attachments||[]).length?`<span class="mission-chip">${p.attachments.length} attachments</span>`:''}<span class="mission-chip">${esc(p.orchestrator_used||p.orchestrator_model)} ${esc(p.orchestrator_effort)} → ${esc(p.worker_model)} ${esc(p.worker_effort)} × ${p.max_parallel}</span><button class="text-button" onclick="showDocs('${p.id}')">docs</button>${canApply?`<button class="secondary compact" onclick="showPlanDiff('${p.id}')">Review diff</button><button class="primary compact start-btn" onclick="applyPlan('${p.id}')">Apply changes ↵</button>`:''}${canRun?`<button class="primary compact start-btn" onclick="runPlan('${p.id}')">${p.status==='attention'?'Retry mission':'Start mission'} ↵</button>`:''}`;
   renderUsage();
   renderDecisionPanel(p);
+  renderConsultationPanel(p);
   renderPlanReview(p,tasks);
-  const rank={running:0,pending:1,failed:2,blocked:2,cancelled:2,attention:2,executed:3,done:3};
+  const rank={running:0,waiting_for_orchestrator:1,waiting_for_user:1,resuming:1,pending:2,failed:3,blocked:3,cancelled:3,attention:3,executed:4,done:4};
   const sorted=[...tasks].sort((a,b)=>(rank[a.status]??4)-(rank[b.status]??4)||a.seq-b.seq);
-  const doctor=renderDoctor(live.doctor||{}),orch=renderOrchestrator(live.orchestrator||{});
+  const doctor=renderDoctor(live.doctor||{}),orch=renderOrchestrator(live.orchestrator||{}),threadPanel=renderOrchestratorThreadPanel(live.orchestrator||{});
   const showWorkers=tasks.length>0&&!['planned','approved'].includes(p.status);
-  $('liveGrid').innerHTML=doctor+orch+(showWorkers&&sorted.length?sorted.map(renderTerminal).join(''):(['planning','preflight'].includes(p.status)?'':showWorkers?'<div class="empty-terminal"><span>agentdock@local:~$</span> no tasks_':''));
+  $('liveGrid').innerHTML=doctor+orch+threadPanel+(showWorkers&&sorted.length?sorted.map(renderTerminal).join(''):(['planning','preflight'].includes(p.status)?'':showWorkers?'<div class="empty-terminal"><span>agentdock@local:~$</span> no tasks_':''));
   renderTaskGraph(tasks,p);
 }
 function renderUsage(){const p=live.plan||{},q=live.quota||state.quota||{},mu=live.mission_usage||{};if(p.demo_mode){$('usagePanel').innerHTML=`<div class="usage-card"><span>CODEX QUOTA</span><div>${quotaBucket('5H',q.five_hour)}${quotaBucket('WEEK',q.weekly)}</div></div><div class="usage-card mission-usage demo-usage"><span>MISSION USAGE · DEMO</span><b>0% quota used</b><small>Local simulation only. No Codex model call is made.</small></div>`;return}function delta(d){if(!d)return '—';if(d.reset_during_mission)return 'window reset';const v=d.used_percent_delta;return `${v>0?'+':''}${v}% used`}$('usagePanel').innerHTML=`<div class="usage-card"><span>CODEX QUOTA</span><div>${quotaBucket('5H',q.five_hour)}${quotaBucket('WEEK',q.weekly)}</div></div><div class="usage-card mission-usage"><span>MISSION USAGE${mu.live?' · LIVE':''}</span><b>5H ${delta(mu.five_hour_delta)}</b><b>WEEK ${delta(mu.weekly_delta)}</b><small>Official snapshots; task attribution is not guessed.</small></div>`}
@@ -180,12 +189,21 @@ function renderOrchestrator(o){
   const title=noTask?'Disposition decided':p.status==='planning'?'Analyzing mission and workspace':p.status==='planned'?'Plan ready for review':p.status==='approved'?'Waiting for execution':'Monitoring task graph and integration';
   return `<article class="agent-terminal orchestrator-terminal clickable ${esc(status)}" onclick="openOrchestratorInspector()"><div class="agent-titlebar"><span class="status-led"></span><span class="agent-name">SUPERVISOR / ORCHESTRATOR</span><span class="agent-index">root</span><span class="agent-model">${esc(configLabel(o.model||p.orchestrator_model||'',o.reasoning_effort||p.orchestrator_effort,o.service_tier||p.orchestrator_tier))}</span></div><div class="agent-task"><div class="task-path">mission / control-plane</div><strong>${esc(title)}</strong><p>${esc(waiting||'Owns the disposition, architecture, scope, dependencies, escalation decisions and final synthesis.')}</p></div><div class="mini-terminal orchestrator-log">${working}${recent}</div><div class="agent-footer"><span>control</span><span>${esc(effortLabels[o.reasoning_effort||p.orchestrator_effort]||'')}</span><span class="footer-spacer"></span><button class="text-button" onclick="event.stopPropagation();openOrchestratorInspector(true)">message</button><button class="text-button" onclick="event.stopPropagation();logs('orchestrator:${p.id}','orchestrator')">Raw log</button></div></article>`
 }
+function renderOrchestratorThreadPanel(o){
+  const p=live.plan||{},thread=o.thread_id||p.orchestrator_thread_id||'',legacy=o.legacy_state||p.legacy_orchestrator_status||'',consultations=o.consultations||[];
+  if(!thread&&!legacy&&!consultations.length)return '';
+  const waiting=consultations.filter(x=>['queued','waiting_for_user','resolving'].includes(x.status)).length;
+  const action=['reconstruct_required','reconciliation_required'].includes(legacy)?'<button class="secondary compact" onclick="reconstructOrchestrator(\''+p.id+'\')">'+(legacy==='reconciliation_required'?'Reconcile context':'Reconstruct context')+'</button>':'';
+  return '<div class="orchestrator-thread-panel"><span class="eyebrow">MISSION ORCHESTRATOR SESSION</span><b>'+esc(thread?'One conversation · '+short(thread,22):'Context reconstruction required')+'</b><span>generation '+esc(String(o.generation||p.orchestrator_generation||1))+' · '+esc(o.turn_status||p.orchestrator_turn_status||'idle')+(waiting?' · '+waiting+' consultation(s) waiting':'')+'</span>'+(legacy?'<small>'+esc(legacy==='reconciliation_required'?'Legacy history needs reconciliation':legacy==='reconstruct_required'?'Legacy mission needs explicit reconstruction':legacy)+'</small>':'')+action+'</div>';
+}
 function renderTerminal(t){
-  const d=deps(t),logs=t.recent_logs||[];let lines='';
+  const d=deps(t),logs=['waiting_for_orchestrator','waiting_for_user'].includes(t.status)?[]:(t.recent_logs||[]);let lines='';
   const pausedForPreflight=['waiting_for_user','blocked'].includes(live.plan?.status)&&['waiting_for_user','blocked'].includes(live.plan?.preflight_status);
   const working=t.status==='running'?`<div class="classic-working"><i></i><b>Working</b><span>(${elapsed(t.started_at,null,live.server_time)} · stop to interrupt)</span></div>`:'';
   if(logs.length)lines=working+logs.slice(-7).map(l=>`<div class="term-line ${esc(l.stream)}">${l.stream==='stderr'?'! ':l.stream==='manual'?'> ':'$ '}${esc(short(l.line,220))}</div>`).join('');
   else if(t.status==='running')lines=working+`<div class="term-line"><span class="term-caret">▋</span></div>`;
+  else if(t.status==='waiting_for_orchestrator')lines='<div class="term-line system">> waiting for orchestrator</div><div class="term-line">'+esc(short(t.waiting_reason||'A worker decision is being resolved.',360))+'</div>';
+  else if(t.status==='waiting_for_user')lines='<div class="term-line system">> waiting for your answer</div><div class="term-line">'+esc(short(t.waiting_reason||'The mission needs information before continuing.',360))+'</div>';
   else if(t.status==='pending'&&pausedForPreflight)lines=`<div class="term-line system">$ paused · waiting for your workspace decision</div><div class="term-line"><span class="term-caret">_</span> preflight resolution required</div>`;
   else if(t.status==='pending')lines=`<div class="term-line system">$ queued${d.length?` · waiting for task ${d.map(x=>x+1).join(', ')}`:' · ready'}</div><div class="term-line"><span class="term-caret">_</span></div>`;
   else if(['done','executed'].includes(t.status))lines=`<div class="term-line system">$ task complete</div><div class="term-line">${esc(short(t.output||'No textual output.',300))}</div>`;
@@ -218,6 +236,18 @@ async function runPlan(id){try{await api('/api/run-plan/'+id,{method:'POST',body
 async function reconsiderPlan(id,mode){const labels={force_execute:'Create an execution plan anyway?',reconsider:'Ask the orchestrator to reconsider this decision?',verify:'Run a fresh read-only verification?'};if(!window.confirm(labels[mode]||'Ask the orchestrator to reconsider?'))return;try{await api('/api/reconsider-plan/'+id,{method:'POST',body:JSON.stringify({mode})});await refreshState();scheduleFastPolling()}catch(e){$('planMsg').textContent=e.message}}
 function selectedPreflightPaths(){return [...document.querySelectorAll('.preflight-path input:checked')].map(x=>x.value)}
 async function preflightAction(id,action,requiresPaths){const paths=requiresPaths?selectedPreflightPaths():[];if(requiresPaths&&!paths.length){window.alert('Select at least one file first.');return}if(!window.confirm(action==='move'?'Move the selected files to AgentDock safe area?':action==='stage'?'Stage the selected files without creating a commit?':action==='ignore'?'Add the selected paths to local ignore rules?':action==='verify_again'?'Run the read-only workspace verification again?':action==='cancel'?'Cancel this mission?':'Continue this mission in read-only mode?'))return;try{await api('/api/preflight-action/'+id,{method:'POST',body:JSON.stringify({action,paths})});await refreshState();await refreshLive();scheduleFastPolling()}catch(e){$('planMsg').textContent=e.message}}
+async function submitConsultationAnswer(planId,consultationId){
+  const answer=($('consultationAnswer')?.value||'').trim(),option=($('consultationOption')?.value||'').trim(),files=[...($('consultationFiles')?.files||[])];
+  if(!answer&&!option&&!files.length){window.alert('Add an answer, choose an option, or attach an image.');return}
+  try{
+    const attachments=[];for(const file of files)attachments.push(await fileToAttachment(file));
+    await api('/api/consultation-answer/'+planId,{method:'POST',body:JSON.stringify({consultation_id:consultationId,answer,option,attachments})});
+    await refreshState();await refreshLive();scheduleFastPolling();
+  }catch(e){$('planMsg').textContent=e.message}
+}
+async function leaveConsultationField(planId,consultationId){if(!window.confirm('Tell the orchestrator to leave this field out?'))return;try{await api('/api/consultation-answer/'+planId,{method:'POST',body:JSON.stringify({consultation_id:consultationId,answer:'Leave this field out of the result.'})});await refreshState();await refreshLive();scheduleFastPolling()}catch(e){$('planMsg').textContent=e.message}}
+async function cancelConsultationMission(planId){if(!window.confirm('Cancel this mission?'))return;try{await api('/api/preflight-action/'+planId,{method:'POST',body:JSON.stringify({action:'cancel',paths:[]})});await refreshState();await refreshLive()}catch(e){$('planMsg').textContent=e.message}}
+async function reconstructOrchestrator(planId){if(!window.confirm('Create a new orchestrator generation from the persisted mission history?'))return;try{await api('/api/reconstruct-orchestrator/'+planId,{method:'POST',body:'{}'});await refreshState();await refreshLive();scheduleFastPolling()}catch(e){$('planMsg').textContent=e.message}}
 async function cancelTask(id){try{await api('/api/cancel-task/'+id,{method:'POST',body:'{}'});await refreshLive();if(inspectorTaskId===id)refreshInspector()}catch(e){$('planMsg').textContent=e.message}}
 function scheduleFastPolling(){clearInterval(liveTimer);liveTimer=setInterval(async()=>{if(selectedPlanId)await refreshLive()},1000)}
 async function logs(id,title){$('logTitle').textContent=`${title}.log`;$('logDialog').showModal();async function pull(){const j=await api('/api/logs/'+id);$('logText').textContent=j.logs.map(x=>`[${x.stream}] ${x.line}`).join('\n');$('logText').scrollTop=$('logText').scrollHeight}await pull();clearInterval(logTimer);logTimer=setInterval(()=>{if(!$('logDialog').open){clearInterval(logTimer);return}pull()},800)}
@@ -260,6 +290,15 @@ function activityEvent(ev){
   if(it==='mcp_tool_call'||it==='collab_tool_call')return `<div class="tool-row"><div class="tool-head"><span>${esc(it)}</span><b>${esc(item.tool||item.server||'tool')}</b><em>${esc(item.status||'')}</em></div></div>`;
   if(it==='error')return `<div class="activity-error">${esc(item.message||'Error')}</div>`;
   return ''
+}
+
+function renderRootInspectorMeta(p){
+  const box=$('taskContract');if(!box)return;
+  const o=live.orchestrator||{},thread=o.thread_id||p.orchestrator_thread_id||'',generation=o.generation||p.orchestrator_generation||1,turn=o.turn_status||p.orchestrator_turn_status||'idle',consultations=Array.isArray(o.consultations)?o.consultations:[],pending=p.pending_question||{},legacy=o.legacy_state||p.legacy_orchestrator_status||'';
+  const waiting=consultations.filter(x=>['queued','waiting_for_user','resolving'].includes(x.status)).length;
+  const action=['reconstruct_required','reconciliation_required'].includes(legacy)?'<button class="secondary compact" onclick="reconstructOrchestrator(\''+p.id+'\')">'+(legacy==='reconciliation_required'?'Reconcile context':'Reconstruct context')+'</button>':'';
+  const pendingHtml=pending.kind==='execution_question'?'<p><strong>Waiting for you:</strong> '+esc(pending.question||'Additional information is required.')+'</p>':'';
+  box.insertAdjacentHTML('beforeend','<section class="root-session-meta"><h4>Mission orchestrator session</h4><p><strong>One conversation:</strong> '+esc(thread||'not bound')+'</p><p><strong>Generation / turn:</strong> '+esc(String(generation))+' · '+esc(turn)+(waiting?' · '+waiting+' waiting consultation(s)':'')+'</p>'+(legacy?'<p><strong>Legacy state:</strong> '+esc(legacy)+'</p>':'')+pendingHtml+action+'</section>');
 }
 
 async function openInspector(id){inspectorTaskId=id;manualAttachments=[];renderAttachmentStrip('manualAttachments',manualAttachments,'manual');$('manualPrompt').value='';$('taskDialog').showModal();setInspectorTab('activity');await refreshInspector();clearInterval(inspectorTimer);inspectorTimer=setInterval(()=>{if(!$('taskDialog').open){clearInterval(inspectorTimer);return}refreshInspector(false)},1000)}
