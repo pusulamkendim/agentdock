@@ -183,3 +183,7 @@ dialog{border:1px solid #d3d5cf;background:#fff;color:var(--ink);border-radius:1
 /* Keep the global mission list inside its cards at every responsive width. */
 @media(max-width:1180px){.global-mission-row{grid-template-columns:12px minmax(0,1fr) 130px 100px minmax(96px,max-content)}}
 @media(max-width:820px){.global-mission-row{grid-template-columns:10px minmax(0,1fr) 95px}.global-mission-workspace,.global-mission-runtime,.global-mission-time{display:none}}
+.global-mission-row{grid-template-areas:"state title workspace runtime time status"}
+.global-mission-row>.mission-state{grid-area:state}.global-mission-row>.global-mission-title{grid-area:title}.global-mission-row>.global-mission-workspace{grid-area:workspace}.global-mission-row>.global-mission-runtime{grid-area:runtime}.global-mission-row>.global-mission-time{grid-area:time}.global-mission-row>.global-mission-status{grid-area:status}
+@media(max-width:1180px){.global-mission-row{grid-template-areas:"state title workspace time status"}}
+@media(max-width:820px){.global-mission-row{grid-template-areas:"state title status"}}
