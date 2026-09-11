@@ -73,6 +73,10 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         payload = json.loads(path.read_text())
         self.assertEqual(payload["required"], ["tasks"])
         self.assertEqual(payload["properties"]["tasks"]["maxItems"], 12)
+        contract = payload["properties"]["tasks"]["items"]["properties"]["contract"]
+        self.assertFalse(contract["additionalProperties"])
+        self.assertEqual(set(contract["required"]), set(contract["properties"]))
+        self.assertFalse(contract["properties"]["scope"]["additionalProperties"])
 
 
 class ExecutionTests(AgentDockTestCase):
