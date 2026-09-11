@@ -252,3 +252,30 @@ def timeline_for(target_id):
     for sequence, item in enumerate(items, 1):
         item["sequence"] = sequence
     return {"session": latest_agent_session(target_id), "items": items}
+
+
+def logs_payload(task_id):
+    return {"logs": rows("SELECT * FROM logs WHERE task_id=? ORDER BY id", (task_id,))}
+
+
+def events_payload(task_id):
+    session = latest_agent_session(task_id)
+    events = rows(
+        "SELECT id,session_id,ts,event_type,item_type,payload_json FROM agent_events WHERE task_id=? ORDER BY id DESC LIMIT 300",
+        (task_id,),
+    )
+    events.reverse()
+    for event in events:
+        event["payload"] = safe_json(event.pop("payload_json", "{}"), {})
+    return {"session": session, "events": events}
+
+
+def messages_payload(task_id):
+    return {"messages": rows("SELECT * FROM task_messages WHERE task_id=? ORDER BY ts,id", (task_id,))}
+
+
+def diff_payload(task_id):
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise KeyError("task not found")
+    return {"diff": task_diff(task)}

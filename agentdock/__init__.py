@@ -20,12 +20,13 @@ from . import (
     integration,
     mission,
     orchestrator,
+    platform,
     preflight,
     schemas,
     tasks,
     timeline,
 )
-from .api import Handler, manual_followup_delivery_status, open_terminal_at, run_manual_followup_message, run_single_task
+from .api import Handler
 from .app import main
 from .codex import (
     engine_status,
@@ -104,19 +105,31 @@ from .git_ops import (
 )
 from .mission import (
     apply_plan,
+    approve_plan,
     build_demo_plan,
     build_plan,
+    create_agent_profile,
+    create_plan_request,
+    create_workspace_request,
+    docs_payload,
+    health_payload,
     integration_patch,
+    live_payload,
     mission_config,
+    plan_diff_payload,
     pause_plan,
     pause_task,
+    quota_payload,
     replan_mission,
     reset_plan_for_retry,
     restart_as_new_mission,
     resume_plan,
     resume_task,
     run_plan,
+    start_plan,
+    state_payload,
     stored_integration_context,
+    workspace_browse,
 )
 from .handoffs import (
     consultation_payload,
@@ -129,6 +142,7 @@ from .handoffs import (
 from .integration import integrate_write_result, resolve_merge_conflict
 from .orchestrator import (
     answer_consultation,
+    answer_consultation_request,
     latest_orchestrator_session,
     orchestrator_log_id,
     plan_consultations,
@@ -138,6 +152,8 @@ from .orchestrator import (
     resolve_worker_failure,
     run_mission_orchestrator_turn,
     run_orchestrator_followup,
+    start_orchestrator_followup,
+    start_reconstruct,
 )
 from .preflight import PreflightBlocked, PreflightWaitingForUser, apply_preflight_action, run_preflight
 from .schemas import (
@@ -150,22 +166,29 @@ from .schemas import (
     validate_task_graph,
 )
 from .tasks import (
+    cancel_task,
+    configure_task,
+    manual_followup_delivery_status,
     mark_read_result_done,
+    open_task_terminal,
     queued_messages,
     run_demo_manual_followup,
     run_manual_followup,
+    run_manual_followup_message,
     run_parallel_task,
+    run_single_task,
     run_task_once,
     run_task_with_recovery,
     task_effort,
     task_model,
     task_tier,
 )
-from .timeline import latest_log_segment, mission_usage, task_diff, timeline_for, write_mission_docs
+from .platform import open_terminal_at
+from .timeline import diff_payload, events_payload, latest_log_segment, logs_payload, messages_payload, mission_usage, task_diff, timeline_for, write_mission_docs
 
 
 __all__ = [
-    "api", "app", "codex", "config", "db", "git_ops", "handoffs", "integration", "mission", "orchestrator",
+    "api", "app", "codex", "config", "db", "git_ops", "handoffs", "integration", "mission", "orchestrator", "platform",
     "preflight", "schemas", "tasks", "timeline", "Handler", "main", "init_db",
     "run_codex", "run_codex_app_server", "run_orchestrator", "run_plan",
     "run_mission_orchestrator_turn", "run_task_once", "run_parallel_task",

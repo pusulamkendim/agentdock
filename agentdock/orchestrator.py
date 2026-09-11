@@ -35,6 +35,7 @@ from .db import (
     record_control_event,
     release_plan_run,
     rows,
+    save_attachment,
 )
 from .schemas import CONSULTATION_SCHEMA, consultation_schema_path, extract_json, extract_worker_consultation, normalize_consultation_result, safe_json
 from .handoffs import (
@@ -777,6 +778,18 @@ def run_orchestrator_followup(plan_id, prompt, image_paths=None):
         "orchestrator answered the conversation message on the same mission thread",
     )
 
+
+def start_orchestrator_followup(plan_id, prompt, image_paths=None):
+    """Queue a manual orchestrator conversation turn in the background."""
+    if not str(prompt or "").strip():
+        raise ValueError("Mesaj gerekli")
+    threading.Thread(
+        target=run_orchestrator_followup,
+        args=(plan_id, prompt, image_paths or []),
+        daemon=True,
+    ).start()
+    return {"ok": True}
+
 def answer_consultation(plan_id, consultation_id, answer, attachments=None):
     """Persist a user answer, resolve it on the same root thread, then resume work."""
     plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
@@ -833,6 +846,41 @@ def answer_consultation(plan_id, consultation_id, answer, attachments=None):
     if resolved.get("blocked"):
         return {"ok": False, "status": "blocked", "error": resolved.get("error") or ""}
     return {"ok": False, "status": "attention", "error": resolved.get("error") or "Consultation could not be resolved."}
+
+
+def answer_consultation_request(plan_id, data):
+    """Parse one consultation answer and persist any attached files."""
+    consultation_id = (data.get("consultation_id") or "").strip()
+    if not consultation_id:
+        raise ValueError("Consultation id gerekli")
+    consultation = one(
+        "SELECT task_id FROM consultations WHERE id=? AND plan_id=?",
+        (consultation_id, plan_id),
+    )
+    if not consultation:
+        raise ValueError("Consultation bulunamadı")
+    saved = []
+    for item in (data.get("attachments") or [])[:8]:
+        if isinstance(item, dict) and item.get("data_base64"):
+            saved.append(
+                save_attachment(
+                    plan_id,
+                    item.get("name") or "consultation.png",
+                    item.get("mime") or "image/png",
+                    item["data_base64"],
+                    task_id=consultation["task_id"],
+                )
+            )
+    answer = (data.get("answer") or "").strip()
+    option = (data.get("option") or "").strip()
+    if option:
+        answer = f"{option}\n{answer}".strip()
+    return answer_consultation(
+        plan_id,
+        consultation_id,
+        answer,
+        [item["path"] for item in saved],
+    )
 
 def reconstruct_orchestrator_context(plan_id):
     """Start a new orchestrator generation only after an explicit user action."""
@@ -896,3 +944,18 @@ def _run_reconstruct_and_release(plan_id):
         log(orchestrator_log_id(plan_id), "supervisor", f"orchestrator reconstruction failed: {exc}")
     finally:
         release_plan_run(plan_id)
+
+
+def start_reconstruct(plan_id):
+    """Start explicit context reconstruction behind the plan run lock."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if not claim_plan_run(plan_id):
+        return {"ok": False, "status": "busy", "error": "Bu mission için başka bir işlem zaten çalışıyor."}
+    threading.Thread(
+        target=_run_reconstruct_and_release,
+        args=(plan_id,),
+        daemon=True,
+    ).start()
+    return {"ok": True, "status": "reconstructing"}

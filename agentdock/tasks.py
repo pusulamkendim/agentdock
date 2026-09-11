@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 import webbrowser
 import fnmatch
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -22,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config
-from .codex import run_codex, task_input_attachment_paths
+from .codex import run_codex, steer_app_server, task_input_attachment_paths, terminate_process
 from .db import (
     create_agent_session,
     execute,
@@ -31,6 +32,7 @@ from .db import (
     log,
     one,
     rows,
+    save_attachment,
 )
 from .git_ops import (
     commit_worker_changes,
@@ -41,7 +43,163 @@ from .git_ops import (
 )
 from .preflight import is_transient_error
 from .handoffs import create_worker_consultation, safe_json, task_dependency_context
+from .platform import open_terminal_at
 from .timeline import write_mission_docs
+
+
+def run_single_task(task_id):
+    """Compatibility service for the legacy direct-task endpoint."""
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        return
+    plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],))
+    workspace = task.get("workspace") or plan["workspace"]
+    result = run_task_once(plan, task, workspace, force_mode=task["mode"])
+    if result["ok"]:
+        execute("UPDATE tasks SET status=? WHERE id=?", ("done", task_id))
+
+
+def run_manual_followup_message(message_id):
+    """Deliver one persisted user message without changing task execution state."""
+    message = one("SELECT * FROM task_messages WHERE id=?", (message_id,))
+    if not message:
+        return
+    execute("UPDATE task_messages SET status=? WHERE id=?", ("sending", message_id))
+    try:
+        run_manual_followup(
+            message["task_id"],
+            message.get("text") or "Continue.",
+            safe_json(message.get("attachments_json"), []),
+        )
+        execute(
+            "UPDATE task_messages SET status=?,error=? WHERE id=?",
+            ("delivered", "", message_id),
+        )
+    except Exception as exc:
+        execute(
+            "UPDATE task_messages SET status=?,error=? WHERE id=?",
+            ("failed", str(exc), message_id),
+        )
+
+
+def manual_followup_delivery_status(task_id):
+    """Choose delivery based on a live runner, not a historical task status."""
+    with config.APP_SERVER_CONTROLS_LOCK:
+        if task_id in config.APP_SERVER_CONTROLS:
+            return "sending"
+    with config.RUNNERS_LOCK:
+        if config.RUNNERS.get(task_id):
+            return "queued"
+    # A completed task can still have a resumable worker conversation.  Start
+    # the manual turn immediately; task execution state stays untouched.
+    return "sending"
+
+
+def send_task_followup(task_id, prompt, attachments=None):
+    """Persist and deliver a conversational worker follow-up."""
+    prompt = (prompt or "").strip()
+    attachments = attachments or []
+    if not prompt and not attachments:
+        raise ValueError("Mesaj veya attachment gerekli")
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise ValueError("Task bulunamadı")
+    image_paths = []
+    for item in attachments[:8]:
+        if isinstance(item, dict) and item.get("data_base64"):
+            saved = save_attachment(
+                task["plan_id"],
+                item.get("name") or "image.png",
+                item.get("mime") or "image/png",
+                item["data_base64"],
+                task_id=task_id,
+            )
+            image_paths.append(saved["path"])
+    message_id = str(uuid.uuid4())[:10]
+    status = manual_followup_delivery_status(task_id)
+    with config.APP_SERVER_CONTROLS_LOCK:
+        app_server_active = task_id in config.APP_SERVER_CONTROLS
+    execute(
+        "INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)",
+        (
+            message_id,
+            task_id,
+            task["plan_id"],
+            config.now(),
+            prompt,
+            json.dumps(image_paths),
+            status,
+        ),
+    )
+    if status == "sending":
+        if app_server_active:
+            # The transport records a race as a visible failed message if the
+            # active turn finishes between the check and the steer request.
+            steer_app_server(task_id, message_id, prompt, image_paths)
+        else:
+            threading.Thread(
+                target=run_manual_followup_message,
+                args=(message_id,),
+                daemon=True,
+            ).start()
+    else:
+        log(task_id, "manual", "user message queued for the next Codex turn")
+    return {"ok": True, "queued": status == "queued", "message_id": message_id}
+
+
+def configure_task(task_id, data):
+    """Update a task assignment before execution begins."""
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise ValueError("Task bulunamadı")
+    plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],))
+    if plan.get("status") not in ("planned", "approved"):
+        raise ValueError("Task assignment yalnızca execution başlamadan önce değiştirilebilir.")
+    agent_id = (data.get("agent_id") or task.get("agent_id") or "").strip()
+    if agent_id and not one("SELECT id FROM agents WHERE id=?", (agent_id,)):
+        raise ValueError("Agent profile bulunamadı")
+    mode = data.get("mode") or task.get("mode") or "read"
+    if mode not in ("read", "write"):
+        raise ValueError("Geçersiz task mode")
+    execute("UPDATE tasks SET agent_id=?,mode=? WHERE id=?", (agent_id, mode, task_id))
+    if plan.get("status") == "approved":
+        execute("UPDATE plans SET status=?,approved_at=NULL WHERE id=?", ("planned", plan["id"]))
+    write_mission_docs(plan["id"])
+    return {"ok": True}
+
+
+def cancel_task(task_id):
+    """Permanently cancel a worker; resumable pauses use ``pause_task``."""
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise ValueError("Task bulunamadı")
+    plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],))
+    with config.RUNNERS_LOCK:
+        process = config.RUNNERS.get(task_id)
+    if process:
+        terminate_process(process)
+        execute(
+            "UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?",
+            ("cancelled", "User cancelled", config.now(), task_id),
+        )
+        return {"ok": True}
+    if plan and int(plan.get("demo_mode") or 0) and task.get("status") == "running":
+        execute(
+            "UPDATE tasks SET status=?,error=?,finished_at=? WHERE id=?",
+            ("cancelled", "User cancelled demo agent", config.now(), task_id),
+        )
+        return {"ok": True}
+    return {"ok": False, "message": "Task çalışmıyor"}
+
+
+def open_task_terminal(task_id):
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise ValueError("Task bulunamadı")
+    plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],))
+    open_terminal_at(task.get("workspace") or plan.get("workspace"))
+    return {"ok": True}
+
 
 def make_task_prompt(plan, task, agent):
     dep_context = task_dependency_context(task)

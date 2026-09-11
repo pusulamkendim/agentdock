@@ -38,6 +38,7 @@ from .config import (
     recovery_settings,
 )
 from .codex import (
+    engine_status,
     interrupt_app_server,
     quota_status,
     run_codex,
@@ -47,6 +48,8 @@ from .codex import (
 from .db import (
     claim_plan_run,
     create_agent_session,
+    doctor_log_id,
+    ensure_workspace,
     execute,
     finish_agent_session,
     latest_agent_session,
@@ -57,6 +60,8 @@ from .db import (
     record_control_event,
     release_plan_run,
     rows,
+    save_attachment,
+    workspace_summary,
 )
 from .git_ops import (
     delete_branch,
@@ -95,7 +100,423 @@ from .tasks import (
     task_model,
     task_tier,
 )
-from .timeline import write_mission_docs
+from .timeline import latest_log_segment, mission_usage, write_mission_docs
+from .config import choose_workspace_folder
+
+
+def health_payload():
+    """Build the public health response without HTTP concerns."""
+    from .version import VERSION
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "db": str(config.DB),
+        "engines": engine_status(),
+        "codex_transport": config.CODEX_TRANSPORT,
+        "server_time": config.now(),
+    }
+
+
+def state_payload():
+    """Build the dashboard state snapshot used by the HTTP adapter."""
+    plans = rows("SELECT * FROM plans ORDER BY created_at DESC LIMIT 100")
+    for plan in plans:
+        plan["tasks"] = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan["id"],))
+        plan["repo"] = repo_info(plan["workspace"])
+        plan["attachments"] = rows(
+            "SELECT id,name,mime,path,created_at FROM attachments WHERE plan_id=? ORDER BY created_at",
+            (plan["id"],),
+        )
+        plan["evidence"] = safe_json(plan.get("evidence_json"), [])
+        plan["questions"] = safe_json(plan.get("questions_json"), [])
+        plan["workspace_snapshot"] = safe_json(plan.get("workspace_snapshot_json"), {})
+        plan["pending_question"] = safe_json(plan.get("pending_question_json"), {})
+        plan["consultations"] = plan_consultations(plan["id"])
+    workspaces = [
+        workspace_summary(workspace)
+        for workspace in rows(
+            "SELECT * FROM workspaces ORDER BY last_opened_at DESC, created_at DESC"
+        )
+    ]
+    return {
+        "agents": rows("SELECT * FROM agents ORDER BY created_at"),
+        "plans": plans,
+        "workspaces": workspaces,
+        "engines": engine_status(),
+        "quota": quota_status(),
+        "defaults": {
+            "orchestrator": config.DEFAULT_ORCHESTRATOR,
+            "worker": config.DEFAULT_WORKER,
+            "orchestrator_effort": config.DEFAULT_ORCHESTRATOR_EFFORT,
+            "worker_effort": config.DEFAULT_WORKER_EFFORT,
+            "orchestrator_tier": config.DEFAULT_ORCHESTRATOR_TIER,
+            "worker_tier": config.DEFAULT_WORKER_TIER,
+            "max_parallel": 4,
+            "recovery": config.RECOVERY_DEFAULTS,
+        },
+    }
+
+
+def live_payload(plan_id):
+    """Build the live mission payload consumed by the mission screen."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise KeyError("plan not found")
+    plan["attachments"] = rows(
+        "SELECT id,name,mime,path,created_at FROM attachments WHERE plan_id=? ORDER BY created_at",
+        (plan_id,),
+    )
+    plan["evidence"] = safe_json(plan.get("evidence_json"), [])
+    plan["questions"] = safe_json(plan.get("questions_json"), [])
+    plan["workspace_snapshot"] = safe_json(plan.get("workspace_snapshot_json"), {})
+    plan["pending_question"] = safe_json(plan.get("pending_question_json"), {})
+    consultations = plan_consultations(plan_id)
+    task_rows = rows(
+        """SELECT t.*, a.name AS agent_name, a.role AS agent_role, a.model AS agent_model,
+                  a.reasoning_effort AS agent_effort, a.service_tier AS agent_tier
+           FROM tasks t LEFT JOIN agents a ON a.id=t.agent_id
+           WHERE t.plan_id=? ORDER BY t.seq""",
+        (plan_id,),
+    )
+    for task in task_rows:
+        recent = rows(
+            "SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 18",
+            (task["id"],),
+        )
+        task["recent_logs"] = list(reversed(recent))
+        agent_settings = {
+            "model": task.get("agent_model") or "",
+            "reasoning_effort": task.get("agent_effort") or "",
+            "service_tier": task.get("agent_tier") or "",
+        }
+        task["effective_model"] = task_model(plan, agent_settings, task)
+        task["effective_effort"] = task_effort(plan, agent_settings, task)
+        task["effective_tier"] = task_tier(plan, agent_settings, task)
+        task["contract"] = safe_json(task.get("contract_json"), {})
+    orchestrator_id = orchestrator_log_id(plan_id)
+    orch_logs = rows(
+        "SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 24",
+        (orchestrator_id,),
+    )
+    orchestrator = {
+        "id": orchestrator_id,
+        "status": "running"
+        if plan.get("status") in ("planning", "preflight", "running")
+        else plan.get("status"),
+        "model": plan.get("orchestrator_used") or plan.get("orchestrator_model"),
+        "reasoning_effort": plan.get("orchestrator_effort"),
+        "service_tier": plan.get("orchestrator_tier"),
+        "thread_id": plan.get("orchestrator_thread_id") or "",
+        "generation": int(plan.get("orchestrator_generation") or 1),
+        "turn_status": plan.get("orchestrator_turn_status") or "",
+        "last_turn_id": plan.get("orchestrator_last_turn_id") or "",
+        "last_error": plan.get("orchestrator_last_error") or "",
+        "legacy_state": plan.get("legacy_orchestrator_status") or "",
+        "consultations": consultations,
+        "recent_logs": list(reversed(orch_logs)),
+    }
+    doctor_id = doctor_log_id(plan_id)
+    doctor_logs = rows(
+        "SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 80",
+        (doctor_id,),
+    )
+    doctor_logs = latest_log_segment(list(reversed(doctor_logs)), "preflight started")
+    doctor = {
+        "id": doctor_id,
+        "status": plan.get("preflight_status") or "idle",
+        "report": safe_json(plan.get("preflight_json"), {}),
+        "recent_logs": doctor_logs,
+    }
+    quota = quota_status()
+    return {
+        "plan": plan,
+        "tasks": task_rows,
+        "orchestrator": orchestrator,
+        "consultations": consultations,
+        "doctor": doctor,
+        "quota": quota,
+        "mission_usage": mission_usage(plan, quota),
+        "server_time": config.now(),
+    }
+
+
+def workspace_browse():
+    selected = choose_workspace_folder()
+    if not selected:
+        return {"ok": True, "cancelled": True}
+    info = repo_info(selected)
+    return {
+        "ok": True,
+        "path": selected,
+        "name": Path(selected).name,
+        "is_git": bool(info.get("is_git")),
+        "branch": info.get("branch") or "",
+    }
+
+
+def create_workspace_request(data):
+    return ensure_workspace(
+        data.get("repo_path") or data.get("path") or "",
+        data.get("name"),
+    )
+
+
+def quota_payload(force=False, wait=False):
+    return quota_status(force=force, wait=wait)
+
+
+def create_agent_profile(data):
+    """Validate and persist one worker profile."""
+    aid = data.get("id") or str(uuid.uuid4())[:8]
+    agent_model = (data.get("model") or "").strip()
+    agent_effort = (data.get("reasoning_effort") or "").strip()
+    agent_tier = (data.get("service_tier") or "").strip()
+    if agent_model and agent_effort:
+        validate_runtime_config(agent_model, agent_effort, agent_tier or "default", "Worker profile")
+    elif agent_tier and agent_tier not in config.VALID_TIERS:
+        raise ValueError(f"Worker profile: invalid speed {agent_tier}")
+    execute(
+        """INSERT OR REPLACE INTO agents(id,name,role,engine,model,mode,created_at,reasoning_effort,service_tier)
+           VALUES(?,?,?,?,?,?,COALESCE((SELECT created_at FROM agents WHERE id=?),?),?,?)""",
+        (
+            aid,
+            data["name"],
+            data["role"],
+            "codex",
+            agent_model,
+            data.get("mode", "read"),
+            aid,
+            config.now(),
+            agent_effort,
+            agent_tier,
+        ),
+    )
+    return {"ok": True, "id": aid}
+
+
+def _workspace_for_request(data):
+    workspace_id = (data.get("workspace_id") or "").strip()
+    workspace = one("SELECT * FROM workspaces WHERE id=?", (workspace_id,)) if workspace_id else None
+    if not workspace:
+        workspace = ensure_workspace(
+            (data.get("workspace") or "").strip(), data.get("workspace_name")
+        )
+        workspace_id = workspace["id"]
+    return workspace_id, workspace
+
+
+def create_plan_request(data, demo=False):
+    """Create a mission record and start its planning turn."""
+    goal = (data.get("goal") or "").strip()
+    if not goal:
+        raise ValueError("Goal gerekli")
+    workspace_id, workspace = _workspace_for_request(data)
+    orchestrator_model = data.get("orchestrator_model") or DEFAULT_ORCHESTRATOR
+    worker_model = data.get("worker_model") or DEFAULT_WORKER
+    orchestrator_effort = data.get("orchestrator_effort") or DEFAULT_ORCHESTRATOR_EFFORT
+    worker_effort = data.get("worker_effort") or DEFAULT_WORKER_EFFORT
+    orchestrator_tier = data.get("orchestrator_tier") or DEFAULT_ORCHESTRATOR_TIER
+    worker_tier = data.get("worker_tier") or DEFAULT_WORKER_TIER
+    validate_runtime_config(orchestrator_model, orchestrator_effort, orchestrator_tier, "Orchestrator")
+    validate_runtime_config(worker_model, worker_effort, worker_tier, "Worker default")
+    max_parallel = max(1, min(int(data.get("max_parallel") or 4), MAX_PARALLEL_HARD))
+    automation_mode = data.get("automation_mode") or "auto"
+    if not demo and automation_mode not in ("auto", "supervised", "manual"):
+        raise ValueError("Automation mode geçersiz")
+    recovery = dict(config.RECOVERY_DEFAULTS)
+    if not demo:
+        requested_recovery = data.get("recovery") or {}
+        if isinstance(requested_recovery, dict):
+            for key in config.RECOVERY_DEFAULTS:
+                if key in requested_recovery:
+                    recovery[key] = requested_recovery[key]
+        if recovery.get("unknown_local_changes") != "ask":
+            raise ValueError("Unknown local changes policy must be 'ask'")
+        if recovery.get("merge_conflicts") not in ("orchestrator", "ask"):
+            raise ValueError("Merge conflict policy invalid")
+        if recovery.get("destructive_operations") != "never":
+            raise ValueError("Destructive operations must remain 'never'")
+    plan_id = str(uuid.uuid4())[:8]
+    saved_attachments = []
+    for item in (data.get("attachments") or [])[:8]:
+        if isinstance(item, dict) and item.get("data_base64"):
+            saved_attachments.append(
+                save_attachment(
+                    plan_id,
+                    item.get("name") or "image.png",
+                    item.get("mime") or "image/png",
+                    item["data_base64"],
+                )
+            )
+    attachment_paths = [attachment["path"] for attachment in saved_attachments]
+    if demo:
+        execute(
+            """INSERT INTO plans(id,goal,title,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json,demo_mode)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                plan_id,
+                goal,
+                deterministic_mission_title(goal),
+                workspace["repo_path"],
+                "demo-simulator",
+                "planning",
+                config.now(),
+                orchestrator_model,
+                worker_model,
+                max_parallel,
+                str(config.mission_dir(plan_id)),
+                "{}",
+                orchestrator_effort,
+                worker_effort,
+                orchestrator_tier,
+                worker_tier,
+                json.dumps(config.RECOVERY_DEFAULTS),
+                workspace_id,
+                "auto",
+                json.dumps(attachment_paths),
+                1,
+            ),
+        )
+    else:
+        workspace_path = str(Path(workspace["repo_path"]).expanduser().resolve())
+        execute(
+            """INSERT INTO plans(id,goal,title,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                plan_id,
+                goal,
+                deterministic_mission_title(goal),
+                workspace_path,
+                "codex-chatgpt",
+                "planning",
+                config.now(),
+                orchestrator_model,
+                worker_model,
+                max_parallel,
+                str(config.mission_dir(plan_id)),
+                "{}",
+                orchestrator_effort,
+                worker_effort,
+                orchestrator_tier,
+                worker_tier,
+                json.dumps(recovery, ensure_ascii=False),
+                workspace_id,
+                automation_mode,
+                json.dumps(attachment_paths, ensure_ascii=False),
+            ),
+        )
+    execute("UPDATE workspaces SET last_opened_at=? WHERE id=?", (config.now(), workspace_id))
+    write_mission_docs(plan_id)
+    worker = build_demo_plan if demo else build_plan
+    threading.Thread(target=worker, args=(plan_id,), daemon=True).start()
+    response = {"ok": True, "plan_id": plan_id, "status": "planning"}
+    if demo:
+        response["demo"] = True
+    return response
+
+
+def start_plan(plan_id):
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if plan.get("status") not in ("approved", "attention", "waiting_for_user"):
+        raise ValueError("Planı önce review edip onayla.")
+    if not claim_plan_run(plan_id):
+        return {"ok": False, "status": "busy", "error": "Bu mission için başka bir işlem zaten çalışıyor."}
+    threading.Thread(
+        target=run_plan,
+        args=(plan_id,),
+        kwargs={"claimed": True},
+        daemon=True,
+    ).start()
+    return {"ok": True}
+
+
+def reopen_plan(plan_id):
+    """Reopen a completed mission while preserving its existing checkpoints."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if plan.get("status") != "done":
+        raise ValueError("Yalnızca tamamlanmış mission yeniden açılabilir")
+    has_tasks = bool(one("SELECT id FROM tasks WHERE plan_id=? LIMIT 1", (plan_id,)))
+    if not has_tasks:
+        execute(
+            """UPDATE plans SET status='planning',error='',decision='',decision_reason='',
+               evidence_json='[]',questions_json='[]',final_response='',summary='',
+               pending_question_id='',pending_question_json='{}',started_at=NULL,
+               finished_at=NULL WHERE id=?""",
+            (plan_id,),
+        )
+        log(
+            orchestrator_log_id(plan_id),
+            "manual",
+            "no-task mission reopened; re-evaluating disposition in the same orchestrator conversation",
+        )
+        write_mission_docs(plan_id)
+        if not claim_plan_run(plan_id):
+            return {"ok": False, "status": "busy"}
+        threading.Thread(
+            target=build_plan,
+            args=(plan_id,),
+            kwargs={"claimed": True},
+            daemon=True,
+        ).start()
+        return {"ok": True, "status": "planning"}
+    execute("UPDATE plans SET status=?,error='',finished_at=NULL WHERE id=?", ("approved", plan_id))
+    log(orchestrator_log_id(plan_id), "manual", "mission reopened by user; completed tasks remain checkpoints")
+    write_mission_docs(plan_id)
+    if not claim_plan_run(plan_id):
+        return {"ok": False, "status": "busy"}
+    threading.Thread(
+        target=run_plan,
+        args=(plan_id,),
+        kwargs={"claimed": True},
+        daemon=True,
+    ).start()
+    return {"ok": True, "status": "resuming"}
+
+
+def approve_plan(plan_id, note=""):
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if plan.get("status") != "planned":
+        raise ValueError("Plan review için hazır değil")
+    task_rows = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
+    if not task_rows:
+        raise ValueError("Onaylanacak task yok")
+    missing = [task["title"] for task in task_rows if not task.get("agent_id")]
+    if missing:
+        raise ValueError("Agent atanmamış task var: " + ", ".join(missing))
+    execute(
+        "UPDATE plans SET status=?,approved_at=?,approval_note=? WHERE id=?",
+        ("approved", config.now(), (note or "").strip(), plan_id),
+    )
+    log(
+        orchestrator_log_id(plan_id),
+        "supervisor",
+        "plan approved by user · execution is still paused until Start mission",
+    )
+    write_mission_docs(plan_id)
+    return {"ok": True}
+
+
+def docs_payload(plan_id):
+    write_mission_docs(plan_id)
+    plan = one("SELECT mission_dir FROM plans WHERE id=?", (plan_id,))
+    return {"mission_dir": plan.get("mission_dir") if plan else ""}
+
+
+def plan_diff_payload(plan_id):
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise KeyError("mission not found")
+    if plan.get("status") != "awaiting_apply":
+        return {"diff": "No pending integration diff for this mission."}
+    return {"diff": integration_patch(stored_integration_context(plan))}
+
 
 def reset_plan_for_retry(plan, preserve_completed=False):
     plan_id = plan["id"]
