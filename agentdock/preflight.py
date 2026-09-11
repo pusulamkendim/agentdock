@@ -22,13 +22,27 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+from .db import claim_plan_run, doctor_log_id, execute, log, one, record_control_event, rows
+from .git_ops import (
+    _git_dir,
+    _path_is_open,
+    git,
+    git_read,
+    git_status_entries,
+    repo_info,
+    workspace_snapshot,
+)
+from .schemas import safe_json
+from .timeline import write_mission_docs
+
 def is_transient_error(error):
     text = str(error or "").lower()
     # Quota exhaustion / auth failures should not be spam-retried.
     hard = ("usage limit", "weekly limit", "not logged in", "unauthorized", "forbidden", "insufficient quota")
     if any(x in text for x in hard):
         return False
-    return any(re.search(p, text, re.I) for p in TRANSIENT_ERROR_PATTERNS)
+    return any(re.search(p, text, re.I) for p in config.TRANSIENT_ERROR_PATTERNS)
 
 def update_preflight(plan_id, status, report):
     execute(
@@ -103,7 +117,7 @@ def run_preflight(plan, has_write, phase="execution"):
         "blockers": [],
         "affected_paths": [],
         "action_options": [],
-        "started_at": now(),
+        "started_at": config.now(),
         "finished_at": None,
     }
     log(doctor_log_id(plan_id), "supervisor", f"preflight started · phase={phase}")
@@ -182,7 +196,7 @@ def run_preflight(plan, has_write, phase="execution"):
         else:
             report["checks"].append("Working tree clean")
 
-    report["finished_at"] = now()
+    report["finished_at"] = config.now()
     if report["blockers"]:
         # Every blocked preflight must expose a safe next step even when the
         # problem is not tied to a selectable file (for example a missing
@@ -238,8 +252,8 @@ def apply_preflight_action(plan_id, action, selected=None):
         raise ValueError("Geçersiz preflight aksiyonu")
 
     if action == "cancel":
-        execute("UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?", ("cancelled", "Mission cancelled by user", now(), plan_id))
-        log(orchestrator_log_id(plan_id), "supervisor", "mission cancelled by user during preflight")
+        execute("UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?", ("cancelled", "Mission cancelled by user", config.now(), plan_id))
+        log(f"orchestrator:{plan_id}", "supervisor", "mission cancelled by user during preflight")
         write_mission_docs(plan_id)
         return {"ok": True, "status": "cancelled"}
 
@@ -266,7 +280,7 @@ def apply_preflight_action(plan_id, action, selected=None):
                 for rule in missing:
                     handle.write(rule + "\n")
             changed = missing
-        log(orchestrator_log_id(plan_id), "supervisor", "user explicitly added local ignore rules: " + ", ".join(rules))
+        log(f"orchestrator:{plan_id}", "supervisor", "user explicitly added local ignore rules: " + ", ".join(rules))
     elif action == "stage":
         git(root, "add", "--", *[rel for rel, _, _ in selected_rows])
         changed = [rel for rel, _, _ in selected_rows]
@@ -275,9 +289,9 @@ def apply_preflight_action(plan_id, action, selected=None):
             "UPDATE plans SET workspace_choice_json=? WHERE id=?",
             (json.dumps(sorted(accepted_paths), ensure_ascii=False), plan_id),
         )
-        log(orchestrator_log_id(plan_id), "supervisor", "user explicitly staged files (no commit created): " + ", ".join(changed))
+        log(f"orchestrator:{plan_id}", "supervisor", "user explicitly staged files (no commit created): " + ", ".join(changed))
     elif action == "move":
-        safe_root = ATTACHMENT_ROOT / plan_id / "preflight-preserved"
+        safe_root = config.ATTACHMENT_ROOT / plan_id / "preflight-preserved"
         moved = []
         for rel, target, entry in selected_rows:
             if entry.get("xy") != "??":
@@ -291,13 +305,14 @@ def apply_preflight_action(plan_id, action, selected=None):
             shutil.move(str(target), str(destination))
             moved.append({"path": rel, "preserved_at": str(destination)})
         changed = moved
-        log(orchestrator_log_id(plan_id), "supervisor", "user explicitly moved files to AgentDock safe area: " + ", ".join(x["path"] for x in moved))
+        log(f"orchestrator:{plan_id}", "supervisor", "user explicitly moved files to AgentDock safe area: " + ", ".join(x["path"] for x in moved))
     elif action == "continue_read_only":
         tasks = rows("SELECT mode FROM tasks WHERE plan_id=?", (plan_id,))
         if not any(t.get("mode") == "read" for t in tasks):
             raise ValueError("Bu mission içinde read-only çalıştırılabilecek task yok")
         execute("UPDATE plans SET status=?,error=? WHERE id=?", ("approved", "", plan_id))
         if claim_plan_run(plan_id):
+            from .mission import run_plan
             threading.Thread(target=run_plan, args=(plan_id,), kwargs={"claimed": True, "read_only_only": True}, daemon=True).start()
         return {"ok": True, "status": "approved", "resuming": True, "read_only_only": True}
 
@@ -313,11 +328,12 @@ def apply_preflight_action(plan_id, action, selected=None):
 
     if phase == "execution":
         execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("approved", "", plan_id))
-        log(orchestrator_log_id(plan_id), "supervisor", "preflight resolved by user; resuming mission automatically")
+        log(f"orchestrator:{plan_id}", "supervisor", "preflight resolved by user; resuming mission automatically")
         if claim_plan_run(plan_id):
+            from .mission import run_plan
             threading.Thread(target=run_plan, args=(plan_id,), kwargs={"claimed": True}, daemon=True).start()
         return {"ok": True, "status": "approved", "resuming": True, "report": latest_report, "changed": changed}
     execute("UPDATE plans SET status=?,apply_status=?,apply_error=?,error=? WHERE id=?", ("awaiting_apply", "ready", "", "", plan_id))
-    log(orchestrator_log_id(plan_id), "supervisor", "apply preflight resolved by user; diff is ready for review")
+    log(f"orchestrator:{plan_id}", "supervisor", "apply preflight resolved by user; diff is ready for review")
     write_mission_docs(plan_id)
     return {"ok": True, "status": "awaiting_apply", "report": latest_report, "changed": changed}

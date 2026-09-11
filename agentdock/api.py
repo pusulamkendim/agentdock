@@ -22,6 +22,64 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+from .codex import (
+    engine_status,
+    quota_status,
+    steer_app_server,
+    terminate_process,
+    validate_runtime_config,
+)
+from .db import (
+    claim_plan_run,
+    create_agent_session,
+    doctor_log_id,
+    ensure_workspace,
+    execute,
+    latest_agent_session,
+    log,
+    one,
+    record_control_event,
+    rows,
+    save_attachment,
+    workspace_summary,
+)
+from .git_ops import repo_info
+from .mission import (
+    apply_plan,
+    build_demo_plan,
+    build_plan,
+    integration_patch,
+    mission_config,
+    pause_plan,
+    pause_task,
+    replan_mission,
+    reset_plan_for_retry,
+    restart_as_new_mission,
+    resume_plan,
+    resume_task,
+    run_plan,
+    stored_integration_context,
+)
+from .orchestrator import (
+    answer_consultation,
+    orchestrator_log_id,
+    plan_consultations,
+    reconstruct_orchestrator_context,
+    run_orchestrator_followup,
+)
+from .preflight import apply_preflight_action
+from .schemas import deterministic_mission_title, safe_json
+from .tasks import (
+    run_manual_followup,
+    run_task_once,
+    task_effort,
+    task_model,
+    task_tier,
+)
+from .timeline import latest_log_segment, mission_usage, task_diff, timeline_for, write_mission_docs
+from .config import choose_workspace_folder
+
 def open_terminal_at(path):
     path=str(Path(path).expanduser().resolve())
     if not Path(path).is_dir():
@@ -55,11 +113,11 @@ def run_manual_followup_message(message_id):
 
 def manual_followup_delivery_status(task_id):
     """Choose delivery based on a live runner, not a historical task status."""
-    with APP_SERVER_CONTROLS_LOCK:
-        if task_id in APP_SERVER_CONTROLS:
+    with config.APP_SERVER_CONTROLS_LOCK:
+        if task_id in config.APP_SERVER_CONTROLS:
             return "sending"
-    with RUNNERS_LOCK:
-        if RUNNERS.get(task_id):
+    with config.RUNNERS_LOCK:
+        if config.RUNNERS.get(task_id):
             return "queued"
     # An executed task can still have a resumable worker conversation. Start
     # the manual turn now; task execution state is intentionally independent.
@@ -68,7 +126,7 @@ def manual_followup_delivery_status(task_id):
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
         rel = urlparse(path).path.lstrip("/") or "index.html"
-        static_root = STATIC.resolve()
+        static_root = config.STATIC.resolve()
         candidate = (static_root / rel).resolve()
         if candidate != static_root and static_root not in candidate.parents:
             return str(static_root / "__agentdock_missing_file__")
@@ -96,10 +154,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({
                 "ok": True,
                 "version": "0.12.0",
-                "db": str(DB),
+                "db": str(config.DB),
                 "engines": engines,
-                "codex_transport": CODEX_TRANSPORT,
-                "server_time": now(),
+                "codex_transport": config.CODEX_TRANSPORT,
+                "server_time": config.now(),
             })
         if p == "/api/state":
             plans = rows("SELECT * FROM plans ORDER BY created_at DESC LIMIT 100")
@@ -121,14 +179,14 @@ class Handler(SimpleHTTPRequestHandler):
                     "engines": engine_status(),
                     "quota": quota_status(),
                     "defaults": {
-                        "orchestrator": DEFAULT_ORCHESTRATOR,
-                        "worker": DEFAULT_WORKER,
-                        "orchestrator_effort": DEFAULT_ORCHESTRATOR_EFFORT,
-                        "worker_effort": DEFAULT_WORKER_EFFORT,
-                        "orchestrator_tier": DEFAULT_ORCHESTRATOR_TIER,
-                        "worker_tier": DEFAULT_WORKER_TIER,
+                        "orchestrator": config.DEFAULT_ORCHESTRATOR,
+                        "worker": config.DEFAULT_WORKER,
+                        "orchestrator_effort": config.DEFAULT_ORCHESTRATOR_EFFORT,
+                        "worker_effort": config.DEFAULT_WORKER_EFFORT,
+                        "orchestrator_tier": config.DEFAULT_ORCHESTRATOR_TIER,
+                        "worker_tier": config.DEFAULT_WORKER_TIER,
                         "max_parallel": 4,
-                        "recovery": RECOVERY_DEFAULTS,
+                        "recovery": config.RECOVERY_DEFAULTS,
                     },
                 }
             )
@@ -191,7 +249,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "recent_logs": doctor_logs,
             }
             q = quota_status()
-            return self.send_json({"plan": plan, "tasks": tasks, "orchestrator": orchestrator, "consultations": consultations, "doctor": doctor, "quota": q, "mission_usage": mission_usage(plan, q), "server_time": now()})
+            return self.send_json({"plan": plan, "tasks": tasks, "orchestrator": orchestrator, "consultations": consultations, "doctor": doctor, "quota": q, "mission_usage": mission_usage(plan, q), "server_time": config.now()})
         if p.startswith("/api/logs/"):
             tid = p.split("/api/logs/",1)[1]
             return self.send_json({"logs": rows("SELECT * FROM logs WHERE task_id=? ORDER BY id", (tid,))})
@@ -262,7 +320,7 @@ class Handler(SimpleHTTPRequestHandler):
                 agent_tier = (data.get("service_tier") or "").strip()
                 if agent_model and agent_effort:
                     validate_runtime_config(agent_model, agent_effort, agent_tier or "default", "Worker profile")
-                elif agent_tier and agent_tier not in VALID_TIERS:
+                elif agent_tier and agent_tier not in config.VALID_TIERS:
                     raise ValueError(f"Worker profile: invalid speed {agent_tier}")
                 execute(
                     "INSERT OR REPLACE INTO agents(id,name,role,engine,model,mode,created_at,reasoning_effort,service_tier) VALUES(?,?,?,?,?,?,COALESCE((SELECT created_at FROM agents WHERE id=?),?),?,?)",
@@ -274,7 +332,7 @@ class Handler(SimpleHTTPRequestHandler):
                         agent_model,
                         data.get("mode", "read"),
                         aid,
-                        now(),
+                        config.now(),
                         agent_effort,
                         agent_tier,
                     ),
@@ -291,15 +349,15 @@ class Handler(SimpleHTTPRequestHandler):
                     workspace_id = ws["id"]
                 if not goal:
                     raise ValueError("Goal gerekli")
-                orchestrator_model = data.get("orchestrator_model") or DEFAULT_ORCHESTRATOR
-                worker_model = data.get("worker_model") or DEFAULT_WORKER
-                orchestrator_effort = data.get("orchestrator_effort") or DEFAULT_ORCHESTRATOR_EFFORT
-                worker_effort = data.get("worker_effort") or DEFAULT_WORKER_EFFORT
-                orchestrator_tier = data.get("orchestrator_tier") or DEFAULT_ORCHESTRATOR_TIER
-                worker_tier = data.get("worker_tier") or DEFAULT_WORKER_TIER
+                orchestrator_model = data.get("orchestrator_model") or config.DEFAULT_ORCHESTRATOR
+                worker_model = data.get("worker_model") or config.DEFAULT_WORKER
+                orchestrator_effort = data.get("orchestrator_effort") or config.DEFAULT_ORCHESTRATOR_EFFORT
+                worker_effort = data.get("worker_effort") or config.DEFAULT_WORKER_EFFORT
+                orchestrator_tier = data.get("orchestrator_tier") or config.DEFAULT_ORCHESTRATOR_TIER
+                worker_tier = data.get("worker_tier") or config.DEFAULT_WORKER_TIER
                 validate_runtime_config(orchestrator_model, orchestrator_effort, orchestrator_tier, "Orchestrator")
                 validate_runtime_config(worker_model, worker_effort, worker_tier, "Worker default")
-                max_parallel = max(1, min(int(data.get("max_parallel") or 4), MAX_PARALLEL_HARD))
+                max_parallel = max(1, min(int(data.get("max_parallel") or 4), config.MAX_PARALLEL_HARD))
                 pid = str(uuid.uuid4())[:8]
                 saved_attachments = []
                 for item in (data.get("attachments") or [])[:8]:
@@ -308,9 +366,9 @@ class Handler(SimpleHTTPRequestHandler):
                 attachment_paths = [a["path"] for a in saved_attachments]
                 execute(
                     "INSERT INTO plans(id,goal,title,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json,demo_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (pid, goal, deterministic_mission_title(goal), ws["repo_path"], "demo-simulator", "planning", now(), orchestrator_model, worker_model, max_parallel, str(mission_dir(pid)), "{}", orchestrator_effort, worker_effort, orchestrator_tier, worker_tier, json.dumps(RECOVERY_DEFAULTS), workspace_id, "auto", json.dumps(attachment_paths), 1),
+                    (pid, goal, deterministic_mission_title(goal), ws["repo_path"], "demo-simulator", "planning", config.now(), orchestrator_model, worker_model, max_parallel, str(config.mission_dir(pid)), "{}", orchestrator_effort, worker_effort, orchestrator_tier, worker_tier, json.dumps(config.RECOVERY_DEFAULTS), workspace_id, "auto", json.dumps(attachment_paths), 1),
                 )
-                execute("UPDATE workspaces SET last_opened_at=? WHERE id=?", (now(), workspace_id))
+                execute("UPDATE workspaces SET last_opened_at=? WHERE id=?", (config.now(), workspace_id))
                 write_mission_docs(pid)
                 threading.Thread(target=build_demo_plan, args=(pid,), daemon=True).start()
                 return self.send_json({"ok":True,"plan_id":pid,"status":"planning","demo":True})
@@ -329,19 +387,19 @@ class Handler(SimpleHTTPRequestHandler):
                 automation_mode = data.get("automation_mode") or "auto"
                 if automation_mode not in ("auto", "supervised", "manual"):
                     raise ValueError("Automation mode geçersiz")
-                orchestrator_model = data.get("orchestrator_model") or DEFAULT_ORCHESTRATOR
-                worker_model = data.get("worker_model") or DEFAULT_WORKER
-                orchestrator_effort = data.get("orchestrator_effort") or DEFAULT_ORCHESTRATOR_EFFORT
-                worker_effort = data.get("worker_effort") or DEFAULT_WORKER_EFFORT
-                orchestrator_tier = data.get("orchestrator_tier") or DEFAULT_ORCHESTRATOR_TIER
-                worker_tier = data.get("worker_tier") or DEFAULT_WORKER_TIER
+                orchestrator_model = data.get("orchestrator_model") or config.DEFAULT_ORCHESTRATOR
+                worker_model = data.get("worker_model") or config.DEFAULT_WORKER
+                orchestrator_effort = data.get("orchestrator_effort") or config.DEFAULT_ORCHESTRATOR_EFFORT
+                worker_effort = data.get("worker_effort") or config.DEFAULT_WORKER_EFFORT
+                orchestrator_tier = data.get("orchestrator_tier") or config.DEFAULT_ORCHESTRATOR_TIER
+                worker_tier = data.get("worker_tier") or config.DEFAULT_WORKER_TIER
                 validate_runtime_config(orchestrator_model, orchestrator_effort, orchestrator_tier, "Orchestrator")
                 validate_runtime_config(worker_model, worker_effort, worker_tier, "Worker default")
-                max_parallel = max(1, min(int(data.get("max_parallel") or 4), MAX_PARALLEL_HARD))
-                recovery = dict(RECOVERY_DEFAULTS)
+                max_parallel = max(1, min(int(data.get("max_parallel") or 4), config.MAX_PARALLEL_HARD))
+                recovery = dict(config.RECOVERY_DEFAULTS)
                 requested_recovery = data.get("recovery") or {}
                 if isinstance(requested_recovery, dict):
-                    for key in RECOVERY_DEFAULTS:
+                    for key in config.RECOVERY_DEFAULTS:
                         if key in requested_recovery:
                             recovery[key] = requested_recovery[key]
                 if recovery.get("unknown_local_changes") != "ask":
@@ -359,14 +417,14 @@ class Handler(SimpleHTTPRequestHandler):
                 execute(
                     "INSERT INTO plans(id,goal,title,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        pid, goal, deterministic_mission_title(goal), str(Path(workspace).expanduser().resolve()), "codex-chatgpt", "planning", now(),
-                        orchestrator_model, worker_model, max_parallel, str(mission_dir(pid)), "{}",
+                        pid, goal, deterministic_mission_title(goal), str(Path(workspace).expanduser().resolve()), "codex-chatgpt", "planning", config.now(),
+                        orchestrator_model, worker_model, max_parallel, str(config.mission_dir(pid)), "{}",
                         orchestrator_effort, worker_effort, orchestrator_tier, worker_tier,
                         json.dumps(recovery, ensure_ascii=False), workspace_id, automation_mode,
                         json.dumps(attachment_paths, ensure_ascii=False),
                     ),
                 )
-                execute("UPDATE workspaces SET last_opened_at=? WHERE id=?", (now(), workspace_id))
+                execute("UPDATE workspaces SET last_opened_at=? WHERE id=?", (config.now(), workspace_id))
                 write_mission_docs(pid)
                 threading.Thread(target=build_plan, args=(pid,), daemon=True).start()
                 return self.send_json({"ok": True, "plan_id": pid, "status": "planning"})
@@ -511,9 +569,9 @@ class Handler(SimpleHTTPRequestHandler):
                         image_paths.append(saved["path"])
                 mid=str(uuid.uuid4())[:10]
                 status = manual_followup_delivery_status(tid)
-                with APP_SERVER_CONTROLS_LOCK:
-                    app_server_active = tid in APP_SERVER_CONTROLS
-                execute("INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)", (mid,tid,task['plan_id'],now(),prompt,json.dumps(image_paths),status))
+                with config.APP_SERVER_CONTROLS_LOCK:
+                    app_server_active = tid in config.APP_SERVER_CONTROLS
+                execute("INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)", (mid,tid,task['plan_id'],config.now(),prompt,json.dumps(image_paths),status))
                 if status=='sending':
                     if app_server_active:
                         if not steer_app_server(tid, mid, prompt, image_paths):
@@ -563,7 +621,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not tasks: raise ValueError('Onaylanacak task yok')
                 missing=[t['title'] for t in tasks if not t.get('agent_id')]
                 if missing: raise ValueError('Agent atanmamış task var: '+', '.join(missing))
-                execute("UPDATE plans SET status=?,approved_at=?,approval_note=? WHERE id=?",('approved',now(),(data.get('note') or '').strip(),pid))
+                execute("UPDATE plans SET status=?,approved_at=?,approval_note=? WHERE id=?",('approved',config.now(),(data.get('note') or '').strip(),pid))
                 log(orchestrator_log_id(pid),'supervisor','plan approved by user · execution is still paused until Start mission')
                 write_mission_docs(pid)
                 return self.send_json({'ok':True})
@@ -581,14 +639,14 @@ class Handler(SimpleHTTPRequestHandler):
                 task=one("SELECT * FROM tasks WHERE id=?",(tid,))
                 if not task: raise ValueError('Task bulunamadı')
                 plan=one("SELECT * FROM plans WHERE id=?",(task['plan_id'],))
-                with RUNNERS_LOCK:
-                    proc = RUNNERS.get(tid)
+                with config.RUNNERS_LOCK:
+                    proc = config.RUNNERS.get(tid)
                 if proc:
                     terminate_process(proc)
-                    execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("cancelled", "User cancelled", now(), tid))
+                    execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("cancelled", "User cancelled", config.now(), tid))
                     return self.send_json({"ok": True})
                 if plan and int(plan.get('demo_mode') or 0) and task.get('status')=='running':
-                    execute("UPDATE tasks SET status=?,error=?,finished_at=? WHERE id=?",('cancelled','User cancelled demo agent',now(),tid))
+                    execute("UPDATE tasks SET status=?,error=?,finished_at=? WHERE id=?",('cancelled','User cancelled demo agent',config.now(),tid))
                     return self.send_json({'ok':True})
                 return self.send_json({"ok": False, "message": "Task çalışmıyor"}, 409)
 

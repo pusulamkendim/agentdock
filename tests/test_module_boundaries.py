@@ -1,3 +1,4 @@
+import ast
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,12 +16,14 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertIs(agentdock.Handler, agentdock.api.Handler)
         self.assertIs(agentdock.main, agentdock.app.main)
 
-    def test_legacy_facade_patches_reach_extracted_modules(self):
+    def test_facade_patches_are_local_to_the_patched_owner(self):
         replacement = object()
         with patch.object(agentdock, "run_codex", replacement):
+            self.assertIs(agentdock.run_codex, replacement)
+            self.assertIsNot(agentdock.codex.run_codex, replacement)
+            self.assertIsNot(agentdock.tasks.run_codex, replacement)
+        with patch.object(agentdock.codex, "run_codex", replacement):
             self.assertIs(agentdock.codex.run_codex, replacement)
-            self.assertIs(agentdock.tasks.run_codex, replacement)
-        self.assertIs(agentdock.run_codex, agentdock.codex.run_codex)
 
     def test_script_entrypoint_is_a_thin_facade(self):
         entrypoint = Path(__file__).parents[1] / "agentdock.py"

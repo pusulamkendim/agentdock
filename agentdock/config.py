@@ -219,7 +219,14 @@ def choose_workspace_folder():
     return str(Path(value).expanduser().resolve()) if value else None
 
 def recovery_settings(plan):
-    configured = safe_json((plan or {}).get("recovery_json"), {}) if "safe_json" in globals() else {}
+    # config is a leaf module.  Keep this small parser local instead of
+    # importing the schema/JSON helpers and creating an upward dependency.
+    try:
+        configured = json.loads((plan or {}).get("recovery_json") or "{}")
+    except Exception:
+        configured = {}
+    if not isinstance(configured, dict):
+        configured = {}
     out = dict(RECOVERY_DEFAULTS)
     if isinstance(configured, dict):
         out.update({k: configured[k] for k in RECOVERY_DEFAULTS if k in configured})

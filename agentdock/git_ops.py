@@ -21,6 +21,9 @@ import fnmatch
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
+
+from . import config
+from .db import execute, log
 FINGERPRINT_MAX_FILES = 2000
 
 FINGERPRINT_MAX_HASH_BYTES = 64 * 1024 * 1024
@@ -124,7 +127,7 @@ def workspace_snapshot(workspace):
             "isolated_write": "unavailable",
             "requires_user_resolution": False,
         },
-        "captured_at": now(),
+        "captured_at": config.now(),
     }
     if not info.get("is_git"):
         snapshot["write_safety"]["requires_user_resolution"] = True
@@ -159,7 +162,7 @@ def workspace_snapshot(workspace):
 
 def _is_agentdock_state_path(path):
     target = Path(path).expanduser().resolve()
-    for base in (STATE_ROOT, MISSION_ROOT, WORKTREE_ROOT, ATTACHMENT_ROOT):
+    for base in (config.STATE_ROOT, config.MISSION_ROOT, config.WORKTREE_ROOT, config.ATTACHMENT_ROOT):
         try:
             target.relative_to(Path(base).expanduser().resolve())
             return True
@@ -217,7 +220,7 @@ def workspace_fingerprint(workspace):
     fingerprint = {
         "workspace": str(resolved),
         "kind": "git" if info.get("is_git") else "filesystem",
-        "captured_at": now(),
+        "captured_at": config.now(),
     }
     budget = [0]
     if info.get("is_git"):
@@ -298,10 +301,10 @@ def safe_generated_target(repo_root, rel_path):
     rel = Path(rel_path)
     parts = rel.parts
     for idx, part in enumerate(parts):
-        if part in SAFE_GENERATED_DIRS:
+        if part in config.SAFE_GENERATED_DIRS:
             return (root / Path(*parts[: idx + 1])).resolve()
     name = rel.name
-    if name in SAFE_GENERATED_FILES or name.endswith((".pyc", ".pyo")) or name.startswith(".coverage."):
+    if name in config.SAFE_GENERATED_FILES or name.endswith((".pyc", ".pyo")) or name.startswith(".coverage."):
         return (root / rel).resolve()
     return None
 
@@ -322,7 +325,7 @@ def repair_local_ignore_rules(repo_root):
     exclude = info / "exclude"
     existing = exclude.read_text(errors="replace") if exclude.exists() else ""
     current = {line.strip() for line in existing.splitlines() if line.strip() and not line.lstrip().startswith("#")}
-    missing = [x for x in LOCAL_IGNORE_RULES if x not in current]
+    missing = [x for x in config.LOCAL_IGNORE_RULES if x not in current]
     if missing:
         prefix = "" if not existing or existing.endswith("\n") else "\n"
         with exclude.open("a") as f:
@@ -360,7 +363,7 @@ def sanitize_branch_component(text):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-.")[:40] or "task"
 
 def plan_paths(plan_id):
-    base = WORKTREE_ROOT / plan_id
+    base = config.WORKTREE_ROOT / plan_id
     return base, base / "integration"
 
 def remove_worktree(repo_root, path):
@@ -381,7 +384,7 @@ def prepare_integration(plan):
         # The explicit execution preflight choice protects these changes in the
         # user's checkout. Worker isolation starts from HEAD and never writes
         # into this dirty checkout; the final apply gate still rechecks it.
-        log(orchestrator_log_id(plan["id"]), "supervisor", "working tree is dirty but explicitly accepted; isolated workers start from HEAD")
+        log(f"orchestrator:{plan['id']}", "supervisor", "working tree is dirty but explicitly accepted; isolated workers start from HEAD")
     repo_root = Path(info["root"])
     base_dir, integration_dir = plan_paths(plan["id"])
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -482,7 +485,12 @@ def path_matches_allowed(rel_path, pattern):
     return rel == pat or fnmatch.fnmatchcase(rel, pat)
 
 def validate_worker_changes(worktree, task):
-    contract = safe_json(task.get("contract_json"), {})
+    try:
+        contract = json.loads(task.get("contract_json") or "{}")
+    except Exception:
+        contract = {}
+    if not isinstance(contract, dict):
+        contract = {}
     allowed = contract.get("allowed_paths") or []
     if isinstance(allowed, str):
         allowed = [allowed]

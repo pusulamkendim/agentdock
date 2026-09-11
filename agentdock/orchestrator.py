@@ -22,6 +22,23 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+from .codex import run_orchestrator
+from .db import (
+    claim_plan_run,
+    create_agent_session,
+    execute,
+    finish_agent_session,
+    latest_agent_session,
+    log,
+    one,
+    record_control_event,
+    release_plan_run,
+    rows,
+)
+from .schemas import CONSULTATION_SCHEMA, consultation_schema_path, extract_json, extract_worker_consultation, normalize_consultation_result, safe_json
+from .timeline import write_mission_docs
+
 def plan_is_paused(plan_id):
     plan = one("SELECT status,paused FROM plans WHERE id=?", (plan_id,)) or {}
     return plan.get("status") in ("paused", "pausing") or int(plan.get("paused") or 0) == 1
@@ -30,11 +47,11 @@ def orchestrator_log_id(plan_id):
     return f"orchestrator:{plan_id}"
 
 def _orchestrator_lock(plan_id):
-    with ORCHESTRATOR_TURN_LOCKS_LOCK:
-        lock = ORCHESTRATOR_TURN_LOCKS.get(plan_id)
+    with config.ORCHESTRATOR_TURN_LOCKS_LOCK:
+        lock = config.ORCHESTRATOR_TURN_LOCKS.get(plan_id)
         if lock is None:
             lock = threading.RLock()
-            ORCHESTRATOR_TURN_LOCKS[plan_id] = lock
+            config.ORCHESTRATOR_TURN_LOCKS[plan_id] = lock
         return lock
 
 def _latest_orchestrator_thread(plan_id):
@@ -60,7 +77,7 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
     A per-mission lock serializes turns while the database preserves the queue
     and thread identity across process restarts.
     """
-    if purpose not in ORCHESTRATOR_PURPOSES:
+    if purpose not in config.ORCHESTRATOR_PURPOSES:
         raise ValueError(f"Unknown orchestrator turn purpose: {purpose}")
     plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
     if not plan:
@@ -89,7 +106,7 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
             ) VALUES(?,?,?,?,?,?,?)""",
             (
                 turn_record_id, plan_id, existing_thread, purpose, "queued",
-                json.dumps(context_payload, ensure_ascii=False), now(),
+                json.dumps(context_payload, ensure_ascii=False), config.now(),
             ),
         )
         execute(
@@ -104,19 +121,19 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
         )
         execute(
             "UPDATE orchestrator_turns SET status=?,started_at=? WHERE id=?",
-            ("running", now(), turn_record_id),
+            ("running", config.now(), turn_record_id),
         )
         try:
             prompt = _orchestrator_turn_prompt(purpose, context)
-            model = requested_model or plan.get("orchestrator_model") or DEFAULT_ORCHESTRATOR
-            recovery = recovery_settings(plan)
+            model = requested_model or plan.get("orchestrator_model") or config.DEFAULT_ORCHESTRATOR
+            recovery = config.recovery_settings(plan)
             text, used_model = run_orchestrator(
                 prompt,
                 plan["workspace"],
                 model,
                 orchestrator_log_id(plan_id),
-                plan.get("orchestrator_effort") or DEFAULT_ORCHESTRATOR_EFFORT,
-                plan.get("orchestrator_tier") or DEFAULT_ORCHESTRATOR_TIER,
+                plan.get("orchestrator_effort") or config.DEFAULT_ORCHESTRATOR_EFFORT,
+                plan.get("orchestrator_tier") or config.DEFAULT_ORCHESTRATOR_TIER,
                 mode=mode,
                 transient_retries=transient_retries if transient_retries is not None else (1 if recovery.get("auto_retry_transient") else 0),
                 images=images or [],
@@ -156,7 +173,7 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
                 """UPDATE orchestrator_turns SET thread_id=?,turn_id=?,status=?,
                    response_text=?,response_json=?,usage_json=?,finished_at=? WHERE id=?""",
                 (actual_thread, turn_id, "completed", str(text or "")[-120000:], response_json,
-                 json.dumps(usage, ensure_ascii=False), now(), turn_record_id),
+                 json.dumps(usage, ensure_ascii=False), config.now(), turn_record_id),
             )
             log(
                 orchestrator_log_id(plan_id),
@@ -192,7 +209,7 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
             )
             execute(
                 """UPDATE orchestrator_turns SET thread_id=?,turn_id=?,status=?,usage_json=?,error=?,finished_at=? WHERE id=?""",
-                (actual_thread or existing_thread, turn_id, "failed", json.dumps(usage, ensure_ascii=False), message[-12000:], now(), turn_record_id),
+                (actual_thread or existing_thread, turn_id, "failed", json.dumps(usage, ensure_ascii=False), message[-12000:], config.now(), turn_record_id),
             )
             log(orchestrator_log_id(plan_id), "supervisor", f"orchestrator turn failed · purpose={purpose}: {message}")
             record_control_event(plan_id, "agentdock.orchestrator_turn", {
@@ -442,6 +459,8 @@ def same_worker_resume_handoff(task, instruction="Continue the same task from yo
 
 def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=None):
     """Ask the same orchestrator thread to resolve a worker's structured question."""
+    from .tasks import create_worker_consultation
+
     fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
     consultation_id = fresh.get("consultation_id") or (result or {}).get("consultation_id") or ""
     consultation = one("SELECT * FROM consultations WHERE id=?", (consultation_id,)) if consultation_id else None
@@ -480,7 +499,7 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
             expected_output_schema=consultation_schema_path(),
             mode="read",
             images=answer_images,
-            transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
+            transient_retries=1 if config.recovery_settings(plan).get("auto_retry_transient") else 0,
         )
         if plan_is_paused(plan["id"]):
             return _defer_consultation_for_paused_plan(plan, fresh, consultation, payload)
@@ -506,7 +525,7 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
             )
             execute(
                 "UPDATE consultations SET status=?,resolved_at=? WHERE id=?",
-                ("resolved", now(), consultation["id"]),
+                ("resolved", config.now(), consultation["id"]),
             )
             execute(
                 "UPDATE plans SET pending_question_id=?,pending_question_json=?,error=?,status=? WHERE id=?",
@@ -544,7 +563,7 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
         reason = response["reason"] or "Orchestrator blocked the mission."
         execute(
             "UPDATE consultations SET status=?,resolved_at=? WHERE id=?",
-            ("blocked", now(), consultation["id"]),
+            ("blocked", config.now(), consultation["id"]),
         )
         execute(
             "UPDATE tasks SET status=?,error=?,waiting_reason=? WHERE id=?",
@@ -552,7 +571,7 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
         )
         execute(
             "UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?",
-            ("blocked", reason, now(), plan["id"]),
+            ("blocked", reason, config.now(), plan["id"]),
         )
         log(orchestrator_log_id(plan["id"]), "supervisor", f"mission blocked by orchestrator decision · {reason}")
         write_mission_docs(plan["id"])
@@ -573,6 +592,8 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
         return {"ok": False, "attention": True, "error": message}
 
 def escalation_prompt(plan, task, worker_output):
+    from .tasks import task_dependency_context
+
     contract = safe_json(task.get("contract_json"), {})
     return f"""You are the root orchestrator supervising a smaller worker. The worker correctly refused to make a reserved decision.
 
@@ -605,6 +626,8 @@ Rules:
 """
 
 def resolve_worker_escalation(plan, task, result, workspace, ctx=None):
+    from .tasks import create_worker_consultation
+
     fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
     count = int(fresh.get("escalation_count") or 0)
     if count >= 2:
@@ -632,6 +655,8 @@ def resolve_worker_escalation(plan, task, result, workspace, ctx=None):
         return False
 
 def failure_recovery_prompt(plan, task, result):
+    from .tasks import task_dependency_context
+
     contract = safe_json(task.get("contract_json"), {})
     return f"""You are the root orchestrator supervising a smaller execution worker. The worker failed while executing an already-decided task contract.
 
@@ -688,7 +713,7 @@ def resolve_worker_failure(plan, task, result, ctx=None):
             failure_recovery_prompt(plan, fresh, result),
             expected_output_schema=consultation_schema_path(),
             mode="read",
-            transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
+            transient_retries=1 if config.recovery_settings(plan).get("auto_retry_transient") else 0,
         )
         obj = normalize_consultation_result(extract_json(turn["text"]))
         used = turn.get("model") or plan.get("orchestrator_used") or plan["orchestrator_model"]
@@ -781,7 +806,7 @@ def run_orchestrator_followup(plan_id, prompt, image_paths=None):
         # The model used by the previous turn must not pin future turns after
         # the user changes Runtime settings.
         requested_model=plan.get("orchestrator_model"),
-        transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
+        transient_retries=1 if config.recovery_settings(plan).get("auto_retry_transient") else 0,
     )
     log(
         orchestrator_log_id(plan_id),
@@ -804,7 +829,7 @@ def answer_consultation(plan_id, consultation_id, answer, attachments=None):
     answer_payload = {
         "text": answer_text,
         "attachments": attachment_paths,
-        "answered_at": now(),
+        "answered_at": config.now(),
     }
     execute(
         "UPDATE consultations SET status=?,user_answer_json=? WHERE id=?",
@@ -832,6 +857,7 @@ def answer_consultation(plan_id, consultation_id, answer, attachments=None):
         )
         log(orchestrator_log_id(plan_id), "supervisor", "user answer accepted · resuming the same worker and remaining graph")
         if claim_plan_run(plan_id):
+            from .mission import run_plan
             threading.Thread(
                 target=run_plan,
                 args=(plan_id,),
@@ -883,7 +909,7 @@ what the next safe action is.
             "reconstruct",
             context,
             mode="read",
-            transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
+        transient_retries=1 if config.recovery_settings(plan).get("auto_retry_transient") else 0,
         )
         execute(
             "UPDATE plans SET legacy_orchestrator_status=?,orchestrator_last_error=?,summary=? WHERE id=?",

@@ -22,6 +22,34 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+from .codex import run_codex, task_input_attachment_paths
+from .db import (
+    create_agent_session,
+    execute,
+    finish_agent_session,
+    latest_agent_session,
+    log,
+    one,
+    record_control_event,
+    rows,
+)
+from .git_ops import (
+    changed_git_paths,
+    commit_worker_changes,
+    create_worker_worktree,
+    delete_branch,
+    git,
+    path_matches_allowed,
+    remove_worktree,
+    validate_read_workspace,
+    validate_worker_changes,
+    workspace_fingerprint,
+)
+from .preflight import is_transient_error
+from .schemas import extract_worker_consultation, safe_json
+from .timeline import write_mission_docs
+
 def format_contract_md(contract):
     if not isinstance(contract, dict):
         contract = {}
@@ -128,15 +156,15 @@ NON-NEGOTIABLE WORK RULES:
 
 def task_model(plan, agent, task=None):
     task = task or {}
-    return (task.get("model_override") or "").strip() or (agent.get("model") or agent.get("agent_model") or "").strip() or plan.get("worker_model") or DEFAULT_WORKER
+    return (task.get("model_override") or "").strip() or (agent.get("model") or agent.get("agent_model") or "").strip() or plan.get("worker_model") or config.DEFAULT_WORKER
 
 def task_effort(plan, agent, task=None):
     task = task or {}
-    return (task.get("reasoning_effort_override") or "").strip() or (agent.get("reasoning_effort") or agent.get("agent_effort") or "").strip() or plan.get("worker_effort") or DEFAULT_WORKER_EFFORT
+    return (task.get("reasoning_effort_override") or "").strip() or (agent.get("reasoning_effort") or agent.get("agent_effort") or "").strip() or plan.get("worker_effort") or config.DEFAULT_WORKER_EFFORT
 
 def task_tier(plan, agent, task=None):
     task = task or {}
-    return (task.get("service_tier_override") or "").strip() or (agent.get("service_tier") or agent.get("agent_tier") or "").strip() or plan.get("worker_tier") or DEFAULT_WORKER_TIER
+    return (task.get("service_tier_override") or "").strip() or (agent.get("service_tier") or agent.get("agent_tier") or "").strip() or plan.get("worker_tier") or config.DEFAULT_WORKER_TIER
 
 def create_worker_consultation(plan, task, output):
     request = extract_worker_consultation(output)
@@ -161,7 +189,7 @@ def create_worker_consultation(plan, task, output):
             json.dumps(request["options"], ensure_ascii=False),
             worker_thread_id,
             plan.get("orchestrator_thread_id") or "",
-            now(),
+            config.now(),
         ),
     )
     execute(
@@ -183,7 +211,7 @@ def create_worker_consultation(plan, task, output):
         f"worker consultation queued · {request['question'][:300]}",
     )
     log(
-        orchestrator_log_id(plan["id"]),
+        f"orchestrator:{plan['id']}",
         "supervisor",
         f"TASK-{task['seq']+1:03d} waiting for orchestrator · consultation={consultation_id[:12]}",
     )
@@ -214,7 +242,7 @@ def run_task_once(plan, task, workspace, force_mode=None):
     existing_worker_thread = task.get("worker_thread_id") or (latest_agent_session(task["id"]) or {}).get("thread_id") or ""
     execute(
         "UPDATE tasks SET status=?, started_at=?, error=?, workspace=?,waiting_reason=? WHERE id=?",
-        ("running", now(), "", str(workspace), "", task["id"]),
+        ("running", config.now(), "", str(workspace), "", task["id"]),
     )
     write_mission_docs(plan["id"])
     try:
@@ -254,7 +282,7 @@ def run_task_once(plan, task, workspace, force_mode=None):
         # session/timeline by consume_queued_messages; never replace the
         # worker's canonical execution output or turn it into a consultation.
         consume_queued_messages(plan, task, workspace, model, effort, tier)
-        execute("UPDATE tasks SET status=?, output=?, error=?, finished_at=? WHERE id=?", ("executed", output, "", now(), task["id"]))
+        execute("UPDATE tasks SET status=?, output=?, error=?, finished_at=? WHERE id=?", ("executed", output, "", config.now(), task["id"]))
         write_mission_docs(plan["id"])
         return {"ok": True, "output": output}
     except Exception as e:
@@ -269,12 +297,12 @@ def run_task_once(plan, task, workspace, force_mode=None):
         if current.get("status")=="cancelled":
             write_mission_docs(plan["id"])
             return {"ok": False, "cancelled": True, "error": "User cancelled"}
-        execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), now(), task["id"]))
+        execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), config.now(), task["id"]))
         write_mission_docs(plan["id"])
         return {"ok": False, "error": str(e)}
 
 def run_task_with_recovery(plan, task, workspace, force_mode=None):
-    settings = recovery_settings(plan)
+    settings = config.recovery_settings(plan)
     max_retries = 2 if settings.get("auto_retry_transient") else 0
     attempt = 0
     while True:
@@ -291,7 +319,7 @@ def run_task_with_recovery(plan, task, workspace, force_mode=None):
         execute("UPDATE plans SET recovery_count=recovery_count+1 WHERE id=?", (plan["id"],))
         delay = 2 if attempt == 1 else 5
         log(task["id"], "supervisor", f"self-heal: transient failure detected; retry {attempt}/{max_retries} in {delay}s")
-        log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} transient failure; automatic retry {attempt}/{max_retries}")
+        log(f"orchestrator:{plan['id']}", "supervisor", f"TASK-{task['seq']+1:03d} transient failure; automatic retry {attempt}/{max_retries}")
         time.sleep(delay)
 
 def run_parallel_task(plan, task, ctx, wave_base_commit):
@@ -306,11 +334,11 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
         try:
             wt, workspace, branch = create_worker_worktree(ctx, plan, task, wave_base_commit)
         except Exception as e:
-            execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), now(), task["id"]))
+            execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), config.now(), task["id"]))
             return {"task": task, "ok": False, "write": True, "phase": "worktree", "error": str(e)}
         result = run_task_with_recovery(plan, task, workspace)
         if result.get("paused"):
-            log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} paused by user; worktree and worker thread preserved")
+            log(f"orchestrator:{plan['id']}", "supervisor", f"TASK-{task['seq']+1:03d} paused by user; worktree and worker thread preserved")
             return {"task": task, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch, **result}
         # A previous interrupted/failed integration may already have produced
         # a durable worker commit. Keep it as the checkpoint if the resumed
@@ -326,7 +354,7 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
                 execute("UPDATE tasks SET commit_hash=? WHERE id=?", (commit_hash, task["id"]))
             except Exception as e:
                 result = {"ok": False, "phase": "contract", "error": f"Worker değişiklikleri contract kontrolünden geçemedi: {e}"}
-                execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", result["error"], now(), task["id"]))
+                execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", result["error"], config.now(), task["id"]))
         return {"task": task, "ok": result["ok"], "write": True, "phase": "worker", "wt": str(wt), "branch": branch, "commit": commit_hash, **result}
     else:
         baseline = workspace_fingerprint(ctx["integration_workspace"])
@@ -343,7 +371,7 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
                 result["fingerprint"] = after
             except Exception as e:
                 result = {"ok": False, "phase": "contract", "error": str(e)}
-                execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), now(), task["id"]))
+                execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), config.now(), task["id"]))
         return {"task": task, "ok": result.get("ok", False), "write": False, "phase": "worker", **result}
 
 def merge_conflict_prompt(plan, task, unresolved, cherry_error):
@@ -375,14 +403,15 @@ Otherwise resolve the files in-place and briefly report what you reconciled.
 
 def resolve_merge_conflict(plan, ctx, result, cherry_error):
     task = result["task"]
-    settings = recovery_settings(plan)
+    settings = config.recovery_settings(plan)
     unresolved = [x for x in git(ctx["integration_dir"], "diff", "--name-only", "--diff-filter=U", check=False).stdout.splitlines() if x.strip()]
     if settings.get("merge_conflicts") != "orchestrator":
         return False, f"Merge conflict requires attention: {', '.join(unresolved) or cherry_error}"
-    log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} integration conflict; root orchestrator is attempting a bounded resolution")
+    log(f"orchestrator:{plan['id']}", "supervisor", f"TASK-{task['seq']+1:03d} integration conflict; root orchestrator is attempting a bounded resolution")
     execute("UPDATE plans SET recovery_count=recovery_count+1 WHERE id=?", (plan["id"],))
     try:
         retries = 1 if settings.get("auto_retry_transient") else 0
+        from .orchestrator import run_mission_orchestrator_turn
         turn = run_mission_orchestrator_turn(
             plan["id"],
             "failure_recovery",
@@ -435,7 +464,7 @@ def resolve_merge_conflict(plan, ctx, result, cherry_error):
             "cherry-pick", "--continue",
         )
         execute("UPDATE tasks SET status=?, error=?, integration_status=? WHERE id=?", ("done", "", "resolved_by_orchestrator", task["id"]))
-        log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} merge conflict resolved by {used}")
+        log(f"orchestrator:{plan['id']}", "supervisor", f"TASK-{task['seq']+1:03d} merge conflict resolved by {used}")
         return True, ""
     except Exception as e:
         return False, f"Orchestrator conflict recovery failed: {e}"
@@ -464,7 +493,7 @@ def integrate_write_result(plan, ctx, result):
             return True
         git(ctx["integration_dir"], "cherry-pick", "--abort", check=False)
         err = f"Parallel integration conflict could not be self-healed: {detail or e}"
-        execute("UPDATE tasks SET status=?, error=?, integration_status=?, finished_at=? WHERE id=?", ("failed", err, "conflict", now(), task["id"]))
+        execute("UPDATE tasks SET status=?, error=?, integration_status=?, finished_at=? WHERE id=?", ("failed", err, "conflict", config.now(), task["id"]))
         return False
 
 def mark_read_result_done(result):
@@ -475,6 +504,8 @@ def mark_read_result_done(result):
     return False
 
 def run_demo_manual_followup(task_id, prompt, image_paths=None):
+    from .mission import demo_event
+
     task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
     plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],)) if task else None
     if not task or not plan:

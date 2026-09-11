@@ -22,8 +22,10 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+
 def db():
-    con = sqlite3.connect(DB, check_same_thread=False, timeout=30)
+    con = sqlite3.connect(config.DB, check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=30000")
     con.execute("PRAGMA foreign_keys=ON")
@@ -44,13 +46,13 @@ def ensure_column(table, name, ddl):
         con.close()
 
 def init_db():
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
-    MISSION_ROOT.mkdir(parents=True, exist_ok=True)
-    ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
-    if not DB.exists() and LEGACY_DB.exists() and LEGACY_DB.resolve() != DB.resolve():
-        shutil.copy2(LEGACY_DB, DB)
-        print(f"Migrated legacy AgentDock database to {DB}")
+    config.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    config.WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
+    config.MISSION_ROOT.mkdir(parents=True, exist_ok=True)
+    config.ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
+    if not config.DB.exists() and config.LEGACY_DB.exists() and config.LEGACY_DB.resolve() != config.DB.resolve():
+        shutil.copy2(config.LEGACY_DB, config.DB)
+        print(f"Migrated legacy AgentDock database to {config.DB}")
     con = db()
     cur = con.cursor()
     cur.executescript(
@@ -234,10 +236,11 @@ def init_db():
             ("tester", "Tester", "Design and run the smallest meaningful verification needed for the assigned change. Report exact commands and failures.", "codex", "", "read"),
         ]
         for row in defaults:
-            cur.execute("INSERT INTO agents(id,name,role,engine,model,mode,created_at) VALUES(?,?,?,?,?,?,?)", (*row, now()))
+            cur.execute("INSERT INTO agents(id,name,role,engine,model,mode,created_at) VALUES(?,?,?,?,?,?,?)", (*row, config.now()))
     con.commit()
     con.close()
 
+    from .schemas import consultation_schema_path, planner_schema_path
     planner_schema_path()
     consultation_schema_path()
     recover_orphaned_runs()
@@ -255,9 +258,10 @@ def init_db():
         else:
             wid = str(uuid.uuid4())[:8]
             name = Path(repo_path).name or repo_path
+            from .git_ops import repo_info
             info = repo_info(repo_path) if Path(repo_path).exists() else {"branch":""}
             con.execute("INSERT INTO workspaces(id,name,repo_path,default_branch,created_at,last_opened_at) VALUES(?,?,?,?,?,?)",
-                        (wid,name,repo_path,info.get("branch") or "",now(),now()))
+                        (wid,name,repo_path,info.get("branch") or "",config.now(),config.now()))
         if not pl["workspace_id"]:
             con.execute("UPDATE plans SET workspace_id=? WHERE id=?", (wid,pl["id"]))
     con.commit()
@@ -266,8 +270,8 @@ def init_db():
 
 def recover_orphaned_runs():
     """Move work interrupted by a server restart into an explicit retry state."""
-    interrupted_at = now()
-    with DB_LOCK:
+    interrupted_at = config.now()
+    with config.DB_LOCK:
         con = db()
         plans = con.execute(
             "SELECT id FROM plans WHERE status IN ('preflight','running','pausing','resuming')"
@@ -317,7 +321,8 @@ def recover_orphaned_runs():
         con.commit()
         con.close()
     for plan_id in plan_ids:
-        log(orchestrator_log_id(plan_id), "supervisor", message)
+        from .timeline import write_mission_docs
+        log(f"orchestrator:{plan_id}", "supervisor", message)
         write_mission_docs(plan_id)
     return len(plan_ids)
 
@@ -358,7 +363,8 @@ def migrate_legacy_orchestrator_state():
                    legacy_orchestrator_status=?,orchestrator_last_error=? WHERE id=?""",
                 (current or preferred, int(plan.get("orchestrator_generation") or 1), status, message, plan["id"]),
             )
-            log(orchestrator_log_id(plan["id"]), "supervisor", message)
+            from .timeline import write_mission_docs
+            log(f"orchestrator:{plan['id']}", "supervisor", message)
             write_mission_docs(plan["id"])
         elif not current and not legacy and plan.get("status") not in ("done", "cancelled"):
             message = "Legacy mission: unified orchestrator session must be reconstructed explicitly."
@@ -366,7 +372,8 @@ def migrate_legacy_orchestrator_state():
                 "UPDATE plans SET legacy_orchestrator_status=?,orchestrator_last_error=? WHERE id=?",
                 ("reconstruct_required", message, plan["id"]),
             )
-            log(orchestrator_log_id(plan["id"]), "supervisor", message)
+            from .timeline import write_mission_docs
+            log(f"orchestrator:{plan['id']}", "supervisor", message)
             write_mission_docs(plan["id"])
 
 def rows(sql, args=()):
@@ -382,7 +389,7 @@ def one(sql, args=()):
     return dict(r) if r else None
 
 def execute(sql, args=()):
-    with DB_LOCK:
+    with config.DB_LOCK:
         con = db()
         con.execute(sql, args)
         con.commit()
@@ -392,35 +399,37 @@ def log(task_id, stream, line):
     if task_id:
         execute(
             "INSERT INTO logs(task_id,ts,stream,line) VALUES(?,?,?,?)",
-            (task_id, now(), stream, str(line)[:12000]),
+            (task_id, config.now(), stream, str(line)[:12000]),
         )
 
 def claim_plan_run(plan_id):
     """Prevent duplicate starts caused by double clicks or concurrent clients."""
-    with ACTIVE_PLAN_RUNS_LOCK:
-        if plan_id in ACTIVE_PLAN_RUNS:
+    with config.ACTIVE_PLAN_RUNS_LOCK:
+        if plan_id in config.ACTIVE_PLAN_RUNS:
             return False
-        ACTIVE_PLAN_RUNS.add(plan_id)
+        config.ACTIVE_PLAN_RUNS.add(plan_id)
         return True
 
 def release_plan_run(plan_id):
-    with ACTIVE_PLAN_RUNS_LOCK:
-        ACTIVE_PLAN_RUNS.discard(plan_id)
+    with config.ACTIVE_PLAN_RUNS_LOCK:
+        config.ACTIVE_PLAN_RUNS.discard(plan_id)
 
 def ensure_workspace(repo_path, name=None):
+    from .config import normalize_workspace_path
+    from .git_ops import repo_info
     path = normalize_workspace_path(repo_path)
     canonical = str(path)
     current = one("SELECT * FROM workspaces WHERE repo_path=?", (canonical,))
     info = repo_info(canonical)
     if current:
         execute("UPDATE workspaces SET last_opened_at=?, default_branch=CASE WHEN ?<>'' THEN ? ELSE default_branch END WHERE id=?",
-                (now(), info.get("branch") or "", info.get("branch") or "", current["id"]))
+                (config.now(), info.get("branch") or "", info.get("branch") or "", current["id"]))
         if name and name.strip() and name.strip() != current.get("name"):
             execute("UPDATE workspaces SET name=? WHERE id=?", (name.strip(), current["id"]))
         return one("SELECT * FROM workspaces WHERE id=?", (current["id"],))
     wid = str(uuid.uuid4())[:8]
     execute("INSERT INTO workspaces(id,name,repo_path,default_branch,created_at,last_opened_at) VALUES(?,?,?,?,?,?)",
-            (wid, (name or path.name or canonical).strip(), canonical, info.get("branch") or "", now(), now()))
+            (wid, (name or path.name or canonical).strip(), canonical, info.get("branch") or "", config.now(), config.now()))
     return one("SELECT * FROM workspaces WHERE id=?", (wid,))
 
 def workspace_summary(workspace):
@@ -448,7 +457,7 @@ def create_agent_session(plan_id, task_id, kind, model, effort, tier, mode, cwd)
     sid = str(uuid.uuid4())
     execute("""INSERT INTO agent_sessions(id,plan_id,task_id,kind,model,reasoning_effort,service_tier,mode,cwd,status,started_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (sid, plan_id or "", task_id or "", kind, model or "", effort or "", tier or "default", mode, str(cwd), "running", now()))
+            (sid, plan_id or "", task_id or "", kind, model or "", effort or "", tier or "default", mode, str(cwd), "running", config.now()))
     return sid
 
 def record_codex_event(session_id, task_id, plan_id, raw_line):
@@ -461,7 +470,7 @@ def record_codex_event(session_id, task_id, plan_id, raw_line):
     item = obj.get("item") if isinstance(obj.get("item"), dict) else params.get("item") if isinstance(params.get("item"), dict) else {}
     itype = str(item.get("type") or "")
     execute("INSERT INTO agent_events(session_id,plan_id,task_id,ts,event_type,item_type,payload_json) VALUES(?,?,?,?,?,?,?)",
-            (session_id, plan_id or "", task_id or "", now(), typ, itype, json.dumps(obj, ensure_ascii=False)[:120000]))
+            (session_id, plan_id or "", task_id or "", config.now(), typ, itype, json.dumps(obj, ensure_ascii=False)[:120000]))
     if typ in ("thread.started", "thread/started"):
         thread = obj.get("thread") if isinstance(obj.get("thread"), dict) else params.get("thread") if isinstance(params.get("thread"), dict) else {}
         thread_id = str(obj.get("thread_id") or thread.get("id") or "")
@@ -471,7 +480,7 @@ def record_codex_event(session_id, task_id, plan_id, raw_line):
             # thread. Never replace an already-bound thread from an ordinary
             # resume; the gateway performs the hard mismatch check after the
             # turn completes.
-            if plan_id and str(task_id or "") == orchestrator_log_id(plan_id):
+            if plan_id and str(task_id or "") == f"orchestrator:{plan_id}":
                 execute(
                     "UPDATE plans SET orchestrator_thread_id=? WHERE id=? AND (orchestrator_thread_id='' OR orchestrator_thread_id=?)",
                     (thread_id, plan_id, thread_id),
@@ -485,29 +494,34 @@ def record_codex_event(session_id, task_id, plan_id, raw_line):
 
 def finish_agent_session(session_id, status, final_response=""):
     execute("UPDATE agent_sessions SET status=?, finished_at=?, final_response=? WHERE id=?",
-            (status, now(), str(final_response or "")[-50000:], session_id))
+            (status, config.now(), str(final_response or "")[-50000:], session_id))
 
 def latest_agent_session(task_id):
     return one("SELECT * FROM agent_sessions WHERE task_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1", (task_id,))
 
 def record_control_event(plan_id, event_type, payload=None, task_id=""):
     """Persist a human-readable control-plane event alongside raw Codex events."""
-    session = latest_agent_session(orchestrator_log_id(plan_id))
+    session = latest_agent_session(f"orchestrator:{plan_id}")
     if not session:
         return
     obj = {"type": event_type, "plan_id": plan_id}
     if isinstance(payload, dict):
         obj.update(payload)
-    record_codex_event(session["id"], task_id or orchestrator_log_id(plan_id), plan_id, json.dumps(obj, ensure_ascii=False))
+    record_codex_event(session["id"], task_id or f"orchestrator:{plan_id}", plan_id, json.dumps(obj, ensure_ascii=False))
 
 def plan_attachment_paths(plan):
-    vals = safe_json((plan or {}).get("attachments_json"), []) if "safe_json" in globals() else []
+    try:
+        vals = json.loads((plan or {}).get("attachments_json") or "[]")
+    except Exception:
+        vals = []
+    if not isinstance(vals, list):
+        vals = []
     if isinstance(vals, list):
         return [str(x) for x in vals if x and Path(str(x)).is_file()]
     return []
 
 def attachment_dir(plan_id):
-    path = ATTACHMENT_ROOT / (plan_id or "drafts")
+    path = config.ATTACHMENT_ROOT / (plan_id or "drafts")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -527,7 +541,7 @@ def save_attachment(plan_id, name, mime, data_b64, task_id=""):
     path = attachment_dir(plan_id) / f"{aid}-{safe_name}"
     path.write_bytes(raw)
     execute("INSERT INTO attachments(id,plan_id,task_id,name,mime,path,created_at) VALUES(?,?,?,?,?,?,?)",
-            (aid, plan_id or "", task_id or "", safe_name, mime, str(path), now()))
+            (aid, plan_id or "", task_id or "", safe_name, mime, str(path), config.now()))
     return {"id": aid, "name": safe_name, "mime": mime, "path": str(path), "size": len(raw)}
 def doctor_log_id(plan_id):
     return f"doctor:{plan_id}"

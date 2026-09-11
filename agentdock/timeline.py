@@ -22,6 +22,11 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+from .db import execute, doctor_log_id, latest_agent_session, one, rows
+from .git_ops import git, repo_info
+from .schemas import safe_json
+
 def latest_log_segment(items, marker):
     """Keep only the newest logical run while preserving the full raw log."""
     start = 0
@@ -56,17 +61,20 @@ def mission_usage(plan, current=None):
     }
 
 def write_mission_docs(plan_id):
+    from .orchestrator import plan_consultations
+    from .tasks import format_contract_md
+
     plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
     if not plan:
         return
     task_rows = rows("SELECT t.*,a.name agent_name,a.model agent_model,a.reasoning_effort agent_effort,a.service_tier agent_tier FROM tasks t LEFT JOIN agents a ON a.id=t.agent_id WHERE t.plan_id=? ORDER BY t.seq", (plan_id,))
-    d = mission_dir(plan_id)
+    d = config.mission_dir(plan_id)
     td = d / "tasks"
     td.mkdir(parents=True, exist_ok=True)
     if plan.get("mission_dir") != str(d):
         execute("UPDATE plans SET mission_dir=? WHERE id=?", (str(d), plan_id))
     usage = mission_usage(plan)
-    recovery = recovery_settings(plan)
+    recovery = config.recovery_settings(plan)
     preflight = safe_json(plan.get("preflight_json"), {})
     evidence = safe_json(plan.get("evidence_json"), [])
     questions = safe_json(plan.get("questions_json"), [])
@@ -183,12 +191,14 @@ def write_mission_docs(plan_id):
     preflight_md += ["## Policy", "", "```json", json.dumps(recovery, ensure_ascii=False, indent=2), "```", ""]
     (d / "PREFLIGHT.md").write_text("\n".join(preflight_md))
     (d / "FINAL.md").write_text(f"# Final Synthesis\n\n{plan.get('summary') or 'Mission has not finished yet.'}\n")
-    log_rows = rows("SELECT id,task_id,ts,stream,line FROM logs WHERE task_id IN (?,?) OR task_id IN (SELECT id FROM tasks WHERE plan_id=?) ORDER BY id", (orchestrator_log_id(plan_id), doctor_log_id(plan_id), plan_id))
+    log_rows = rows("SELECT id,task_id,ts,stream,line FROM logs WHERE task_id IN (?,?) OR task_id IN (SELECT id FROM tasks WHERE plan_id=?) ORDER BY id", (f"orchestrator:{plan_id}", doctor_log_id(plan_id), plan_id))
     with (d / "events.jsonl").open("w") as f:
         for item in log_rows:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 def task_diff(task):
+    from .mission import demo_task_diff
+
     plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],))
     if plan and int(plan.get("demo_mode") or 0):
         return demo_task_diff(task)

@@ -22,6 +22,21 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+from .db import (
+    create_agent_session,
+    execute,
+    finish_agent_session,
+    latest_agent_session,
+    log,
+    one,
+    plan_attachment_paths,
+    record_codex_event,
+    rows,
+)
+from .git_ops import shell
+from .schemas import safe_json
+
 def validate_runtime_config(model, effort, tier, label):
     allowed = None
     if model:
@@ -30,10 +45,10 @@ def validate_runtime_config(model, effort, tier, label):
                 allowed = set(item.get("reasoning_levels") or [])
                 break
     if allowed is None:
-        allowed = MODEL_EFFORTS.get(model)
+        allowed = config.MODEL_EFFORTS.get(model)
     if allowed and effort not in allowed:
         raise ValueError(f"{label}: {model} için reasoning effort '{effort}' geçerli değil")
-    if tier not in VALID_TIERS:
+    if tier not in config.VALID_TIERS:
         raise ValueError(f"{label}: speed/service tier '{tier}' geçerli değil")
 
 def terminate_process(proc):
@@ -50,9 +65,9 @@ def terminate_process(proc):
 
 def discover_model_catalog(force=False):
     """Read the bundled Codex model catalog without making a model call."""
-    with MODEL_CATALOG_LOCK:
-        cached = MODEL_CATALOG_CACHE.get("value") or []
-        if cached and not force and (time.time() - MODEL_CATALOG_CACHE.get("ts", 0)) < 300:
+    with config.MODEL_CATALOG_LOCK:
+        cached = config.MODEL_CATALOG_CACHE.get("value") or []
+        if cached and not force and (time.time() - config.MODEL_CATALOG_CACHE.get("ts", 0)) < 300:
             return list(cached)
     exe = shutil.which("codex")
     if not exe:
@@ -77,21 +92,21 @@ def discover_model_catalog(force=False):
             })
     except Exception:
         catalog = []
-    with MODEL_CATALOG_LOCK:
-        MODEL_CATALOG_CACHE["ts"] = time.time()
-        MODEL_CATALOG_CACHE["value"] = catalog
+    with config.MODEL_CATALOG_LOCK:
+        config.MODEL_CATALOG_CACHE["ts"] = time.time()
+        config.MODEL_CATALOG_CACHE["value"] = catalog
     return list(catalog)
 
 def engine_status(force=False):
     # Live dashboard polls often; avoid spawning `codex` on every request.
-    with ENGINE_STATUS_LOCK:
-        cached = ENGINE_STATUS_CACHE.get("value")
-        if cached is not None and not force and (time.time() - ENGINE_STATUS_CACHE.get("ts", 0)) < 12:
+    with config.ENGINE_STATUS_LOCK:
+        cached = config.ENGINE_STATUS_CACHE.get("value")
+        if cached is not None and not force and (time.time() - config.ENGINE_STATUS_CACHE.get("ts", 0)) < 12:
             return cached
 
     codex = shutil.which("codex")
     out = {
-        "codex": {"installed": bool(codex), "path": codex, "version": "", "login": "unknown", "models": [], "app_server": bool(codex), "transport": CODEX_TRANSPORT},
+        "codex": {"installed": bool(codex), "path": codex, "version": "", "login": "unknown", "models": [], "app_server": bool(codex), "transport": config.CODEX_TRANSPORT},
         "git": {"installed": bool(shutil.which("git")), "path": shutil.which("git")},
     }
     if codex:
@@ -110,9 +125,9 @@ def engine_status(force=False):
         except Exception:
             pass
 
-    with ENGINE_STATUS_LOCK:
-        ENGINE_STATUS_CACHE["ts"] = time.time()
-        ENGINE_STATUS_CACHE["value"] = out
+    with config.ENGINE_STATUS_LOCK:
+        config.ENGINE_STATUS_CACHE["ts"] = time.time()
+        config.ENGINE_STATUS_CACHE["value"] = out
     return out
 
 def _app_server_request(method, params=None, timeout=10):
@@ -209,38 +224,38 @@ def _normalize_rate_limits(result):
         "five_hour": windows.get("300"),
         "weekly": windows.get("10080"),
         "windows": windows,
-        "fetched_at": now(),
+        "fetched_at": config.now(),
     }
 
 def _refresh_quota_cache():
     try:
         value = _normalize_rate_limits(_app_server_request("account/rateLimits/read"))
     except Exception as e:
-        value = {"status": "error", "available": False, "error": str(e), "fetched_at": now()}
-    with QUOTA_LOCK:
-        QUOTA_CACHE["ts"] = time.time()
-        QUOTA_CACHE["value"] = value
-        QUOTA_CACHE["refreshing"] = False
+        value = {"status": "error", "available": False, "error": str(e), "fetched_at": config.now()}
+    with config.QUOTA_LOCK:
+        config.QUOTA_CACHE["ts"] = time.time()
+        config.QUOTA_CACHE["value"] = value
+        config.QUOTA_CACHE["refreshing"] = False
 
 def quota_status(force=False, wait=False):
-    with QUOTA_LOCK:
-        fresh = (time.time() - QUOTA_CACHE.get("ts", 0)) < 45
+    with config.QUOTA_LOCK:
+        fresh = (time.time() - config.QUOTA_CACHE.get("ts", 0)) < 45
         if fresh and not force:
-            return dict(QUOTA_CACHE["value"])
-        if not QUOTA_CACHE.get("refreshing"):
-            QUOTA_CACHE["refreshing"] = True
+            return dict(config.QUOTA_CACHE["value"])
+        if not config.QUOTA_CACHE.get("refreshing"):
+            config.QUOTA_CACHE["refreshing"] = True
             t = threading.Thread(target=_refresh_quota_cache, daemon=True)
             t.start()
         else:
             t = None
-        current = dict(QUOTA_CACHE.get("value") or {})
+        current = dict(config.QUOTA_CACHE.get("value") or {})
         current["refreshing"] = True
     if wait:
         deadline = time.time() + 12
         while time.time() < deadline:
-            with QUOTA_LOCK:
-                if not QUOTA_CACHE.get("refreshing"):
-                    return dict(QUOTA_CACHE["value"])
+            with config.QUOTA_LOCK:
+                if not config.QUOTA_CACHE.get("refreshing"):
+                    return dict(config.QUOTA_CACHE["value"])
             time.sleep(0.05)
     return current
 
@@ -417,9 +432,9 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
         bufsize=1,
         start_new_session=True,
     )
-    with RUNNERS_LOCK:
+    with config.RUNNERS_LOCK:
         if task_id:
-            RUNNERS[task_id] = proc
+            config.RUNNERS[task_id] = proc
     stderr_buf = []
     messages = []
     stdout_queue = queue.Queue()
@@ -516,12 +531,12 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
     completed_status = "failed"
     try:
         request(1, "initialize", {
-            "clientInfo": {"name": "agentdock", "title": "AgentDock", "version": "0.12.0"},
+            "clientInfo": {"name": "agentdock", "title": "AgentDock", "version": "0.13.0"},
             "capabilities": {"experimentalApi": True},
         })
         send({"method": "initialized", "params": {}})
         thread_params = {
-            "model": model or DEFAULT_WORKER,
+            "model": model or config.DEFAULT_WORKER,
             "cwd": workspace,
             "serviceName": "agentdock",
             "serviceTier": service_tier or "default",
@@ -544,8 +559,8 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
             "threadId": thread_id,
             "input": app_server_input_items(prompt, images, task_id),
             "cwd": workspace,
-            "model": model or DEFAULT_WORKER,
-            "effort": reasoning_effort or DEFAULT_WORKER_EFFORT,
+            "model": model or config.DEFAULT_WORKER,
+            "effort": reasoning_effort or config.DEFAULT_WORKER_EFFORT,
             "serviceTier": service_tier or "default",
             "approvalPolicy": "never",
             "sandboxPolicy": _app_server_sandbox(workspace, mode),
@@ -562,8 +577,8 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
         if turn_id:
             execute("UPDATE agent_sessions SET turn_id=? WHERE id=?", (turn_id, session_id))
         if task_id and thread_id and turn_id:
-            with APP_SERVER_CONTROLS_LOCK:
-                APP_SERVER_CONTROLS[task_id] = {
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS[task_id] = {
                     "send": send,
                     "interrupt": lambda: send({
                         "method": "turn/interrupt",
@@ -581,8 +596,8 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
             if message.get("method"):
                 answer_server_request(message)
             if message.get("id"):
-                with APP_SERVER_CONTROLS_LOCK:
-                    control = APP_SERVER_CONTROLS.get(task_id) if task_id else None
+                with config.APP_SERVER_CONTROLS_LOCK:
+                    control = config.APP_SERVER_CONTROLS.get(task_id) if task_id else None
                     message_id = control.get("pending", {}).pop(message["id"], None) if control else None
                 if message_id:
                     if message.get("error"):
@@ -612,18 +627,19 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
         return final
     except Exception as exc:
         current_status = (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") if task_id else ""
+        from .orchestrator import plan_is_paused
         stopped = current_status in ("cancelled", "paused_by_user", "pausing") or plan_is_paused(plan_id)
         finish_agent_session(session_id, "cancelled" if stopped else "failed", str(exc))
         raise
     finally:
-        with APP_SERVER_CONTROLS_LOCK:
-            control = APP_SERVER_CONTROLS.pop(task_id, None) if task_id else None
+        with config.APP_SERVER_CONTROLS_LOCK:
+            control = config.APP_SERVER_CONTROLS.pop(task_id, None) if task_id else None
             pending_message_ids = list((control or {}).get("pending", {}).values())
         for message_id in pending_message_ids:
             execute("UPDATE task_messages SET status=?,error=? WHERE id=? AND status=?", ("failed", "App Server turn ended before this message was delivered", message_id, "sending"))
-        with RUNNERS_LOCK:
+        with config.RUNNERS_LOCK:
             if task_id:
-                RUNNERS.pop(task_id, None)
+                config.RUNNERS.pop(task_id, None)
         try:
             if proc.poll() is None:
                 proc.terminate()
@@ -641,7 +657,7 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
 
 def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_effort="", service_tier="default",
               images=None, resume_thread_id="", session_kind="worker", output_schema=""):
-    if CODEX_TRANSPORT in ("app-server", "app_server"):
+    if config.CODEX_TRANSPORT in ("app-server", "app_server"):
         return run_codex_app_server(prompt, workspace, mode, model, task_id, reasoning_effort, service_tier,
                                     images=images, resume_thread_id=resume_thread_id, session_kind=session_kind,
                                     output_schema=output_schema)
@@ -699,9 +715,9 @@ def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_
         bufsize=1,
         start_new_session=True,
     )
-    with RUNNERS_LOCK:
+    with config.RUNNERS_LOCK:
         if task_id:
-            RUNNERS[task_id] = p
+            config.RUNNERS[task_id] = p
     out, err = [], []
 
     def pump(stream, sink, name):
@@ -719,13 +735,14 @@ def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_
     t2 = threading.Thread(target=pump, args=(p.stderr, err, "stderr"), daemon=True)
     t1.start(); t2.start()
     code = p.wait(); t1.join(); t2.join()
-    with RUNNERS_LOCK:
+    with config.RUNNERS_LOCK:
         if task_id:
-            RUNNERS.pop(task_id, None)
+            config.RUNNERS.pop(task_id, None)
     stdout, stderr = "".join(out), "".join(err)
     final = parse_codex_final(stdout)
     if code != 0:
         current_status = (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") if task_id else ""
+        from .orchestrator import plan_is_paused
         stopped = current_status in ("cancelled", "paused_by_user", "pausing") or plan_is_paused(plan_id)
         finish_agent_session(session_id, "cancelled" if stopped else "failed", final)
         raise RuntimeError((stderr or stdout or f"process exit {code}")[-12000:])
@@ -734,8 +751,8 @@ def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_
 
 def steer_app_server(task_id, message_id, prompt, image_paths=None):
     """Deliver a user message to an active App Server turn when possible."""
-    with APP_SERVER_CONTROLS_LOCK:
-        control = APP_SERVER_CONTROLS.get(task_id)
+    with config.APP_SERVER_CONTROLS_LOCK:
+        control = config.APP_SERVER_CONTROLS.get(task_id)
         if not control:
             return False
         request_id = control["next_request_id"]
@@ -758,7 +775,7 @@ def steer_app_server(task_id, message_id, prompt, image_paths=None):
         log(task_id, "manual", "user message sent to the active App Server turn")
         return True
     except Exception as exc:
-        with APP_SERVER_CONTROLS_LOCK:
+        with config.APP_SERVER_CONTROLS_LOCK:
             control["pending"].pop(request_id, None)
         execute("UPDATE task_messages SET status=?,error=? WHERE id=?", ("failed", str(exc), message_id))
         log(task_id, "manual", f"App Server steer could not be sent: {exc}")
@@ -766,8 +783,8 @@ def steer_app_server(task_id, message_id, prompt, image_paths=None):
 
 def interrupt_app_server(task_id):
     """Ask an active App Server turn to stop without opening a new thread."""
-    with APP_SERVER_CONTROLS_LOCK:
-        control = APP_SERVER_CONTROLS.get(task_id)
+    with config.APP_SERVER_CONTROLS_LOCK:
+        control = config.APP_SERVER_CONTROLS.get(task_id)
         interrupt = (control or {}).get("interrupt")
     if not interrupt:
         return False
@@ -782,9 +799,11 @@ def interrupt_app_server(task_id):
 def orchestrator_models(requested):
     if requested == "auto-best":
         return ["gpt-6-astra", "gpt-5.6-sol"]
-    return [requested or DEFAULT_ORCHESTRATOR]
+    return [requested or config.DEFAULT_ORCHESTRATOR]
 
 def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning_effort="", service_tier="default", mode="read", transient_retries=0, images=None, output_schema="", resume_thread_id="", session_kind="orchestrator"):
+    from .preflight import is_transient_error
+
     errors = []
     bound_thread_id = resume_thread_id or ""
     for model in orchestrator_models(requested_model):
@@ -810,6 +829,7 @@ def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning
                     continue
                 errors.append(f"{model}: {e}")
                 if not bound_thread_id:
+                    from .orchestrator import latest_orchestrator_session
                     latest = latest_orchestrator_session(infer_plan_id(task_id)) if task_id else None
                     bound_thread_id = (latest or {}).get("thread_id") or ""
                     resume_thread_id = bound_thread_id

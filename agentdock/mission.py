@@ -22,6 +22,81 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import config
+from .config import (
+    DEFAULT_ORCHESTRATOR,
+    DEFAULT_ORCHESTRATOR_EFFORT,
+    DEFAULT_ORCHESTRATOR_TIER,
+    DEFAULT_WORKER,
+    DEFAULT_WORKER_EFFORT,
+    DEFAULT_WORKER_TIER,
+    MAX_PARALLEL_HARD,
+    NO_TASK_DECISIONS,
+    RECOVERY_DEFAULTS,
+    mission_dir,
+    now,
+    recovery_settings,
+)
+from .codex import (
+    interrupt_app_server,
+    quota_status,
+    run_codex,
+    terminate_process,
+    validate_runtime_config,
+)
+from .db import (
+    claim_plan_run,
+    create_agent_session,
+    execute,
+    finish_agent_session,
+    latest_agent_session,
+    log,
+    one,
+    plan_attachment_paths,
+    record_codex_event,
+    record_control_event,
+    release_plan_run,
+    rows,
+)
+from .git_ops import (
+    delete_branch,
+    git,
+    plan_paths,
+    prepare_integration,
+    remove_worktree,
+    repo_info,
+    validate_read_workspace,
+    workspace_fingerprint,
+    workspace_snapshot,
+)
+from .orchestrator import (
+    orchestrator_log_id,
+    planner_prompt,
+    plan_is_paused,
+    resolve_worker_consultation,
+    resolve_worker_failure,
+    run_mission_orchestrator_turn,
+    same_worker_resume_handoff,
+)
+from .preflight import PreflightBlocked, PreflightWaitingForUser, run_preflight
+from .schemas import (
+    deterministic_mission_title,
+    extract_json,
+    normalize_planner_result,
+    planner_schema_path,
+    validate_task_graph,
+)
+from .tasks import (
+    integrate_write_result,
+    mark_read_result_done,
+    queued_messages,
+    run_parallel_task,
+    task_effort,
+    task_model,
+    task_tier,
+)
+from .timeline import write_mission_docs
+
 def reset_plan_for_retry(plan, preserve_completed=False):
     plan_id = plan["id"]
     log(
@@ -1037,14 +1112,14 @@ def pause_plan(plan_id, reason="Paused by user"):
             ("paused_by_user", reason, "mission", thread_id, same_worker_resume_handoff(task, "The mission was paused by the user. Resume this same task when the mission continues."), task["id"]),
         )
         interrupt_app_server(task["id"])
-        with RUNNERS_LOCK:
-            proc = RUNNERS.get(task["id"])
+        with config.RUNNERS_LOCK:
+            proc = config.RUNNERS.get(task["id"])
         if proc:
             terminate_process(proc)
     orchestrator_id = orchestrator_log_id(plan_id)
     interrupt_app_server(orchestrator_id)
-    with RUNNERS_LOCK:
-        orchestrator_proc = RUNNERS.get(orchestrator_id)
+    with config.RUNNERS_LOCK:
+        orchestrator_proc = config.RUNNERS.get(orchestrator_id)
     if orchestrator_proc:
         terminate_process(orchestrator_proc)
     execute("UPDATE plans SET status=? WHERE id=?", ("paused", plan_id))
@@ -1210,8 +1285,8 @@ def pause_task(task_id, reason="Paused by user"):
         ("paused_by_user", reason, "user", thread_id, task_id),
     )
     interrupt_app_server(task_id)
-    with RUNNERS_LOCK:
-        proc = RUNNERS.get(task_id)
+    with config.RUNNERS_LOCK:
+        proc = config.RUNNERS.get(task_id)
     if proc:
         terminate_process(proc)
     log(task_id, "manual", "worker paused by user; same conversation will be resumed on request")

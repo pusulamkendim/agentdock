@@ -9,26 +9,27 @@ from pathlib import Path
 from unittest.mock import patch
 
 import agentdock
+from agentdock import config, mission, orchestrator, tasks
 
 
 class AgentDockTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="agentdock-test-"))
         self.original = {
-            name: getattr(agentdock, name)
+            name: getattr(config, name)
             for name in ("STATE_ROOT", "DB", "WORKTREE_ROOT", "MISSION_ROOT", "ATTACHMENT_ROOT", "LEGACY_DB")
         }
-        agentdock.STATE_ROOT = self.tmp / "state"
-        agentdock.DB = agentdock.STATE_ROOT / "agentdock.sqlite3"
-        agentdock.WORKTREE_ROOT = agentdock.STATE_ROOT / "worktrees"
-        agentdock.MISSION_ROOT = agentdock.STATE_ROOT / "missions"
-        agentdock.ATTACHMENT_ROOT = agentdock.STATE_ROOT / "attachments"
-        agentdock.LEGACY_DB = self.tmp / "missing-legacy.sqlite3"
+        config.STATE_ROOT = self.tmp / "state"
+        config.DB = config.STATE_ROOT / "agentdock.sqlite3"
+        config.WORKTREE_ROOT = config.STATE_ROOT / "worktrees"
+        config.MISSION_ROOT = config.STATE_ROOT / "missions"
+        config.ATTACHMENT_ROOT = config.STATE_ROOT / "attachments"
+        config.LEGACY_DB = self.tmp / "missing-legacy.sqlite3"
         agentdock.init_db()
 
     def tearDown(self):
         for name, value in self.original.items():
-            setattr(agentdock, name, value)
+            setattr(config, name, value)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def add_plan(self, plan_id="plan-1", status="planned"):
@@ -60,8 +61,8 @@ class AgentDockTestCase(unittest.TestCase):
             "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (plan_id, goal, str(workspace), "test", "planning", agentdock.now(), "gpt-5.6-sol", "gpt-5.6-luna", 2, "high", "medium", "default", "default"),
         )
-        with patch.object(agentdock, "quota_status", return_value={"status": "ok", "available": True}), patch.object(
-            agentdock,
+        with patch.object(mission, "quota_status", return_value={"status": "ok", "available": True}), patch.object(
+            mission,
             "run_mission_orchestrator_turn",
             return_value={
                 "text": json.dumps(result),
@@ -312,7 +313,7 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
             agentdock.execute("UPDATE agent_sessions SET thread_id=?,turn_id=? WHERE id=?", (thread, f"turn-{len(calls)}", sid))
             return "orchestrator result", "gpt-5.6-sol"
 
-        with patch.object(agentdock, "run_orchestrator", side_effect=fake_orchestrator):
+        with patch.object(orchestrator, "run_orchestrator", side_effect=fake_orchestrator):
             first = agentdock.run_mission_orchestrator_turn(plan["id"], "initial_disposition", "initial")
             second = agentdock.run_mission_orchestrator_turn(plan["id"], "manual_message", "continue")
 
@@ -358,7 +359,7 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
             "evidence": ["The existing tool is present."],
         }
         with patch.object(
-            agentdock,
+            orchestrator,
             "run_mission_orchestrator_turn",
             return_value={"text": json.dumps(response), "model": "gpt-5.6-sol", "thread_id": "mission-thread", "turn_id": "turn-2"},
         ):
@@ -376,7 +377,7 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
             captured.update(prompt=prompt, resume=kwargs.get("resume_thread_id"))
             return "continued worker result"
 
-        with patch.object(agentdock, "run_codex", side_effect=fake_worker):
+        with patch.object(tasks, "run_codex", side_effect=fake_worker):
             result = agentdock.run_task_once(plan, updated, self.tmp)
         self.assertTrue(result["ok"], result)
         self.assertEqual(captured["resume"], "worker-thread")
@@ -426,7 +427,7 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
                 captured.update(kwargs)
                 return f"chat reply {status}"
 
-            with patch.object(agentdock, "run_codex", side_effect=fake_codex):
+            with patch.object(tasks, "run_codex", side_effect=fake_codex):
                 result = agentdock.run_manual_followup(task_id, "Why did this task stop?")
 
             self.assertEqual(result, f"chat reply {status}")
@@ -476,7 +477,7 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
         def fail_manual_turn(*args, **kwargs):
             raise RuntimeError("manual conversation failed")
 
-        with patch.object(agentdock, "run_codex", side_effect=fail_manual_turn):
+        with patch.object(tasks, "run_codex", side_effect=fail_manual_turn):
             with self.assertRaisesRegex(RuntimeError, "manual conversation failed"):
                 agentdock.run_manual_followup(task_id, "Why did this task fail?")
 
@@ -568,7 +569,7 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
             calls.append(kwargs.get("session_kind"))
             return "canonical execution result" if len(calls) == 1 else "manual chat reply"
 
-        with patch.object(agentdock, "run_codex", side_effect=fake_codex):
+        with patch.object(tasks, "run_codex", side_effect=fake_codex):
             result = agentdock.run_task_once(plan, task, self.tmp)
 
         self.assertTrue(result["ok"], result)
@@ -585,29 +586,29 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
 
     def test_executed_manual_followup_is_started_when_no_runner_is_active(self):
         task_id = "executed-followup-delivery"
-        with agentdock.RUNNERS_LOCK:
-            old_runners = dict(agentdock.RUNNERS)
-            agentdock.RUNNERS.clear()
-        with agentdock.APP_SERVER_CONTROLS_LOCK:
-            old_controls = dict(agentdock.APP_SERVER_CONTROLS)
-            agentdock.APP_SERVER_CONTROLS.clear()
+        with config.RUNNERS_LOCK:
+            old_runners = dict(config.RUNNERS)
+            config.RUNNERS.clear()
+        with config.APP_SERVER_CONTROLS_LOCK:
+            old_controls = dict(config.APP_SERVER_CONTROLS)
+            config.APP_SERVER_CONTROLS.clear()
         try:
             self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "sending")
-            with agentdock.RUNNERS_LOCK:
-                agentdock.RUNNERS[task_id] = object()
+            with config.RUNNERS_LOCK:
+                config.RUNNERS[task_id] = object()
             self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
-            with agentdock.RUNNERS_LOCK:
-                agentdock.RUNNERS.clear()
-            with agentdock.APP_SERVER_CONTROLS_LOCK:
-                agentdock.APP_SERVER_CONTROLS[task_id] = object()
+            with config.RUNNERS_LOCK:
+                config.RUNNERS.clear()
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS[task_id] = object()
             self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "sending")
         finally:
-            with agentdock.RUNNERS_LOCK:
-                agentdock.RUNNERS.clear()
-                agentdock.RUNNERS.update(old_runners)
-            with agentdock.APP_SERVER_CONTROLS_LOCK:
-                agentdock.APP_SERVER_CONTROLS.clear()
-                agentdock.APP_SERVER_CONTROLS.update(old_controls)
+            with config.RUNNERS_LOCK:
+                config.RUNNERS.clear()
+                config.RUNNERS.update(old_runners)
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS.clear()
+                config.APP_SERVER_CONTROLS.update(old_controls)
 
     def test_pausing_consultation_stays_queued_after_orchestrator_interrupt(self):
         plan = self._orchestrator_plan("paused-consultation")
@@ -660,7 +661,7 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
             )
             raise RuntimeError("orchestrator turn interrupted by pause")
 
-        with patch.object(agentdock, "run_mission_orchestrator_turn", side_effect=interrupt_consultation):
+        with patch.object(orchestrator, "run_mission_orchestrator_turn", side_effect=interrupt_consultation):
             result = agentdock.resolve_worker_consultation(
                 plan,
                 task,
@@ -712,10 +713,10 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
         )
         response = {"action": "answer_worker", "reason": "Use the existing tool.", "worker_message": "Link only to the existing tool.", "revised_contract": None, "questions": [], "evidence": []}
         with patch.object(
-            agentdock,
+            orchestrator,
             "run_mission_orchestrator_turn",
             return_value={"text": json.dumps(response), "model": "gpt-5.6-sol", "thread_id": "mission-thread", "turn_id": "turn-answer"},
-        ), patch.object(agentdock, "claim_plan_run", return_value=False):
+        ), patch.object(orchestrator, "claim_plan_run", return_value=False):
             result = agentdock.answer_consultation(plan["id"], "consult-user", "Use the existing tool only.")
         self.assertTrue(result["ok"], result)
         saved = agentdock.one("SELECT status,user_answer_json FROM consultations WHERE id=?", ("consult-user",))
@@ -779,7 +780,7 @@ class MissionDispositionTests(AgentDockTestCase):
             "UPDATE plans SET decision=?,decision_reason=?,questions_json=? WHERE id=?",
             ("needs_user_input", "A decision is still needed.", json.dumps(["Which scope should be used?"]), plan_id),
         )
-        with patch.object(agentdock, "run_preflight", side_effect=AssertionError("zero-task mission entered preflight")):
+        with patch.object(mission, "run_preflight", side_effect=AssertionError("zero-task mission entered preflight")):
             agentdock.run_plan(plan_id)
         self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "waiting_for_user")
 
@@ -908,7 +909,7 @@ class TimelineAndRuntimeControlTests(AgentDockTestCase):
         self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "paused")
         self.assertEqual(agentdock.one("SELECT status,worker_thread_id FROM tasks WHERE id=?", ("pause-running",)), {"status": "paused_by_user", "worker_thread_id": "worker-thread"})
 
-        with patch.object(agentdock, "claim_plan_run", return_value=False):
+        with patch.object(mission, "claim_plan_run", return_value=False):
             resumed = agentdock.resume_plan(plan_id)
         self.assertEqual(resumed["status"], "running")
         self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "approved")
@@ -921,7 +922,7 @@ class TimelineAndRuntimeControlTests(AgentDockTestCase):
             "UPDATE plans SET decision=?,decision_reason=?,orchestrator_thread_id=? WHERE id=?",
             ("answer_only", "A previous answer was recorded.", "mission-thread", plan_id),
         )
-        with patch.object(agentdock, "claim_plan_run", return_value=False):
+        with patch.object(mission, "claim_plan_run", return_value=False):
             result = agentdock.resume_plan(plan_id)
         self.assertEqual(result["status"], "planning")
         reopened = agentdock.one(
@@ -940,8 +941,8 @@ class TimelineAndRuntimeControlTests(AgentDockTestCase):
             "questions": [],
             "tasks": [],
         }
-        with patch.object(agentdock, "quota_status", return_value={"status": "ok", "available": True}), patch.object(
-            agentdock,
+        with patch.object(mission, "quota_status", return_value={"status": "ok", "available": True}), patch.object(
+            mission,
             "run_mission_orchestrator_turn",
             return_value={"text": json.dumps(result), "model": "gpt-5.6-sol", "thread_id": "planning-thread"},
         ):
@@ -1025,7 +1026,7 @@ class ExecutionTests(AgentDockTestCase):
                 (integration / "unrelated.txt").write_text("must not be included\n")
                 return {"text": "Resolved.", "model": "gpt-5.6-sol"}
 
-            with patch.object(agentdock, "run_mission_orchestrator_turn", side_effect=malicious_resolver):
+            with patch.object(orchestrator, "run_mission_orchestrator_turn", side_effect=malicious_resolver):
                 recovered, detail = agentdock.resolve_merge_conflict(
                     agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)),
                     {"integration_dir": integration},
@@ -1124,7 +1125,7 @@ class ExecutionTests(AgentDockTestCase):
             agentdock.shutil,
             "which",
             side_effect=lambda name: "codex" if name == "codex" else real_which(name),
-        ), patch.object(agentdock, "run_codex", return_value="read result"):
+        ), patch.object(tasks, "run_codex", return_value="read result"):
             agentdock.run_plan(plan_id, read_only_only=True)
         self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", ("mixed-read",))["status"], "done")
         self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", ("mixed-write",))["status"], "pending")
@@ -1159,9 +1160,9 @@ class ExecutionTests(AgentDockTestCase):
             events.append("consultation")
             return {"waiting_for_user": True}
 
-        with patch.object(agentdock, "run_preflight", return_value={}), patch.object(
-            agentdock, "run_parallel_task", side_effect=fake_parallel
-        ), patch.object(agentdock, "resolve_worker_consultation", side_effect=fake_resolve):
+        with patch.object(mission, "run_preflight", return_value={}), patch.object(
+            mission, "run_parallel_task", side_effect=fake_parallel
+        ), patch.object(mission, "resolve_worker_consultation", side_effect=fake_resolve):
             agentdock.run_plan(plan_id)
 
         self.assertEqual(events, ["task", "consultation"])
@@ -1222,7 +1223,7 @@ class ExecutionTests(AgentDockTestCase):
             "integration_workspace": self.tmp,
             "integration_branch": "",
         }
-        with patch.object(agentdock, "run_codex", return_value="read result"):
+        with patch.object(tasks, "run_codex", return_value="read result"):
             result = agentdock.run_parallel_task(plan, task, ctx, "")
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "read result")
@@ -1241,7 +1242,7 @@ class ExecutionTests(AgentDockTestCase):
         )
         base_commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
         plan_id = "plan-apply"
-        integration = agentdock.WORKTREE_ROOT / plan_id / "integration"
+        integration = config.WORKTREE_ROOT / plan_id / "integration"
         integration.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["git", "-C", str(repo), "worktree", "add", "-b", f"agentdock/{plan_id}/integration", str(integration), base_commit],
@@ -1267,7 +1268,7 @@ class ExecutionTests(AgentDockTestCase):
             ("task-apply", plan_id, 0, "worker", "worker", "done"),
         )
 
-        with patch.object(agentdock, "run_preflight", return_value={}):
+        with patch.object(mission, "run_preflight", return_value={}):
             result = agentdock.apply_plan(plan_id)
         self.assertTrue(result["applied"])
         self.assertEqual((repo / "value.txt").read_text(), "after\n")
@@ -1341,7 +1342,7 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output
             (plan_id, "fake mission", str(repo), "fake", "planning", agentdock.now(), "gpt-5.6-sol", "gpt-5.6-luna", 2, "high", "medium", "default", "default", json.dumps(agentdock.RECOVERY_DEFAULTS)),
         )
         try:
-            with patch.object(agentdock, "quota_status", return_value={"status": "ok", "available": True}):
+            with patch.object(mission, "quota_status", return_value={"status": "ok", "available": True}):
                 agentdock.build_plan(plan_id)
                 agentdock.execute("UPDATE plans SET status='approved',approved_at=? WHERE id=?", (agentdock.now(), plan_id))
                 agentdock.run_plan(plan_id)

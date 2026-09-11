@@ -21,6 +21,8 @@ import fnmatch
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
+
+from . import config
 PLANNER_SCHEMA = {
     "type": "object",
     "properties": {
@@ -226,16 +228,16 @@ def validate_task_graph(tasks, valid_agents):
     return True
 
 def planner_schema_path():
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    path = STATE_ROOT / "planner.schema.json"
+    config.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = config.STATE_ROOT / "planner.schema.json"
     expected = json.dumps(PLANNER_SCHEMA, ensure_ascii=False, indent=2) + "\n"
     if not path.exists() or path.read_text(errors="replace") != expected:
         path.write_text(expected)
     return path
 
 def consultation_schema_path():
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    path = STATE_ROOT / "orchestrator.consultation.schema.json"
+    config.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = config.STATE_ROOT / "orchestrator.consultation.schema.json"
     expected = json.dumps(CONSULTATION_SCHEMA, ensure_ascii=False, indent=2) + "\n"
     if not path.exists() or path.read_text(errors="replace") != expected:
         path.write_text(expected)
@@ -286,7 +288,7 @@ def normalize_planner_result(obj):
     # schema above.
     if not decision and tasks:
         decision = "execute"
-    if decision not in MISSION_DECISIONS:
+    if decision not in config.MISSION_DECISIONS:
         raise ValueError(f"Invalid mission disposition: {decision or 'missing'}")
     if len(tasks) > 12:
         raise ValueError("Orchestrator returned more than 12 tasks")
@@ -380,7 +382,7 @@ def normalize_consultation_result(obj):
         action = "revise_contract"
     elif action == "stop":
         action = "block_mission"
-    if action not in ORCHESTRATOR_ACTIONS:
+    if action not in config.ORCHESTRATOR_ACTIONS:
         raise ValueError(f"Invalid orchestrator consultation action: {action or 'missing'}")
     reason = str(obj.get("reason") or "").strip()
     if not reason:
