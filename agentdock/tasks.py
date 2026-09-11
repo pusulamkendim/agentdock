@@ -405,7 +405,24 @@ def resolve_merge_conflict(plan, ctx, result, cherry_error):
                     pass
         if marker_files:
             return False, "Orchestrator left conflict markers in: " + ", ".join(marker_files)
-        git(ctx["integration_dir"], "add", "-A")
+        changed = set(changed_git_paths(ctx["integration_dir"]))
+        unresolved_set = set(unresolved)
+        out_of_scope = sorted(changed - unresolved_set)
+        if out_of_scope:
+            return False, "Orchestrator conflict resolver changed files outside the conflicted set: " + ", ".join(out_of_scope[:20])
+        contract = safe_json(task.get("contract_json"), {})
+        allowed_paths = contract.get("allowed_paths") or []
+        disallowed_conflicts = [
+            rel for rel in unresolved
+            if not any(path_matches_allowed(rel, pattern) for pattern in allowed_paths)
+        ]
+        if disallowed_conflicts:
+            return False, "Conflict files fall outside the task contract: " + ", ".join(disallowed_conflicts[:20])
+        if not unresolved:
+            return False, "Git reported no conflicted files to resolve"
+        # Stage only the files Git reported as unmerged. The resolver is not
+        # allowed to smuggle unrelated changes into the integration commit.
+        git(ctx["integration_dir"], "add", "--", *unresolved)
         unresolved_index = git(ctx["integration_dir"], "ls-files", "-u", check=False).stdout.strip()
         if unresolved_index:
             return False, "Orchestrator did not fully stage a conflict resolution"

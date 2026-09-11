@@ -208,11 +208,15 @@ def cleanup_successful_plan(ctx, plan_id):
         shutil.rmtree(base_dir, ignore_errors=True)
     git(ctx["repo_root"], "worktree", "prune", check=False)
 
-def build_plan(plan_id):
-    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
-    if not plan:
+def build_plan(plan_id, claimed=False):
+    """Build a mission disposition/task graph under the plan run lock."""
+    if not claimed and not claim_plan_run(plan_id):
+        log(orchestrator_log_id(plan_id), "supervisor", "duplicate planning request ignored; another operation is active")
         return
     try:
+        plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+        if not plan:
+            return
         if plan_is_paused(plan_id):
             log(orchestrator_log_id(plan_id), "supervisor", "mission planning is paused; waiting for an explicit resume")
             return
@@ -250,6 +254,8 @@ def build_plan(plan_id):
         items = obj["tasks"]
         valid_ids = {a["id"] for a in agents}
         disposition = obj["decision"]
+        if disposition == "execute":
+            validate_task_graph(items, valid_ids)
         disposition_label = {
             "already_satisfied": "Already satisfied",
             "answer_only": "Answer only",
@@ -298,10 +304,10 @@ def build_plan(plan_id):
             return
 
         for i, it in enumerate(items):
-            agent_id = it.get("agent_id") if it.get("agent_id") in valid_ids else agents[0]["id"]
-            deps = [d for d in it.get("depends_on", []) if isinstance(d, int) and 0 <= d < i]
-            mode = it.get("mode", "read") if it.get("mode") in ("read", "write") else "read"
-            contract = it.get("contract") if isinstance(it.get("contract"), dict) else {}
+            agent_id = it["agent_id"]
+            deps = list(it["depends_on"])
+            mode = it["mode"]
+            contract = it["contract"]
             execute(
                 "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
@@ -338,6 +344,8 @@ def build_plan(plan_id):
             execute("UPDATE plans SET status=?, error=? WHERE id=?", ("attention", str(e), plan_id))
             log(orchestrator_log_id(plan_id), "supervisor", f"planning failed: {e}")
         write_mission_docs(plan_id)
+    finally:
+        release_plan_run(plan_id)
 
 def replan_mission(plan_id, mode="reconsider", user_note=""):
     """Start a fresh disposition pass after an explicit user action."""
@@ -1062,7 +1070,7 @@ def resume_plan(plan_id):
         log(orchestrator_log_id(plan_id), "manual", "mission planning resumed; continuing the same orchestrator conversation")
         write_mission_docs(plan_id)
         if claim_plan_run(plan_id):
-            threading.Thread(target=build_plan, args=(plan_id,), daemon=True).start()
+            threading.Thread(target=build_plan, args=(plan_id,), kwargs={"claimed": True}, daemon=True).start()
             return {"ok": True, "status": "resuming"}
         return {"ok": False, "status": "planning", "message": "Mission is already planning."}
     if not one("SELECT id FROM tasks WHERE plan_id=? LIMIT 1", (plan_id,)):
@@ -1080,7 +1088,7 @@ def resume_plan(plan_id):
         log(orchestrator_log_id(plan_id), "manual", "mission disposition reopened; re-evaluating without creating an empty task graph")
         write_mission_docs(plan_id)
         if claim_plan_run(plan_id):
-            threading.Thread(target=build_plan, args=(plan_id,), daemon=True).start()
+            threading.Thread(target=build_plan, args=(plan_id,), kwargs={"claimed": True}, daemon=True).start()
             return {"ok": True, "status": "resuming"}
         return {"ok": False, "status": "planning", "message": "Mission is already planning."}
     mission_paused = rows(

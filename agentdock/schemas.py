@@ -113,6 +113,118 @@ CONSULTATION_SCHEMA["properties"]["revised_contract"] = {
     ]
 }
 
+TASK_CONTRACT_FIELDS = (
+    "objective",
+    "context",
+    "scope",
+    "allowed_paths",
+    "required_inputs",
+    "implementation_steps",
+    "acceptance_criteria",
+    "verification_commands",
+    "expected_output",
+    "escalation_conditions",
+    "decision_policy",
+)
+
+TASK_CONTRACT_LIST_FIELDS = (
+    "allowed_paths",
+    "required_inputs",
+    "implementation_steps",
+    "acceptance_criteria",
+    "verification_commands",
+    "expected_output",
+    "escalation_conditions",
+)
+
+
+def _planner_task_error(index, message):
+    return ValueError(f"Invalid task graph at task {index + 1}: {message}")
+
+
+def _agent_ids(valid_agents):
+    if isinstance(valid_agents, dict):
+        valid_agents = valid_agents.keys()
+    result = set()
+    for agent in valid_agents or ():
+        if isinstance(agent, dict):
+            agent = agent.get("id")
+        if isinstance(agent, str) and agent.strip():
+            result.add(agent)
+    return result
+
+
+def _validate_task_contract(contract, index, mode):
+    if not isinstance(contract, dict):
+        raise _planner_task_error(index, "contract must be an object")
+    missing = [field for field in TASK_CONTRACT_FIELDS if field not in contract]
+    if missing:
+        raise _planner_task_error(index, "contract is incomplete; missing " + ", ".join(missing))
+    if not isinstance(contract.get("objective"), str) or not contract["objective"].strip():
+        raise _planner_task_error(index, "contract.objective must be a non-empty string")
+    if not isinstance(contract.get("context"), str):
+        raise _planner_task_error(index, "contract.context must be a string")
+    if not isinstance(contract.get("decision_policy"), str) or not contract["decision_policy"].strip():
+        raise _planner_task_error(index, "contract.decision_policy must be a non-empty string")
+    scope = contract.get("scope")
+    if not isinstance(scope, dict) or not isinstance(scope.get("in_scope"), list) or not isinstance(scope.get("out_of_scope"), list):
+        raise _planner_task_error(index, "contract.scope must contain in_scope and out_of_scope arrays")
+    for field in TASK_CONTRACT_LIST_FIELDS:
+        values = contract.get(field)
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise _planner_task_error(index, f"contract.{field} must be an array of strings")
+    if mode == "write":
+        allowed_paths = [path.strip().replace("\\", "/") for path in contract["allowed_paths"]]
+        unlimited = {"", ".", "./", "/", "*", "**", "**/*"}
+        normalized_paths = []
+        for path in allowed_paths:
+            normalized = path
+            if normalized.startswith("workspace/"):
+                normalized = normalized[len("workspace/"):]
+            normalized_paths.append(normalized.lstrip("./"))
+        if not allowed_paths or any(path in unlimited for path in normalized_paths):
+            raise _planner_task_error(index, "write tasks require bounded allowed_paths")
+
+
+def validate_task_graph(tasks, valid_agents):
+    """Reject unsafe planner graphs instead of silently repairing them.
+
+    Planner output is an authority boundary: an invalid task must stop the
+    mission before any task is materialized. In particular, dependencies are
+    indexes into the original ordered task list and may only point backward.
+    """
+    if not isinstance(tasks, list):
+        raise ValueError("Planner task graph must be an array")
+    valid_ids = _agent_ids(valid_agents)
+    task_count = len(tasks)
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise _planner_task_error(index, "task must be an object")
+        agent_id = task.get("agent_id")
+        if not isinstance(agent_id, str) or agent_id not in valid_ids:
+            raise _planner_task_error(index, f"unknown agent_id: {agent_id!r}")
+        mode = task.get("mode")
+        if mode not in ("read", "write"):
+            raise _planner_task_error(index, f"invalid mode: {mode!r}")
+        dependencies = task.get("depends_on")
+        if not isinstance(dependencies, list):
+            raise _planner_task_error(index, "depends_on must be an array")
+        seen = set()
+        for dependency in dependencies:
+            if isinstance(dependency, bool) or not isinstance(dependency, int):
+                raise _planner_task_error(index, f"dependency must be an integer: {dependency!r}")
+            if dependency < 0 or dependency >= task_count:
+                raise _planner_task_error(index, f"dependency out of range: {dependency}")
+            if dependency == index:
+                raise _planner_task_error(index, "self dependency is not allowed")
+            if dependency > index:
+                raise _planner_task_error(index, f"forward dependency is not allowed: {dependency}")
+            if dependency in seen:
+                raise _planner_task_error(index, f"duplicate dependency: {dependency}")
+            seen.add(dependency)
+        _validate_task_contract(task.get("contract"), index, mode)
+    return True
+
 def planner_schema_path():
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     path = STATE_ROOT / "planner.schema.json"

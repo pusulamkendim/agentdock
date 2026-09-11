@@ -52,6 +52,19 @@ def run_manual_followup_message(message_id):
     except Exception as e:
         execute("UPDATE task_messages SET status=?,error=? WHERE id=?",('failed',str(e),message_id))
 
+
+def manual_followup_delivery_status(task_id):
+    """Choose delivery based on a live runner, not a historical task status."""
+    with APP_SERVER_CONTROLS_LOCK:
+        if task_id in APP_SERVER_CONTROLS:
+            return "sending"
+    with RUNNERS_LOCK:
+        if RUNNERS.get(task_id):
+            return "queued"
+    # An executed task can still have a resumable worker conversation. Start
+    # the manual turn now; task execution state is intentionally independent.
+    return "sending"
+
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
         rel = urlparse(path).path.lstrip("/") or "index.html"
@@ -400,7 +413,7 @@ class Handler(SimpleHTTPRequestHandler):
                     log(orchestrator_log_id(pid), "manual", "no-task mission reopened; re-evaluating disposition in the same orchestrator conversation")
                     write_mission_docs(pid)
                     if claim_plan_run(pid):
-                        threading.Thread(target=build_plan, args=(pid,), daemon=True).start()
+                        threading.Thread(target=build_plan, args=(pid,), kwargs={"claimed": True}, daemon=True).start()
                     return self.send_json({"ok": True, "status": "planning"})
                 execute("UPDATE plans SET status=?,error='',finished_at=NULL WHERE id=?", ("approved", pid))
                 log(orchestrator_log_id(pid), "manual", "mission reopened by user; completed tasks remain checkpoints")
@@ -497,11 +510,9 @@ class Handler(SimpleHTTPRequestHandler):
                         saved=save_attachment(task["plan_id"], item.get("name") or "image.png", item.get("mime") or "image/png", item["data_base64"], task_id=tid)
                         image_paths.append(saved["path"])
                 mid=str(uuid.uuid4())[:10]
-                with RUNNERS_LOCK:
-                    is_running=bool(RUNNERS.get(tid))
+                status = manual_followup_delivery_status(tid)
                 with APP_SERVER_CONTROLS_LOCK:
                     app_server_active = tid in APP_SERVER_CONTROLS
-                status='sending' if app_server_active else ('queued' if is_running or task.get('status') in ('running','executed') else 'sending')
                 execute("INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)", (mid,tid,task['plan_id'],now(),prompt,json.dumps(image_paths),status))
                 if status=='sending':
                     if app_server_active:

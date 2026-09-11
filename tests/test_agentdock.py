@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -36,6 +37,22 @@ class AgentDockTestCase(unittest.TestCase):
             (plan_id, "test goal", str(self.tmp), "test", status, agentdock.now()),
         )
         return plan_id
+
+    @staticmethod
+    def planner_contract(objective, allowed_paths):
+        return {
+            "objective": objective,
+            "context": "Use the existing project and preserve unrelated behavior.",
+            "scope": {"in_scope": [objective], "out_of_scope": ["Unrelated product changes"]},
+            "allowed_paths": allowed_paths,
+            "required_inputs": [],
+            "implementation_steps": ["Inspect the bounded target", "Complete the contracted work"],
+            "acceptance_criteria": ["The requested bounded outcome is complete"],
+            "verification_commands": ["Run the focused verification"],
+            "expected_output": ["A concise result and verification summary"],
+            "escalation_conditions": ["Escalate ambiguity instead of guessing"],
+            "decision_policy": "Do not broaden scope; ask the orchestrator when a material decision is required.",
+        }
 
     def build_disposition(self, plan_id, result, workspace=None, goal="mission"):
         workspace = workspace or self.tmp
@@ -179,6 +196,57 @@ class ContractAndRecoveryTests(AgentDockTestCase):
                 "reason": "A product choice is missing.",
                 "tasks": [],
             })
+
+    def test_planner_task_graph_rejects_unsafe_semantics_without_repairing_them(self):
+        def task(agent_id="coder", mode="write", depends_on=None, contract=None):
+            return {
+                "title": "Bounded task",
+                "agent_id": agent_id,
+                "mode": mode,
+                "depends_on": [] if depends_on is None else depends_on,
+                "contract": self.planner_contract("Bounded task", ["src/**"]) if contract is None else contract,
+            }
+
+        cases = [
+            ([task(agent_id="unknown")], "unknown agent_id"),
+            ([task(depends_on=[0])], "self dependency"),
+            ([task(depends_on=[1]), task()], "forward dependency"),
+            ([task(depends_on=[1])], "out of range"),
+            ([task(), task(depends_on=[0, 0])], "duplicate dependency"),
+            ([task(mode="append")], "invalid mode"),
+            ([task(contract={"objective": "Incomplete"})], "contract is incomplete"),
+            ([task(contract=self.planner_contract("Write without a boundary", []))], "bounded allowed_paths"),
+            ([task(contract=self.planner_contract("Write everywhere", ["**"]))], "bounded allowed_paths"),
+            ([task(contract=self.planner_contract("Write across the workspace", ["workspace/**"]))], "bounded allowed_paths"),
+        ]
+        for graph, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    agentdock.validate_task_graph(graph, {"architect", "coder"})
+
+    def test_build_plan_rejects_invalid_graph_before_materializing_tasks(self):
+        plan = self.build_disposition(
+            "invalid-graph",
+            {
+                "decision": "execute",
+                "reason": "Two tasks are needed.",
+                "evidence": ["The requested work is not present."],
+                "final_response": "",
+                "questions": [],
+                "tasks": [
+                    {
+                        "title": "Invalid dependency",
+                        "agent_id": "coder",
+                        "mode": "write",
+                        "depends_on": [0],
+                        "contract": self.planner_contract("Update the bounded file", ["src/**"]),
+                    }
+                ],
+            },
+        )
+        self.assertEqual(plan["status"], "attention")
+        self.assertIn("self dependency", plan["error"])
+        self.assertEqual(agentdock.rows("SELECT * FROM tasks WHERE plan_id=?", ("invalid-graph",)), [])
 
     def test_workspace_snapshot_is_deterministic_and_read_only(self):
         repo = self.tmp / "snapshot-repo"
@@ -515,6 +583,32 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
             {"status": "delivered", "error": ""},
         )
 
+    def test_executed_manual_followup_is_started_when_no_runner_is_active(self):
+        task_id = "executed-followup-delivery"
+        with agentdock.RUNNERS_LOCK:
+            old_runners = dict(agentdock.RUNNERS)
+            agentdock.RUNNERS.clear()
+        with agentdock.APP_SERVER_CONTROLS_LOCK:
+            old_controls = dict(agentdock.APP_SERVER_CONTROLS)
+            agentdock.APP_SERVER_CONTROLS.clear()
+        try:
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "sending")
+            with agentdock.RUNNERS_LOCK:
+                agentdock.RUNNERS[task_id] = object()
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
+            with agentdock.RUNNERS_LOCK:
+                agentdock.RUNNERS.clear()
+            with agentdock.APP_SERVER_CONTROLS_LOCK:
+                agentdock.APP_SERVER_CONTROLS[task_id] = object()
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "sending")
+        finally:
+            with agentdock.RUNNERS_LOCK:
+                agentdock.RUNNERS.clear()
+                agentdock.RUNNERS.update(old_runners)
+            with agentdock.APP_SERVER_CONTROLS_LOCK:
+                agentdock.APP_SERVER_CONTROLS.clear()
+                agentdock.APP_SERVER_CONTROLS.update(old_controls)
+
     def test_pausing_consultation_stays_queued_after_orchestrator_interrupt(self):
         plan = self._orchestrator_plan("paused-consultation")
         task_id = "paused-consultation-task"
@@ -662,7 +756,7 @@ class MissionDispositionTests(AgentDockTestCase):
     def test_simple_execution_uses_one_task(self):
         plan = self.build_disposition(
             "one-task",
-            {"decision": "execute", "reason": "One file must change.", "evidence": ["Target file is present."], "final_response": "", "questions": [], "tasks": [{"title": "Update one file", "agent_id": "coder", "mode": "write", "depends_on": [], "contract": {"objective": "Update one file", "allowed_paths": ["src/**"]}}]},
+            {"decision": "execute", "reason": "One file must change.", "evidence": ["Target file is present."], "final_response": "", "questions": [], "tasks": [{"title": "Update one file", "agent_id": "coder", "mode": "write", "depends_on": [], "contract": self.planner_contract("Update one file", ["src/**"])}]},
         )
         self.assertEqual(plan["status"], "planned")
         self.assertEqual(len(agentdock.rows("SELECT * FROM tasks WHERE plan_id=?", ("one-task",))), 1)
@@ -836,8 +930,116 @@ class TimelineAndRuntimeControlTests(AgentDockTestCase):
         )
         self.assertEqual(reopened, {"status": "planning", "decision": "", "decision_reason": "", "orchestrator_thread_id": "mission-thread"})
 
+    def test_planning_resume_releases_the_plan_lock_after_build_finishes(self):
+        plan_id = self.add_plan("planning-resume-lock", status="paused")
+        result = {
+            "decision": "already_satisfied",
+            "reason": "The requested planning check is already satisfied.",
+            "evidence": ["Read-only planning evidence was collected."],
+            "final_response": "No execution is needed.",
+            "questions": [],
+            "tasks": [],
+        }
+        with patch.object(agentdock, "quota_status", return_value={"status": "ok", "available": True}), patch.object(
+            agentdock,
+            "run_mission_orchestrator_turn",
+            return_value={"text": json.dumps(result), "model": "gpt-5.6-sol", "thread_id": "planning-thread"},
+        ):
+            resumed = agentdock.resume_plan(plan_id)
+            self.assertEqual(resumed["status"], "resuming")
+            deadline = time.monotonic() + 3
+            status = "planning"
+            while time.monotonic() < deadline:
+                status = agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"]
+                if status != "planning":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(status, "done")
+
+            acquired = False
+            while time.monotonic() < deadline:
+                if agentdock.claim_plan_run(plan_id):
+                    acquired = True
+                    agentdock.release_plan_run(plan_id)
+                    break
+                time.sleep(0.01)
+            self.assertTrue(acquired, "planning resume left ACTIVE_PLAN_RUNS claimed")
+
 
 class ExecutionTests(AgentDockTestCase):
+    def test_merge_conflict_resolver_rejects_unrelated_changes_before_staging(self):
+        repo = self.tmp / "conflict-repo"
+        repo.mkdir()
+
+        def git(*args, check=True):
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=check,
+                capture_output=True,
+                text=True,
+            )
+
+        git("init", "-b", "main")
+        (repo / "conflict.txt").write_text("base\n")
+        (repo / "unrelated.txt").write_text("base\n")
+        git("add", "conflict.txt", "unrelated.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+        git("checkout", "-b", "worker")
+        (repo / "conflict.txt").write_text("worker change\n")
+        git("add", "conflict.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "worker")
+        worker_commit = git("rev-parse", "HEAD").stdout.strip()
+        git("checkout", "main")
+        (repo / "conflict.txt").write_text("integration change\n")
+        git("add", "conflict.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "integration")
+
+        plan_id = "conflict-resolver-scope"
+        integration = self.tmp / "integration-worktree"
+        branch = "agentdock/conflict-resolver-scope/integration"
+        git("worktree", "add", "-b", branch, str(integration), "main")
+        try:
+            integration_git = lambda *args, **kwargs: subprocess.run(
+                ["git", "-C", str(integration), *args],
+                check=kwargs.get("check", True),
+                capture_output=True,
+                text=True,
+            )
+            integration_git("cherry-pick", worker_commit, check=False)
+            self.assertTrue(integration_git("diff", "--name-only", "--diff-filter=U").stdout.strip())
+            agentdock.execute(
+                "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,recovery_json) VALUES(?,?,?,?,?,?,?)",
+                (plan_id, "Resolve the conflict", str(repo), "test", "running", agentdock.now(), json.dumps(agentdock.RECOVERY_DEFAULTS)),
+            )
+            task = {
+                "id": "conflict-task",
+                "plan_id": plan_id,
+                "seq": 0,
+                "title": "Resolve the bounded conflict",
+                "contract_json": json.dumps({"allowed_paths": ["conflict.txt"]}),
+            }
+            result = {"task": task}
+
+            def malicious_resolver(*args, **kwargs):
+                (integration / "conflict.txt").write_text("resolved\n")
+                (integration / "unrelated.txt").write_text("must not be included\n")
+                return {"text": "Resolved.", "model": "gpt-5.6-sol"}
+
+            with patch.object(agentdock, "run_mission_orchestrator_turn", side_effect=malicious_resolver):
+                recovered, detail = agentdock.resolve_merge_conflict(
+                    agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)),
+                    {"integration_dir": integration},
+                    result,
+                    "cherry-pick conflict",
+                )
+            self.assertFalse(recovered)
+            self.assertIn("outside the conflicted set", detail)
+            staged = integration_git("diff", "--cached", "--name-only").stdout
+            self.assertNotIn("unrelated.txt", staged)
+        finally:
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(integration)], capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(repo), "worktree", "prune"], capture_output=True, text=True)
+
     def test_git_lock_warns_for_read_only_but_blocks_writes_without_deletion(self):
         repo = self.tmp / "lock-repo"
         repo.mkdir()
@@ -1098,9 +1300,23 @@ prompt = args[-1] if args else ""
 print(json.dumps({"type": "thread.started", "thread_id": "fake-thread"}), flush=True)
 print(json.dumps({"type": "turn.started"}), flush=True)
 if "Return ONLY valid JSON with this exact shape" in prompt:
+    def contract(objective, allowed_paths):
+        return {
+            "objective": objective,
+            "context": "Use the existing project and preserve unrelated behavior.",
+            "scope": {"in_scope": [objective], "out_of_scope": ["Unrelated product changes"]},
+            "allowed_paths": allowed_paths,
+            "required_inputs": [],
+            "implementation_steps": ["Inspect the bounded target", "Complete the contracted work"],
+            "acceptance_criteria": ["The requested bounded outcome is complete"],
+            "verification_commands": ["Run the focused verification"],
+            "expected_output": ["A concise result and verification summary"],
+            "escalation_conditions": ["Escalate ambiguity instead of guessing"],
+            "decision_policy": "Do not broaden scope; ask the orchestrator when a material decision is required."
+        }
     result = {"tasks": [
-        {"title": "Inspect repository", "agent_id": "architect", "mode": "read", "depends_on": [], "contract": {"objective": "Inspect repository", "allowed_paths": ["workspace/**"]}},
-        {"title": "Write focused marker", "agent_id": "coder", "mode": "write", "depends_on": [0], "contract": {"objective": "Write focused marker", "allowed_paths": ["src/**"]}},
+        {"title": "Inspect repository", "agent_id": "architect", "mode": "read", "depends_on": [], "contract": contract("Inspect repository", ["workspace/**"])},
+        {"title": "Write focused marker", "agent_id": "coder", "mode": "write", "depends_on": [0], "contract": contract("Write focused marker", ["src/**"])},
     ]}
 elif "final orchestrator synthesis" in prompt.lower():
     result = "Fake Codex synthesis completed after integration."
