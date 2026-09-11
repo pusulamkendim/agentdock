@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AgentDock — Mission Control</title>
-  <link rel="stylesheet" href="/styles.css?v=0.12.2">
+  <link rel="stylesheet" href="/styles.css?v=0.12.5">
 </head>
 <body>
 <div class="app-shell">
@@ -240,7 +240,7 @@
   <div id="contractPane" class="inspector-pane"><div id="taskContract" class="contract-body"></div></div>
   <div id="rawPane" class="inspector-pane"><pre id="inspectorRaw" class="full-log inspector-raw"></pre></div>
   <div class="manual-control">
-    <div class="manual-label"><b>MANUAL CONTROL</b><span id="manualHint">Continue the same Codex thread. Paste a screenshot with ⌘V.</span></div>
+    <div class="manual-label"><b>CONVERSATION</b><span id="manualHint">Continue the same agent conversation. Paste a screenshot with ⌘V.</span></div>
     <div id="conversationHistory" class="conversation-history"></div>
     <div id="manualAttachments" class="attachment-strip"></div>
     <div class="manual-composer"><textarea id="manualPrompt" placeholder="Message this agent…"></textarea><button id="manualSend" class="primary">Send ↵</button></div>
@@ -250,6 +250,6 @@
 <dialog id="logDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span id="logTitle">task.log</span><button onclick="document.getElementById('logDialog').close()" class="terminal-close">×</button></div><pre id="logText" class="full-log"></pre></dialog>
 <dialog id="planDiffDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span>integration.diff</span><button onclick="document.getElementById('planDiffDialog').close()" class="terminal-close">×</button></div><pre id="planDiffText" class="full-log"></pre></dialog>
 
-<script src="/app.js?v=0.12.2"></script>
+<script src="/app.js?v=0.12.5"></script>
 </body>
 </html>
