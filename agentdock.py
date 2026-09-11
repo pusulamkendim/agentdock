@@ -617,6 +617,15 @@ def latest_agent_session(task_id):
     return one("SELECT * FROM agent_sessions WHERE task_id=? ORDER BY started_at DESC LIMIT 1", (task_id,))
 
 
+def latest_log_segment(items, marker):
+    """Keep only the newest logical run while preserving the full raw log."""
+    start = 0
+    for index, item in enumerate(items or []):
+        if marker in str(item.get("line") or ""):
+            start = index
+    return (items or [])[start:]
+
+
 def record_control_event(plan_id, event_type, payload=None, task_id=""):
     """Persist a human-readable control-plane event alongside raw Codex events."""
     session = latest_agent_session(orchestrator_log_id(plan_id))
@@ -3730,12 +3739,14 @@ class Handler(SimpleHTTPRequestHandler):
                 "service_tier": plan.get("orchestrator_tier"),
                 "recent_logs": list(reversed(orch_logs)),
             }
-            doctor_logs = rows("SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 20", (doctor_log_id(pid),))
+            doctor_logs = rows("SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 80", (doctor_log_id(pid),))
+            doctor_logs.reverse()
+            doctor_logs = latest_log_segment(doctor_logs, "preflight started")
             doctor = {
                 "id": doctor_log_id(pid),
                 "status": plan.get("preflight_status") or "idle",
                 "report": safe_json(plan.get("preflight_json"), {}),
-                "recent_logs": list(reversed(doctor_logs)),
+                "recent_logs": doctor_logs,
             }
             q = quota_status()
             return self.send_json({"plan": plan, "tasks": tasks, "orchestrator": orchestrator, "doctor": doctor, "quota": q, "mission_usage": mission_usage(plan, q), "server_time": now()})

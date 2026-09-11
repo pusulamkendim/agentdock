@@ -80,6 +80,18 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         self.assertTrue(agentdock.claim_plan_run("plan-1"))
         agentdock.release_plan_run("plan-1")
 
+    def test_latest_log_segment_hides_previous_preflight_runs(self):
+        logs = [
+            {"line": "preflight started · phase=execution"},
+            {"line": "old blocker"},
+            {"line": "preflight started · phase=execution"},
+            {"line": "current check"},
+        ]
+        self.assertEqual(
+            [item["line"] for item in agentdock.latest_log_segment(logs, "preflight started")],
+            ["preflight started · phase=execution", "current check"],
+        )
+
     def test_planner_schema_is_written_and_valid_json(self):
         path = agentdock.planner_schema_path()
         payload = json.loads(path.read_text())
