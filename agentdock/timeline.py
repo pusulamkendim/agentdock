@@ -26,6 +26,7 @@ from . import config
 from .db import execute, doctor_log_id, latest_agent_session, one, rows
 from .git_ops import git, repo_info
 from .schemas import safe_json
+from .handoffs import format_contract_md
 
 def latest_log_segment(items, marker):
     """Keep only the newest logical run while preserving the full raw log."""
@@ -62,7 +63,6 @@ def mission_usage(plan, current=None):
 
 def write_mission_docs(plan_id):
     from .orchestrator import plan_consultations
-    from .tasks import format_contract_md
 
     plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
     if not plan:

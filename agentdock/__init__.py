@@ -9,7 +9,22 @@ import shutil
 import sqlite3
 import time
 
-from . import api, app, codex, config, db, git_ops, mission, orchestrator, preflight, schemas, tasks, timeline
+from . import (
+    api,
+    app,
+    codex,
+    config,
+    db,
+    git_ops,
+    handoffs,
+    integration,
+    mission,
+    orchestrator,
+    preflight,
+    schemas,
+    tasks,
+    timeline,
+)
 from .api import Handler, manual_followup_delivery_status, open_terminal_at, run_manual_followup_message, run_single_task
 from .app import main
 from .codex import (
@@ -103,6 +118,15 @@ from .mission import (
     run_plan,
     stored_integration_context,
 )
+from .handoffs import (
+    consultation_payload,
+    create_worker_consultation,
+    format_contract_md,
+    same_worker_resume_handoff,
+    task_dependency_context,
+    worker_resume_message,
+)
+from .integration import integrate_write_result, resolve_merge_conflict
 from .orchestrator import (
     answer_consultation,
     latest_orchestrator_session,
@@ -114,7 +138,6 @@ from .orchestrator import (
     resolve_worker_failure,
     run_mission_orchestrator_turn,
     run_orchestrator_followup,
-    same_worker_resume_handoff,
 )
 from .preflight import PreflightBlocked, PreflightWaitingForUser, apply_preflight_action, run_preflight
 from .schemas import (
@@ -127,15 +150,11 @@ from .schemas import (
     validate_task_graph,
 )
 from .tasks import (
-    create_worker_consultation,
-    format_contract_md,
-    integrate_write_result,
     mark_read_result_done,
     queued_messages,
     run_demo_manual_followup,
     run_manual_followup,
     run_parallel_task,
-    resolve_merge_conflict,
     run_task_once,
     run_task_with_recovery,
     task_effort,
@@ -146,12 +165,12 @@ from .timeline import latest_log_segment, mission_usage, task_diff, timeline_for
 
 
 __all__ = [
-    "api", "app", "codex", "config", "db", "git_ops", "mission", "orchestrator",
+    "api", "app", "codex", "config", "db", "git_ops", "handoffs", "integration", "mission", "orchestrator",
     "preflight", "schemas", "tasks", "timeline", "Handler", "main", "init_db",
     "run_codex", "run_codex_app_server", "run_orchestrator", "run_plan",
     "run_mission_orchestrator_turn", "run_task_once", "run_parallel_task",
     "run_manual_followup", "run_manual_followup_message", "run_single_task",
-    "resolve_merge_conflict",
+    "resolve_merge_conflict", "integrate_write_result",
     "manual_followup_delivery_status", "timeline_for", "task_diff", "validate_task_graph",
     "PreflightBlocked", "PreflightWaitingForUser", "apply_preflight_action",
     "build_plan", "apply_plan", "pause_plan", "resume_plan", "pause_task", "resume_task",

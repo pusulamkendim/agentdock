@@ -15,7 +15,6 @@ import sqlite3
 import subprocess
 import threading
 import time
-import uuid
 import webbrowser
 import fnmatch
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -31,82 +30,18 @@ from .db import (
     latest_agent_session,
     log,
     one,
-    record_control_event,
     rows,
 )
 from .git_ops import (
-    changed_git_paths,
     commit_worker_changes,
     create_worker_worktree,
-    delete_branch,
-    git,
-    path_matches_allowed,
-    remove_worktree,
     validate_read_workspace,
     validate_worker_changes,
     workspace_fingerprint,
 )
 from .preflight import is_transient_error
-from .schemas import extract_worker_consultation, safe_json
+from .handoffs import create_worker_consultation, safe_json, task_dependency_context
 from .timeline import write_mission_docs
-
-def format_contract_md(contract):
-    if not isinstance(contract, dict):
-        contract = {}
-    def bullets(values):
-        vals = values or []
-        if isinstance(vals, str): vals = [vals]
-        return "\n".join(f"- {v}" for v in vals) or "- None specified"
-    scope = contract.get("scope") or {}
-    return f"""## Objective
-{contract.get('objective') or 'Not specified'}
-
-## Context
-{contract.get('context') or 'Not specified'}
-
-## In scope
-{bullets(scope.get('in_scope'))}
-
-## Out of scope
-{bullets(scope.get('out_of_scope'))}
-
-## Allowed paths
-{bullets(contract.get('allowed_paths'))}
-
-## Required inputs
-{bullets(contract.get('required_inputs'))}
-
-## Execution steps
-{bullets(contract.get('implementation_steps'))}
-
-## Acceptance criteria
-{bullets(contract.get('acceptance_criteria'))}
-
-## Verification
-{bullets(contract.get('verification_commands'))}
-
-## Expected output
-{bullets(contract.get('expected_output'))}
-
-## Escalate instead of deciding when
-{bullets(contract.get('escalation_conditions'))}
-
-## Decision policy
-{contract.get('decision_policy') or 'Do not make architecture or scope decisions. Escalate ambiguity to the orchestrator.'}
-"""
-
-def task_dependency_context(task):
-    deps = json.loads(task.get("depends_json") or "[]")
-    if not deps:
-        return ""
-    dep_rows = []
-    for d in deps:
-        r = one("SELECT title,output,error,status FROM tasks WHERE plan_id=? AND seq=?", (task["plan_id"], d))
-        if r:
-            dep_rows.append(
-                f"DEPENDENCY {d+1}: {r['title']}\nSTATUS: {r['status']}\nRESULT:\n{(r['output'] or r['error'])[-6000:]}"
-            )
-    return "\n\n".join(dep_rows)
 
 def make_task_prompt(plan, task, agent):
     dep_context = task_dependency_context(task)
@@ -165,66 +100,6 @@ def task_effort(plan, agent, task=None):
 def task_tier(plan, agent, task=None):
     task = task or {}
     return (task.get("service_tier_override") or "").strip() or (agent.get("service_tier") or agent.get("agent_tier") or "").strip() or plan.get("worker_tier") or config.DEFAULT_WORKER_TIER
-
-def create_worker_consultation(plan, task, output):
-    request = extract_worker_consultation(output)
-    if not request:
-        return None
-    latest = latest_agent_session(task["id"]) or {}
-    worker_thread_id = latest.get("thread_id") or task.get("worker_thread_id") or ""
-    consultation_id = str(uuid.uuid4())
-    execute(
-        """INSERT INTO consultations(
-            id,plan_id,task_id,status,question,reason,evidence_json,options_json,
-            worker_thread_id,orchestrator_thread_id,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            consultation_id,
-            plan["id"],
-            task["id"],
-            "queued",
-            request["question"],
-            request["reason"],
-            json.dumps(request["evidence"], ensure_ascii=False),
-            json.dumps(request["options"], ensure_ascii=False),
-            worker_thread_id,
-            plan.get("orchestrator_thread_id") or "",
-            config.now(),
-        ),
-    )
-    execute(
-        """UPDATE tasks SET status=?,output=?,error=?,finished_at=NULL,
-           worker_thread_id=?,waiting_reason=?,consultation_id=? WHERE id=?""",
-        (
-            "waiting_for_orchestrator",
-            str(output or "")[-50000:],
-            "",
-            worker_thread_id,
-            request["question"],
-            consultation_id,
-            task["id"],
-        ),
-    )
-    log(
-        task["id"],
-        "supervisor",
-        f"worker consultation queued · {request['question'][:300]}",
-    )
-    log(
-        f"orchestrator:{plan['id']}",
-        "supervisor",
-        f"TASK-{task['seq']+1:03d} waiting for orchestrator · consultation={consultation_id[:12]}",
-    )
-    record_control_event(plan["id"], "agentdock.consultation", {
-        "consultation_id": consultation_id,
-        "task_id": task["id"],
-        "question": request["question"],
-        "reason": request["reason"],
-        "evidence": request["evidence"],
-        "options": request["options"],
-    }, task_id=task["id"])
-    write_mission_docs(plan["id"])
-    return {**request, "id": consultation_id, "worker_thread_id": worker_thread_id}
 
 def run_task_once(plan, task, workspace, force_mode=None):
     persisted = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
@@ -373,128 +248,6 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
                 result = {"ok": False, "phase": "contract", "error": str(e)}
                 execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), config.now(), task["id"]))
         return {"task": task, "ok": result.get("ok", False), "write": False, "phase": "worker", **result}
-
-def merge_conflict_prompt(plan, task, unresolved, cherry_error):
-    contract = safe_json(task.get("contract_json"), {})
-    return f"""You are the root orchestrator resolving a Git integration conflict between parallel worker results.
-
-MISSION:
-{plan['goal']}
-
-CURRENT TASK:
-TASK-{task['seq']+1:03d} — {task['title']}
-
-TASK CONTRACT:
-{json.dumps(contract, ensure_ascii=False, indent=2)}
-
-CONFLICTED FILES:
-{chr(10).join('- ' + x for x in unresolved) or '- unknown'}
-
-CHERRY-PICK ERROR:
-{cherry_error[-4000:]}
-
-The integration worktree is currently in an active cherry-pick conflict state.
-Resolve ONLY the conflict markers needed to preserve both already-integrated behavior and this task's explicit acceptance criteria.
-You may inspect files and run focused verification. Do not broaden scope, refactor unrelated code, delete user work, change dependencies, or run git commit/cherry-pick/abort/reset commands. The harness owns Git state.
-If the conflict cannot be resolved without a product/architecture decision outside the existing contracts, respond exactly with:
-BLOCKED_NEEDS_USER: <reason>
-Otherwise resolve the files in-place and briefly report what you reconciled.
-"""
-
-def resolve_merge_conflict(plan, ctx, result, cherry_error):
-    task = result["task"]
-    settings = config.recovery_settings(plan)
-    unresolved = [x for x in git(ctx["integration_dir"], "diff", "--name-only", "--diff-filter=U", check=False).stdout.splitlines() if x.strip()]
-    if settings.get("merge_conflicts") != "orchestrator":
-        return False, f"Merge conflict requires attention: {', '.join(unresolved) or cherry_error}"
-    log(f"orchestrator:{plan['id']}", "supervisor", f"TASK-{task['seq']+1:03d} integration conflict; root orchestrator is attempting a bounded resolution")
-    execute("UPDATE plans SET recovery_count=recovery_count+1 WHERE id=?", (plan["id"],))
-    try:
-        retries = 1 if settings.get("auto_retry_transient") else 0
-        from .orchestrator import run_mission_orchestrator_turn
-        turn = run_mission_orchestrator_turn(
-            plan["id"],
-            "failure_recovery",
-            merge_conflict_prompt(plan, task, unresolved, cherry_error),
-            mode="write",
-            transient_retries=retries,
-        )
-        text, used = turn["text"], turn["model"]
-        if "BLOCKED_NEEDS_USER:" in text:
-            return False, text
-        marker_files = []
-        for rel in unresolved:
-            path = Path(ctx["integration_dir"]) / rel
-            if path.is_file():
-                try:
-                    text = path.read_text(errors="replace")
-                    if "<<<<<<<" in text or ">>>>>>>" in text:
-                        marker_files.append(rel)
-                except Exception:
-                    pass
-        if marker_files:
-            return False, "Orchestrator left conflict markers in: " + ", ".join(marker_files)
-        changed = set(changed_git_paths(ctx["integration_dir"]))
-        unresolved_set = set(unresolved)
-        out_of_scope = sorted(changed - unresolved_set)
-        if out_of_scope:
-            return False, "Orchestrator conflict resolver changed files outside the conflicted set: " + ", ".join(out_of_scope[:20])
-        contract = safe_json(task.get("contract_json"), {})
-        allowed_paths = contract.get("allowed_paths") or []
-        disallowed_conflicts = [
-            rel for rel in unresolved
-            if not any(path_matches_allowed(rel, pattern) for pattern in allowed_paths)
-        ]
-        if disallowed_conflicts:
-            return False, "Conflict files fall outside the task contract: " + ", ".join(disallowed_conflicts[:20])
-        if not unresolved:
-            return False, "Git reported no conflicted files to resolve"
-        # Stage only the files Git reported as unmerged. The resolver is not
-        # allowed to smuggle unrelated changes into the integration commit.
-        git(ctx["integration_dir"], "add", "--", *unresolved)
-        unresolved_index = git(ctx["integration_dir"], "ls-files", "-u", check=False).stdout.strip()
-        if unresolved_index:
-            return False, "Orchestrator did not fully stage a conflict resolution"
-        git(ctx["integration_dir"], "diff", "--cached", "--check")
-        git(
-            ctx["integration_dir"],
-            "-c", "user.name=AgentDock",
-            "-c", "user.email=agentdock@local",
-            "-c", "core.editor=true",
-            "cherry-pick", "--continue",
-        )
-        execute("UPDATE tasks SET status=?, error=?, integration_status=? WHERE id=?", ("done", "", "resolved_by_orchestrator", task["id"]))
-        log(f"orchestrator:{plan['id']}", "supervisor", f"TASK-{task['seq']+1:03d} merge conflict resolved by {used}")
-        return True, ""
-    except Exception as e:
-        return False, f"Orchestrator conflict recovery failed: {e}"
-
-def integrate_write_result(plan, ctx, result):
-    task = result["task"]
-    if not result.get("ok"):
-        return False
-    commit_hash = result.get("commit") or ""
-    if not commit_hash:
-        execute("UPDATE tasks SET status=?, integration_status=? WHERE id=?", ("done", "no_changes", task["id"]))
-        remove_worktree(ctx["repo_root"], result["wt"])
-        delete_branch(ctx["repo_root"], result["branch"])
-        return True
-    try:
-        git(ctx["integration_dir"], "-c", "user.name=AgentDock", "-c", "user.email=agentdock@local", "cherry-pick", commit_hash)
-        execute("UPDATE tasks SET status=?, integration_status=? WHERE id=?", ("done", "integrated", task["id"]))
-        remove_worktree(ctx["repo_root"], result["wt"])
-        delete_branch(ctx["repo_root"], result["branch"])
-        return True
-    except Exception as e:
-        recovered, detail = resolve_merge_conflict(plan, ctx, result, str(e))
-        if recovered:
-            remove_worktree(ctx["repo_root"], result["wt"])
-            delete_branch(ctx["repo_root"], result["branch"])
-            return True
-        git(ctx["integration_dir"], "cherry-pick", "--abort", check=False)
-        err = f"Parallel integration conflict could not be self-healed: {detail or e}"
-        execute("UPDATE tasks SET status=?, error=?, integration_status=?, finished_at=? WHERE id=?", ("failed", err, "conflict", config.now(), task["id"]))
-        return False
 
 def mark_read_result_done(result):
     task = result["task"]

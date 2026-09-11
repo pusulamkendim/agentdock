@@ -37,6 +37,13 @@ from .db import (
     rows,
 )
 from .schemas import CONSULTATION_SCHEMA, consultation_schema_path, extract_json, extract_worker_consultation, normalize_consultation_result, safe_json
+from .handoffs import (
+    consultation_payload,
+    create_worker_consultation,
+    same_worker_resume_handoff,
+    task_dependency_context,
+    worker_resume_message,
+)
 from .timeline import write_mission_docs
 
 def plan_is_paused(plan_id):
@@ -358,22 +365,9 @@ Choose exactly one action:
 Never create a new task or a new orchestrator thread in this turn.
 """
 
-def _consultation_payload(row):
-    row = row or {}
-    return {
-        "id": row.get("id") or "",
-        "question": row.get("question") or "",
-        "reason": row.get("reason") or "",
-        "evidence": safe_json(row.get("evidence_json"), []),
-        "options": safe_json(row.get("options_json"), []),
-        "worker_thread_id": row.get("worker_thread_id") or "",
-        "status": row.get("status") or "",
-        "task_id": row.get("task_id") or "",
-    }
-
 def _defer_consultation_for_paused_plan(plan, task, consultation, payload=None):
     """Keep a worker question durable when a mission pause interrupts resolution."""
-    payload = payload or _consultation_payload(consultation)
+    payload = payload or consultation_payload(consultation)
     question = (
         payload.get("question")
         or task.get("waiting_reason")
@@ -434,33 +428,8 @@ def _set_pending_consultation(plan_id, task, consultation, response):
     )
     return pending
 
-def worker_resume_message(response, contract):
-    """Turn an orchestrator decision into an explicit same-thread worker handoff."""
-    return (
-        "ROOT ORCHESTRATOR DECISION\n\n"
-        f"{response.get('worker_message') or response.get('reason') or 'Continue the bounded task.'}\n\n"
-        "Updated contract:\n"
-        f"{json.dumps(contract or {}, ensure_ascii=False, indent=2)}\n\n"
-        "Continue the same task from your current state. Preserve the prior context and tool findings."
-    )
-
-def same_worker_resume_handoff(task, instruction="Continue the same task from your last durable checkpoint."):
-    """Build the durable context sent when a worker continues its own thread."""
-    thread_id = str(task.get("worker_thread_id") or "").strip()
-    if not thread_id:
-        thread_id = str((latest_agent_session(task.get("id")) or {}).get("thread_id") or "").strip()
-    checkpoint = str(task.get("output") or "").strip()[-6000:]
-    return (
-        f"{instruction}\n"
-        f"Existing worker thread: {thread_id or 'not yet bound'}\n"
-        f"Last checkpoint/output:\n{checkpoint or 'No textual checkpoint was recorded.'}\n"
-        "Do not create a new session and do not redo completed work."
-    )
-
 def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=None):
     """Ask the same orchestrator thread to resolve a worker's structured question."""
-    from .tasks import create_worker_consultation
-
     fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
     consultation_id = fresh.get("consultation_id") or (result or {}).get("consultation_id") or ""
     consultation = one("SELECT * FROM consultations WHERE id=?", (consultation_id,)) if consultation_id else None
@@ -470,7 +439,7 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
             consultation = create_worker_consultation(plan, fresh, result.get("output") or "")
     if not consultation:
         return {"ok": False, "error": "Worker consultation record not found."}
-    payload = _consultation_payload(consultation)
+    payload = consultation_payload(consultation)
     if plan_is_paused(plan["id"]):
         return _defer_consultation_for_paused_plan(plan, fresh, consultation, payload)
     # Keep a write worker's isolated worktree alive while the orchestrator is
@@ -592,8 +561,6 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
         return {"ok": False, "attention": True, "error": message}
 
 def escalation_prompt(plan, task, worker_output):
-    from .tasks import task_dependency_context
-
     contract = safe_json(task.get("contract_json"), {})
     return f"""You are the root orchestrator supervising a smaller worker. The worker correctly refused to make a reserved decision.
 
@@ -626,8 +593,6 @@ Rules:
 """
 
 def resolve_worker_escalation(plan, task, result, workspace, ctx=None):
-    from .tasks import create_worker_consultation
-
     fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
     count = int(fresh.get("escalation_count") or 0)
     if count >= 2:
@@ -655,8 +620,6 @@ def resolve_worker_escalation(plan, task, result, workspace, ctx=None):
         return False
 
 def failure_recovery_prompt(plan, task, result):
-    from .tasks import task_dependency_context
-
     contract = safe_json(task.get("contract_json"), {})
     return f"""You are the root orchestrator supervising a smaller execution worker. The worker failed while executing an already-decided task contract.
 

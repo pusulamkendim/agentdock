@@ -76,8 +76,9 @@ from .orchestrator import (
     resolve_worker_consultation,
     resolve_worker_failure,
     run_mission_orchestrator_turn,
-    same_worker_resume_handoff,
 )
+from .handoffs import same_worker_resume_handoff
+from .integration import integrate_write_result
 from .preflight import PreflightBlocked, PreflightWaitingForUser, run_preflight
 from .schemas import (
     deterministic_mission_title,
@@ -87,7 +88,6 @@ from .schemas import (
     validate_task_graph,
 )
 from .tasks import (
-    integrate_write_result,
     mark_read_result_done,
     queued_messages,
     run_parallel_task,
