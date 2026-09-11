@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AgentDock — Mission Control</title>
-  <link rel="stylesheet" href="/styles.css?v=0.12.5">
+  <link rel="stylesheet" href="/styles.css?v=0.13.0">
 </head>
 <body>
 <div class="app-shell">
@@ -183,6 +183,10 @@
           <div><span class="eyebrow">LIVE MISSION</span><h2 id="liveTitle">No mission selected</h2></div>
           <div id="runStats" class="run-stats"></div>
         </div>
+        <details id="missionDetails" class="mission-details" hidden>
+          <summary>Mission details</summary>
+          <div id="missionDetailsBody"></div>
+        </details>
         <div id="missionBar" class="mission-bar empty"><span>Select a mission to inspect it.</span></div>
         <div id="usagePanel" class="usage-panel"></div>
       </div>
@@ -190,7 +194,7 @@
       <section id="decisionPanel" class="surface decision-panel" hidden></section>
       <section id="planReviewPanel" class="surface plan-review-panel" hidden></section>
 
-      <div class="live-section-head"><div><span class="eyebrow">AGENTS</span><h3>Orchestrator & workers</h3></div><span class="section-note">Classic working state, Codex-style activity, manual messages and stop controls.</span></div>
+      <div class="live-section-head"><div><span class="eyebrow">AGENTS</span><h3>Orchestrator & workers</h3></div><span class="section-note">Classic working state, Codex-style activity, messages and pause controls.</span></div>
       <div id="liveGrid" class="terminal-grid"><div class="empty-terminal"><span>agentdock@local:~$</span> waiting for mission_</div></div>
 
       <section class="surface task-surface">
@@ -233,15 +237,14 @@
 <dialog id="agentDialog"><form method="dialog" id="agentForm"><div class="dialog-title"><div><div class="eyebrow">WORKER PROFILE</div><h3>Configure agent</h3></div></div><input type="hidden" id="agentId"><label>NAME<input id="agentName" required></label><label>MODEL OVERRIDE <span>(optional)</span><input id="agentModel" placeholder="gpt-5.6-luna"></label><label>REASONING OVERRIDE <span>(optional)</span><select id="agentEffort"><option value="">Inherit mission</option><option value="none">None</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label><label>SPEED OVERRIDE <span>(optional)</span><select id="agentTier"><option value="">Inherit mission</option><option value="default">Standard</option><option value="fast">Fast</option></select></label><label>PERMISSION<select id="agentMode"><option value="read">Read-only</option><option value="write">Workspace write</option></select></label><label>BRIEF<textarea id="agentRole" required></textarea></label><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="saveAgent" value="default" class="primary">Save</button></div></form></dialog>
 
 <dialog id="taskDialog" class="inspector-dialog">
-  <div class="inspector-head"><div><div class="eyebrow">AGENT INSPECTOR</div><h3 id="taskDialogTitle">Task</h3><div id="taskRuntime" class="inspector-runtime"></div></div><div class="inspector-actions"><button id="openTerminalBtn" class="secondary compact">Open Terminal</button><button id="inspectStop" class="secondary compact danger">Stop</button><button onclick="document.getElementById('taskDialog').close()" class="terminal-close">×</button></div></div>
+  <div class="inspector-head"><div><div class="eyebrow">AGENT INSPECTOR</div><h3 id="taskDialogTitle">Task</h3><div id="taskRuntime" class="inspector-runtime"></div></div><div class="inspector-actions"><button id="openTerminalBtn" class="secondary compact">Open Terminal</button><button id="inspectStop" class="secondary compact danger">Pause</button><button id="inspectResume" class="secondary compact">Resume</button><button onclick="document.getElementById('taskDialog').close()" class="terminal-close">×</button></div></div>
   <div class="inspector-tabs"><button data-tab="activity" class="active">Activity</button><button data-tab="diff">Diff</button><button data-tab="contract">Contract</button><button data-tab="raw">Raw</button></div>
-  <div id="activityPane" class="inspector-pane active"><div id="activityFeed" class="activity-feed"></div></div>
+  <div id="activityPane" class="inspector-pane active"><button id="activityLatest" class="activity-latest" hidden>↓ New activity</button><div id="activityFeed" class="activity-feed"></div></div>
   <div id="diffPane" class="inspector-pane"><pre id="diffText" class="diff-view"></pre></div>
   <div id="contractPane" class="inspector-pane"><div id="taskContract" class="contract-body"></div></div>
   <div id="rawPane" class="inspector-pane"><pre id="inspectorRaw" class="full-log inspector-raw"></pre></div>
   <div class="manual-control">
     <div class="manual-label"><b>CONVERSATION</b><span id="manualHint">Continue the same agent conversation. Paste a screenshot with ⌘V.</span></div>
-    <div id="conversationHistory" class="conversation-history"></div>
     <div id="manualAttachments" class="attachment-strip"></div>
     <div class="manual-composer"><textarea id="manualPrompt" placeholder="Message this agent…"></textarea><button id="manualSend" class="primary">Send ↵</button></div>
   </div>
@@ -250,6 +253,6 @@
 <dialog id="logDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span id="logTitle">task.log</span><button onclick="document.getElementById('logDialog').close()" class="terminal-close">×</button></div><pre id="logText" class="full-log"></pre></dialog>
 <dialog id="planDiffDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span>integration.diff</span><button onclick="document.getElementById('planDiffDialog').close()" class="terminal-close">×</button></div><pre id="planDiffText" class="full-log"></pre></dialog>
 
-<script src="/app.js?v=0.12.6"></script>
+<script src="/app.js?v=0.13.0"></script>
 </body>
 </html>

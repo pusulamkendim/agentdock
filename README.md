@@ -1,4 +1,4 @@
-# AgentDock v0.12 — Supervised Mission Control
+# AgentDock v0.13 — Supervised Mission Control
 
 AgentDock is a local multi-agent control plane for Codex. The orchestrator first decides what the mission needs; it creates worker tasks only when real execution is required. Write workers execute approved tasks in isolated Git worktrees. The normal path reuses the existing ChatGPT-authenticated Codex CLI and requires no API key.
 
@@ -59,13 +59,13 @@ Recent terminal/activity lines continue below it.
 Each worker card exposes:
 
 - **Message** — continue the same agent conversation;
-- **Stop** — terminate a running Codex process;
+- **Pause / Resume** — interrupt or continue the same worker conversation;
 - **Terminal** — open macOS Terminal in that task's worktree;
 - **Inspect** — Activity / Diff / Contract / Raw.
 
 If a worker is currently inside a `codex exec` turn, a message is not discarded. It is recorded as **queued** and automatically delivered as the next turn on the same Codex thread before the task is finalized/integrated. The UI clearly labels this behavior rather than pretending the CLI supports mid-turn steering.
 
-The Inspector keeps a small user-message history with `queued / sending / delivered / failed` status.
+The Inspector presents user messages, agent replies, tool activity and control events in one chronological timeline. User messages retain `queued / sending / delivered / failed` status.
 
 ### Talk to the orchestrator
 
@@ -157,6 +157,26 @@ Read tasks compare a workspace fingerprint captured immediately before the task 
 On restart, interrupted work moves to explicit attention while completed task checkpoints remain intact. Pending consultations are requeued from SQLite, completed read tasks are not rerun, and a persisted integration worktree is reused when safe. Partial read-only execution completes only independent read work; dependent write/test/review tasks and final synthesis wait for the next safe execution phase.
 
 The durable coordination records live in `orchestrator_turns` and `consultations`, while the mission mirror includes the orchestrator thread, generation, turn status, pending questions, consultation history, and worker handoff messages.
+
+## What changed in v0.13
+
+### Mission controls and conversation continuity
+
+- The original mission prompt is preserved in **Mission details** while the live header uses a short planner-generated title (with a deterministic fallback).
+- Runtime settings can be changed from the mission bar for future orchestrator turns and remaining workers: model, reasoning, speed, and parallelism.
+- Mission actions are status-aware: **Pause mission**, **Resume mission**, **Resume from issue**, **Reopen mission**, and **Restart as new mission**.
+- Worker actions distinguish `paused_by_user` from permanent `cancelled`; resuming requires the persisted worker thread and never silently opens a replacement conversation.
+- Activity and Conversation are one timeline. The Inspector and compact agent cards keep the newest meaningful activity at the bottom, preserve the user's scroll position, and expose a **New activity** jump when appropriate.
+
+The control endpoints are:
+
+```text
+POST /api/mission-config/:plan_id
+POST /api/pause-plan/:plan_id
+POST /api/resume-plan/:plan_id
+POST /api/pause-task/:task_id
+POST /api/resume-task/:task_id
+```
 
 ## Quick start
 

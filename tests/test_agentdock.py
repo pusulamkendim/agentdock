@@ -348,10 +348,12 @@ class MissionDispositionTests(AgentDockTestCase):
     def test_already_satisfied_creates_no_tasks(self):
         plan = self.build_disposition(
             "already",
-            {"decision": "already_satisfied", "reason": "The requested flag is already present.", "evidence": ["Inspected src/app.py"], "final_response": "Nothing needs to change.", "questions": [], "tasks": []},
+            {"title": "Flag verification", "decision": "already_satisfied", "reason": "The requested flag is already present.", "evidence": ["Inspected src/app.py"], "final_response": "Nothing needs to change.", "questions": [], "tasks": []},
             goal="Add the flag",
         )
         self.assertEqual(plan["status"], "done")
+        self.assertEqual(plan["title"], "Flag verification")
+        self.assertEqual(plan["goal"], "Add the flag")
         self.assertEqual(plan["decision"], "already_satisfied")
         self.assertEqual(agentdock.rows("SELECT * FROM tasks WHERE plan_id=?", ("already",)), [])
         self.assertEqual(plan["preflight_status"], "")
@@ -450,6 +452,103 @@ for line in sys.stdin:
         event_types = [x["event_type"] for x in agentdock.rows("SELECT event_type FROM agent_events WHERE task_id=? ORDER BY id", ("app-task",))]
         self.assertIn("item/completed", event_types)
         self.assertIn("turn/completed", event_types)
+
+
+class TimelineAndRuntimeControlTests(AgentDockTestCase):
+    def test_timeline_merges_agent_events_logs_and_user_messages_in_sequence(self):
+        plan_id = self.add_plan("timeline-plan", status="attention")
+        task_id = "timeline-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,status) VALUES(?,?,?,?,?,?)",
+            (task_id, plan_id, 0, "Inspect", "Inspect", "done"),
+        )
+        session_id = agentdock.create_agent_session(
+            plan_id, task_id, "worker", "gpt-5.6-luna", "medium", "default", "read", self.tmp,
+        )
+        agentdock.execute(
+            "INSERT INTO agent_events(session_id,plan_id,task_id,ts,event_type,item_type,payload_json) VALUES(?,?,?,?,?,?,?)",
+            (session_id, plan_id, task_id, 100, "item.completed", "agent_message", json.dumps({"item": {"type": "agent_message", "text": "Agent result"}})),
+        )
+        agentdock.execute(
+            "INSERT INTO task_messages(id,task_id,plan_id,ts,text,status) VALUES(?,?,?,?,?,?)",
+            ("timeline-message", task_id, plan_id, 101, "User follow-up", "delivered"),
+        )
+        agentdock.execute(
+            "INSERT INTO logs(task_id,ts,stream,line) VALUES(?,?,?,?)",
+            (task_id, 102, "system", "terminal result"),
+        )
+
+        timeline = agentdock.timeline_for(task_id)
+        self.assertEqual([item["sequence"] for item in timeline["items"]], [1, 2, 3])
+        self.assertEqual([item["kind"] for item in timeline["items"]], ["event", "message", "log"])
+        self.assertEqual(timeline["items"][1]["text"], "User follow-up")
+
+    def test_mission_config_applies_worker_overrides_only_to_remaining_tasks(self):
+        plan_id = self.add_plan("config-plan", status="approved")
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,status,model_override) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("config-pending", plan_id, 0, "Pending", "Pending", "coder", "write", "pending", ""),
+        )
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,status,model_override) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("config-running", plan_id, 1, "Running", "Running", "coder", "write", "running", "old-model"),
+        )
+        result = agentdock.mission_config(
+            plan_id,
+            {
+                "orchestrator_model": "gpt-5.6-sol",
+                "orchestrator_effort": "low",
+                "orchestrator_tier": "fast",
+                "worker_model": "gpt-5.6-luna",
+                "worker_effort": "low",
+                "worker_tier": "fast",
+                "max_parallel": 3,
+                "apply_remaining": True,
+            },
+        )
+        self.assertEqual(result["config"]["max_parallel"], 3)
+        pending = agentdock.one("SELECT model_override,reasoning_effort_override,service_tier_override FROM tasks WHERE id=?", ("config-pending",))
+        running = agentdock.one("SELECT model_override,reasoning_effort_override,service_tier_override FROM tasks WHERE id=?", ("config-running",))
+        self.assertEqual(pending, {"model_override": "gpt-5.6-luna", "reasoning_effort_override": "low", "service_tier_override": "fast"})
+        self.assertEqual(running["model_override"], "old-model")
+
+    def test_mission_pause_and_resume_preserve_worker_thread_and_completed_tasks(self):
+        plan_id = self.add_plan("pause-plan", status="running")
+        agentdock.execute("UPDATE plans SET decision=? WHERE id=?", ("execute", plan_id))
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,status,worker_thread_id) VALUES(?,?,?,?,?,?,?)",
+            ("pause-done", plan_id, 0, "Done", "Done", "done", "done-thread"),
+        )
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,status,worker_thread_id) VALUES(?,?,?,?,?,?,?)",
+            ("pause-running", plan_id, 1, "Running", "Running", "running", "worker-thread"),
+        )
+        paused = agentdock.pause_plan(plan_id)
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "paused")
+        self.assertEqual(agentdock.one("SELECT status,worker_thread_id FROM tasks WHERE id=?", ("pause-running",)), {"status": "paused_by_user", "worker_thread_id": "worker-thread"})
+
+        with patch.object(agentdock, "claim_plan_run", return_value=False):
+            resumed = agentdock.resume_plan(plan_id)
+        self.assertEqual(resumed["status"], "running")
+        self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "approved")
+        self.assertEqual(agentdock.one("SELECT status,worker_thread_id FROM tasks WHERE id=?", ("pause-running",)), {"status": "pending", "worker_thread_id": "worker-thread"})
+        self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", ("pause-done",))["status"], "done")
+
+    def test_no_task_resume_reopens_disposition_without_execution(self):
+        plan_id = self.add_plan("no-task-resume", status="attention")
+        agentdock.execute(
+            "UPDATE plans SET decision=?,decision_reason=?,orchestrator_thread_id=? WHERE id=?",
+            ("answer_only", "A previous answer was recorded.", "mission-thread", plan_id),
+        )
+        with patch.object(agentdock, "claim_plan_run", return_value=False):
+            result = agentdock.resume_plan(plan_id)
+        self.assertEqual(result["status"], "planning")
+        reopened = agentdock.one(
+            "SELECT status,decision,decision_reason,orchestrator_thread_id FROM plans WHERE id=?",
+            (plan_id,),
+        )
+        self.assertEqual(reopened, {"status": "planning", "decision": "", "decision_reason": "", "orchestrator_thread_id": "mission-thread"})
 
 
 class ExecutionTests(AgentDockTestCase):

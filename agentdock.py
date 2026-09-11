@@ -115,6 +115,7 @@ MODEL_EFFORTS = {
 PLANNER_SCHEMA = {
     "type": "object",
     "properties": {
+        "title": {"type": "string", "maxLength": 120},
         "decision": {
             "type": "string",
             "enum": ["already_satisfied", "answer_only", "needs_user_input", "blocked", "execute"],
@@ -406,6 +407,10 @@ def init_db():
         ("legacy_orchestrator_status", "TEXT NOT NULL DEFAULT ''"),
         ("workspace_choice_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("restart_recovery_pending", "INTEGER NOT NULL DEFAULT 0"),
+        ("title", "TEXT NOT NULL DEFAULT ''"),
+        ("pause_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("pause_requested_at", "INTEGER"),
+        ("resume_count", "INTEGER NOT NULL DEFAULT 0"),
     ]:
         ensure_column("plans", name, ddl)
     for name, ddl in [
@@ -428,6 +433,10 @@ def init_db():
         ("waiting_reason", "TEXT NOT NULL DEFAULT ''"),
         ("consultation_id", "TEXT NOT NULL DEFAULT ''"),
         ("baseline_fingerprint_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("model_override", "TEXT NOT NULL DEFAULT ''"),
+        ("reasoning_effort_override", "TEXT NOT NULL DEFAULT ''"),
+        ("service_tier_override", "TEXT NOT NULL DEFAULT ''"),
+        ("pause_reason", "TEXT NOT NULL DEFAULT ''"),
     ]:
         ensure_column("tasks", name, ddl)
     ensure_column("agent_sessions", "turn_id", "TEXT NOT NULL DEFAULT ''")
@@ -482,7 +491,7 @@ def recover_orphaned_runs():
     with DB_LOCK:
         con = db()
         plans = con.execute(
-            "SELECT id FROM plans WHERE status IN ('preflight','running')"
+            "SELECT id FROM plans WHERE status IN ('preflight','running','pausing','resuming')"
         ).fetchall()
         # A process can stop after an answer is durably recorded but before the
         # same orchestrator turn resolves it. Requeue that consultation while
@@ -508,7 +517,7 @@ def recover_orphaned_runs():
         )
         con.execute(
             f"UPDATE tasks SET status='attention', error=?, finished_at=? "
-            f"WHERE plan_id IN ({placeholders}) AND status='running'",
+            f"WHERE plan_id IN ({placeholders}) AND status IN ('running','pausing','resuming')",
             (message, interrupted_at, *plan_ids),
         )
         con.execute(
@@ -640,6 +649,11 @@ def terminate_process(proc):
             pass
 
 
+def plan_is_paused(plan_id):
+    plan = one("SELECT status,paused FROM plans WHERE id=?", (plan_id,)) or {}
+    return plan.get("status") in ("paused", "pausing") or int(plan.get("paused") or 0) == 1
+
+
 def normalize_workspace_path(repo_path):
     """Resolve the path forms people naturally paste on macOS.
 
@@ -722,13 +736,13 @@ def ensure_workspace(repo_path, name=None):
 
 def workspace_summary(workspace):
     wid = workspace["id"]
-    plans = rows("SELECT id,goal,status,created_at,error,max_parallel,worker_model,orchestrator_model FROM plans WHERE workspace_id=? ORDER BY created_at DESC", (wid,))
+    plans = rows("SELECT id,goal,title,status,created_at,error,max_parallel,worker_model,orchestrator_model FROM plans WHERE workspace_id=? ORDER BY created_at DESC", (wid,))
     running = queued = attention = done = 0
     for pl in plans:
         stats = one("""SELECT
-            SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) running,
+            SUM(CASE WHEN status IN ('running','resuming','pausing') THEN 1 ELSE 0 END) running,
             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) queued,
-            SUM(CASE WHEN status IN ('failed','blocked','cancelled') THEN 1 ELSE 0 END) issues,
+            SUM(CASE WHEN status IN ('failed','blocked','cancelled','attention','paused_by_user') THEN 1 ELSE 0 END) issues,
             SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) done
             FROM tasks WHERE plan_id=?""", (pl["id"],)) or {}
         pl["task_stats"] = {k: int(stats.get(k) or 0) for k in ("running","queued","issues","done")}
@@ -2196,7 +2210,6 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
     daemon lifecycle dependency; resume_thread_id keeps the conversation
     continuous. The legacy exec transport remains available as the default.
     """
-    del service_tier  # App Server currently receives the model/effort controls used here.
     workspace = str(Path(workspace).expanduser().resolve())
     if not Path(workspace).is_dir():
         raise RuntimeError(f"Workspace bulunamadı: {workspace}")
@@ -2204,7 +2217,10 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
     if not exe:
         raise RuntimeError("codex CLI PATH içinde bulunamadı")
     plan_id = infer_plan_id(task_id)
-    session_id = create_agent_session(plan_id, task_id or "", session_kind, model, reasoning_effort, "default", mode, workspace)
+    session_id = create_agent_session(
+        plan_id, task_id or "", session_kind, model, reasoning_effort,
+        service_tier or "default", mode, workspace,
+    )
     proc = subprocess.Popen(
         [exe, "app-server", "--stdio"],
         cwd=workspace,
@@ -2318,7 +2334,12 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
             "capabilities": {"experimentalApi": True},
         })
         send({"method": "initialized", "params": {}})
-        thread_params = {"model": model or DEFAULT_WORKER, "cwd": workspace, "serviceName": "agentdock"}
+        thread_params = {
+            "model": model or DEFAULT_WORKER,
+            "cwd": workspace,
+            "serviceName": "agentdock",
+            "serviceTier": service_tier or "default",
+        }
         if resume_thread_id:
             thread_result = request(2, "thread/resume", {"threadId": resume_thread_id})
         else:
@@ -2339,6 +2360,7 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
             "cwd": workspace,
             "model": model or DEFAULT_WORKER,
             "effort": reasoning_effort or DEFAULT_WORKER_EFFORT,
+            "serviceTier": service_tier or "default",
             "approvalPolicy": "never",
             "sandboxPolicy": _app_server_sandbox(workspace, mode),
             "summary": "concise",
@@ -2357,6 +2379,10 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
             with APP_SERVER_CONTROLS_LOCK:
                 APP_SERVER_CONTROLS[task_id] = {
                     "send": send,
+                    "interrupt": lambda: send({
+                        "method": "turn/interrupt",
+                        "params": {"threadId": thread_id, "turnId": turn_id},
+                    }),
                     "thread_id": thread_id,
                     "turn_id": turn_id,
                     "next_request_id": 1000,
@@ -2399,8 +2425,9 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
         finish_agent_session(session_id, "completed", final)
         return final
     except Exception as exc:
-        cancelled = bool(task_id and (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") == "cancelled")
-        finish_agent_session(session_id, "cancelled" if cancelled else "failed", str(exc))
+        current_status = (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") if task_id else ""
+        stopped = current_status in ("cancelled", "paused_by_user", "pausing") or plan_is_paused(plan_id)
+        finish_agent_session(session_id, "cancelled" if stopped else "failed", str(exc))
         raise
     finally:
         with APP_SERVER_CONTROLS_LOCK:
@@ -2513,8 +2540,9 @@ def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_
     stdout, stderr = "".join(out), "".join(err)
     final = parse_codex_final(stdout)
     if code != 0:
-        cancelled = bool(task_id and (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") == "cancelled")
-        finish_agent_session(session_id, "cancelled" if cancelled else "failed", final)
+        current_status = (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") if task_id else ""
+        stopped = current_status in ("cancelled", "paused_by_user", "pausing") or plan_is_paused(plan_id)
+        finish_agent_session(session_id, "cancelled" if stopped else "failed", final)
         raise RuntimeError((stderr or stdout or f"process exit {code}")[-12000:])
     finish_agent_session(session_id, "completed", final)
     return final
@@ -2553,6 +2581,22 @@ def steer_app_server(task_id, message_id, prompt, image_paths=None):
         return False
 
 
+def interrupt_app_server(task_id):
+    """Ask an active App Server turn to stop without opening a new thread."""
+    with APP_SERVER_CONTROLS_LOCK:
+        control = APP_SERVER_CONTROLS.get(task_id)
+        interrupt = (control or {}).get("interrupt")
+    if not interrupt:
+        return False
+    try:
+        interrupt()
+        log(task_id, "supervisor", "interrupt requested; preserving this worker conversation for resume")
+        return True
+    except Exception as exc:
+        log(task_id, "stderr", f"App Server interrupt could not be sent: {exc}")
+        return False
+
+
 def orchestrator_models(requested):
     if requested == "auto-best":
         return ["gpt-6-astra", "gpt-5.6-sol"]
@@ -2573,6 +2617,10 @@ def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning
                 ), model
             except Exception as e:
                 err = str(e)
+                if task_id and plan_is_paused(infer_plan_id(task_id)):
+                    # A user pause must stop model fallback/retry as well. The
+                    # persisted mission state owns the later resume decision.
+                    raise
                 if attempt < transient_retries and is_transient_error(err):
                     attempt += 1
                     delay = 2 if attempt == 1 else 5
@@ -2747,11 +2795,12 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
             session = latest_orchestrator_session(plan_id) or {}
             usage = orchestrator_session_usage(session.get("id"))
             # A failed resume is attention, never a silent new conversation.
+            turn_status = "paused" if plan_is_paused(plan_id) else "attention"
             execute(
                 """UPDATE plans SET orchestrator_thread_id=COALESCE(NULLIF(orchestrator_thread_id,''),?),
                    orchestrator_turn_status=?,orchestrator_last_turn_id=?,
                    orchestrator_last_error=? WHERE id=?""",
-                (actual_thread, "attention", turn_id, message, plan_id),
+                (actual_thread, turn_status, turn_id, "" if turn_status == "paused" else message, plan_id),
             )
             execute(
                 """UPDATE orchestrator_turns SET thread_id=?,turn_id=?,status=?,usage_json=?,error=?,finished_at=? WHERE id=?""",
@@ -2799,6 +2848,7 @@ AVAILABLE WORKER PROFILES:
 
 Return ONLY valid JSON with this exact shape:
 {{
+  "title": "short meaningful mission title, without implementation detail",
   "decision": "already_satisfied|answer_only|needs_user_input|blocked|execute",
   "reason": "short reason for the disposition",
   "evidence": ["workspace facts or checks actually inspected"],
@@ -2828,6 +2878,7 @@ Return ONLY valid JSON with this exact shape:
 }}
 
 Rules:
+- `title` should be a concise human-readable label for the mission, not a copy of the full prompt.
 - `tasks` may contain 0-12 tasks.
 - Use `already_satisfied` only when evidence proves the requested outcome already holds.
 - Use `answer_only` for a direct explanation/report that does not require a worker.
@@ -2864,6 +2915,22 @@ def extract_json(text):
     if not m:
         raise ValueError("Orchestrator geçerli JSON döndürmedi")
     return json.loads(m.group(0))
+
+
+def deterministic_mission_title(goal):
+    """Create a short stable UI title when the planner did not provide one."""
+    text = re.sub(r"\s+", " ", str(goal or "").replace("\u200b", " ")).strip()
+    if not text:
+        return "New mission"
+    # Keep the first complete thought where possible; this is intentionally
+    # deterministic so a transient planner response cannot rename a mission.
+    sentence = re.split(r"(?<=[.!?])\s+|\n+", text, maxsplit=1)[0].strip(" .!?-:")
+    sentence = re.sub(r"^(?:öncelikle|lütfen|please|şunu|bunu)\s+", "", sentence, flags=re.I).strip()
+    if not sentence:
+        sentence = text
+    if len(sentence) > 78:
+        sentence = sentence[:78].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return sentence or "New mission"
 
 
 def normalize_planner_result(obj):
@@ -2904,7 +2971,11 @@ def normalize_planner_result(obj):
         final_response = reason
     if decision in ("already_satisfied", "answer_only") and not final_response:
         final_response = reason
+    title = str(obj.get("title") or "").strip()
+    if len(title) > 120:
+        title = title[:120].rsplit(" ", 1)[0].rstrip(" ,;:-")
     return {
+        "title": title,
         "decision": decision,
         "reason": reason,
         "evidence": evidence,
@@ -3059,16 +3130,19 @@ NON-NEGOTIABLE WORK RULES:
 """
 
 
-def task_model(plan, agent):
-    return (agent.get("model") or "").strip() or plan.get("worker_model") or DEFAULT_WORKER
+def task_model(plan, agent, task=None):
+    task = task or {}
+    return (task.get("model_override") or "").strip() or (agent.get("model") or agent.get("agent_model") or "").strip() or plan.get("worker_model") or DEFAULT_WORKER
 
 
-def task_effort(plan, agent):
-    return (agent.get("reasoning_effort") or "").strip() or plan.get("worker_effort") or DEFAULT_WORKER_EFFORT
+def task_effort(plan, agent, task=None):
+    task = task or {}
+    return (task.get("reasoning_effort_override") or "").strip() or (agent.get("reasoning_effort") or agent.get("agent_effort") or "").strip() or plan.get("worker_effort") or DEFAULT_WORKER_EFFORT
 
 
-def task_tier(plan, agent):
-    return (agent.get("service_tier") or "").strip() or plan.get("worker_tier") or DEFAULT_WORKER_TIER
+def task_tier(plan, agent, task=None):
+    task = task or {}
+    return (task.get("service_tier_override") or "").strip() or (agent.get("service_tier") or agent.get("agent_tier") or "").strip() or plan.get("worker_tier") or DEFAULT_WORKER_TIER
 
 
 def sanitize_branch_component(text):
@@ -3126,6 +3200,27 @@ def prepare_integration(plan):
 
 def create_worker_worktree(ctx, plan, task, base_commit):
     base_dir, _ = plan_paths(plan["id"])
+    existing_workspace = Path(str(task.get("workspace") or "")).expanduser()
+    existing_branch = str(task.get("branch") or "").strip()
+    if existing_workspace.is_dir() and existing_branch:
+        # A paused worker owns this worktree. Reusing it preserves uncommitted
+        # progress and, more importantly, lets the same Codex thread continue
+        # without silently rebuilding the task from HEAD.
+        expected_root = (base_dir / f"task-{task['seq']+1}-{task['id']}").resolve()
+        detected = git_read(existing_workspace, "rev-parse", "--show-toplevel", check=False).stdout.strip()
+        worktree_root = Path(detected).expanduser().resolve() if detected else existing_workspace.resolve()
+        try:
+            existing_workspace.resolve().relative_to(worktree_root)
+        except ValueError:
+            worktree_root = existing_workspace.resolve()
+        # Only reuse a worktree that belongs to this mission/task. If an old
+        # path is stale or points elsewhere, the normal isolated worktree
+        # creation below is safer than deleting or mutating an unknown folder.
+        if worktree_root == expected_root or (
+            base_dir.resolve() in worktree_root.parents
+            and worktree_root.name == expected_root.name
+        ):
+            return worktree_root, existing_workspace.resolve(), existing_branch
     wt = base_dir / f"task-{task['seq']+1}-{task['id']}"
     branch = f"agentdock/{plan['id']}/task-{task['seq']+1}-{sanitize_branch_component(task['title'])}-{task['id']}"
     remove_worktree(ctx["repo_root"], wt)
@@ -3276,11 +3371,18 @@ def create_worker_consultation(plan, task, output):
 
 
 def run_task_once(plan, task, workspace, force_mode=None):
+    persisted = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+    if persisted:
+        task = persisted
+    if task.get("status") in ("paused_by_user", "pausing"):
+        return {"ok": False, "paused": True, "error": "User paused this worker"}
+    if task.get("status") == "cancelled":
+        return {"ok": False, "cancelled": True, "error": "User cancelled this worker"}
     agent = one("SELECT * FROM agents WHERE id=?", (task["agent_id"],)) or one("SELECT * FROM agents ORDER BY created_at LIMIT 1")
     mode = force_mode or task["mode"]
-    model = task_model(plan, agent)
-    effort = task_effort(plan, agent)
-    tier = task_tier(plan, agent)
+    model = task_model(plan, agent, task)
+    effort = task_effort(plan, agent, task)
+    tier = task_tier(plan, agent, task)
     existing_worker_thread = task.get("worker_thread_id") or (latest_agent_session(task["id"]) or {}).get("thread_id") or ""
     execute(
         "UPDATE tasks SET status=?, started_at=?, error=?, workspace=?,waiting_reason=? WHERE id=?",
@@ -3300,6 +3402,10 @@ def run_task_once(plan, task, workspace, force_mode=None):
             resume_thread_id=existing_worker_thread,
             session_kind="worker",
         )
+        current_status = (one("SELECT status FROM tasks WHERE id=?", (task["id"],)) or {}).get("status")
+        if current_status in ("paused_by_user", "pausing"):
+            write_mission_docs(plan["id"])
+            return {"ok": False, "paused": True, "error": "User paused this worker"}
         if task.get("worker_resume_message"):
             execute("UPDATE tasks SET worker_resume_message=? WHERE id=?", ("", task["id"]))
         latest = latest_agent_session(task["id"]) or {}
@@ -3332,6 +3438,13 @@ def run_task_once(plan, task, workspace, force_mode=None):
         return {"ok": True, "output": output}
     except Exception as e:
         current=one("SELECT status FROM tasks WHERE id=?",(task["id"],)) or {}
+        latest = latest_agent_session(task["id"]) or {}
+        worker_thread_id = latest.get("thread_id") or task.get("worker_thread_id") or ""
+        if worker_thread_id:
+            execute("UPDATE tasks SET worker_thread_id=? WHERE id=?", (worker_thread_id, task["id"]))
+        if current.get("status") in ("paused_by_user", "pausing"):
+            write_mission_docs(plan["id"])
+            return {"ok": False, "paused": True, "error": "User paused this worker"}
         if current.get("status")=="cancelled":
             write_mission_docs(plan["id"])
             return {"ok": False, "cancelled": True, "error": "User cancelled"}
@@ -3347,7 +3460,7 @@ def run_task_with_recovery(plan, task, workspace, force_mode=None):
     attempt = 0
     while True:
         result = run_task_once(plan, task, workspace, force_mode=force_mode)
-        if result.get("ok") or result.get("blocked") or result.get("waiting_for_orchestrator") or result.get("waiting_for_user"):
+        if result.get("ok") or result.get("blocked") or result.get("paused") or result.get("cancelled") or result.get("waiting_for_orchestrator") or result.get("waiting_for_user"):
             return result
         err = result.get("error") or ""
         kind = "transient" if is_transient_error(err) else "deterministic"
@@ -3363,6 +3476,13 @@ def run_task_with_recovery(plan, task, workspace, force_mode=None):
         time.sleep(delay)
 
 def run_parallel_task(plan, task, ctx, wave_base_commit):
+    persisted = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+    if persisted:
+        task = persisted
+    if task.get("status") in ("paused_by_user", "pausing"):
+        return {"task": task, "ok": False, "paused": True, "write": task.get("mode") == "write", "phase": "worker", "error": "User paused this worker"}
+    if task.get("status") == "cancelled":
+        return {"task": task, "ok": False, "cancelled": True, "write": task.get("mode") == "write", "phase": "worker", "error": "User cancelled this worker"}
     if task["mode"] == "write":
         try:
             wt, workspace, branch = create_worker_worktree(ctx, plan, task, wave_base_commit)
@@ -3370,12 +3490,20 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
             execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), now(), task["id"]))
             return {"task": task, "ok": False, "write": True, "phase": "worktree", "error": str(e)}
         result = run_task_with_recovery(plan, task, workspace)
-        commit_hash = ""
+        if result.get("paused"):
+            log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} paused by user; worktree and worker thread preserved")
+            return {"task": task, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch, **result}
+        # A previous interrupted/failed integration may already have produced
+        # a durable worker commit. Keep it as the checkpoint if the resumed
+        # turn has no additional file changes.
+        commit_hash = str(task.get("commit_hash") or "")
         if result["ok"]:
+            if (one("SELECT status FROM tasks WHERE id=?", (task["id"],)) or {}).get("status") in ("paused_by_user", "pausing"):
+                return {"task": task, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch, **result}
             try:
                 changed = validate_worker_changes(wt, task)
                 log(task["id"], "supervisor", f"contract path check passed · files={len(changed)}")
-                commit_hash = commit_worker_changes(wt, task)
+                commit_hash = commit_worker_changes(wt, task) or commit_hash
                 execute("UPDATE tasks SET commit_hash=? WHERE id=?", (commit_hash, task["id"]))
             except Exception as e:
                 result = {"ok": False, "phase": "contract", "error": f"Worker değişiklikleri contract kontrolünden geçemedi: {e}"}
@@ -3388,6 +3516,8 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
             (json.dumps(baseline, ensure_ascii=False), task["id"]),
         )
         result = run_task_with_recovery(plan, task, ctx["integration_workspace"], force_mode="read")
+        if result.get("paused"):
+            return {"task": task, "ok": False, "paused": True, "write": False, "phase": "worker", **result}
         if result.get("ok"):
             try:
                 after = validate_read_workspace(ctx["integration_workspace"], baseline=baseline)
@@ -3516,7 +3646,7 @@ def mark_read_result_done(result):
 def ready_tasks(plan_id, pending):
     ready = []
     for seq, task in sorted(pending.items()):
-        if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user"):
+        if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user", "pausing", "resuming"):
             continue
         deps = json.loads(task.get("depends_json") or "[]")
         if not deps:
@@ -3614,6 +3744,9 @@ def build_plan(plan_id):
     if not plan:
         return
     try:
+        if plan_is_paused(plan_id):
+            log(orchestrator_log_id(plan_id), "supervisor", "mission planning is paused; waiting for an explicit resume")
+            return
         # Capture repository/workspace facts before the model is asked to make
         # a disposition. This is read-only and is also shown as evidence.
         log(orchestrator_log_id(plan_id), "supervisor", "analyzing workspace before deciding whether tasks are needed")
@@ -3640,6 +3773,11 @@ def build_plan(plan_id):
         )
         text, used_model = turn["text"], turn["model"]
         obj = normalize_planner_result(extract_json(text))
+        if plan_is_paused(plan_id):
+            log(orchestrator_log_id(plan_id), "supervisor", "mission was paused before the disposition could be materialized")
+            write_mission_docs(plan_id)
+            return
+        mission_title = obj.get("title") or deterministic_mission_title(plan.get("goal"))
         items = obj["tasks"]
         valid_ids = {a["id"] for a in agents}
         disposition = obj["decision"]
@@ -3679,9 +3817,9 @@ def build_plan(plan_id):
             error = obj["reason"] if disposition == "blocked" else ""
             finished = now() if status == "done" else None
             execute(
-                "UPDATE plans SET decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,summary=?,error=?,status=?,orchestrator_used=?,finished_at=? WHERE id=?",
+                "UPDATE plans SET title=?,decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,summary=?,error=?,status=?,orchestrator_used=?,finished_at=? WHERE id=?",
                 (
-                    disposition, obj["reason"], json.dumps(obj["evidence"], ensure_ascii=False),
+                    mission_title, disposition, obj["reason"], json.dumps(obj["evidence"], ensure_ascii=False),
                     json.dumps(obj["questions"], ensure_ascii=False), obj["final_response"], summary,
                     error, status, used_model, finished, plan_id,
                 ),
@@ -3714,17 +3852,22 @@ def build_plan(plan_id):
             dep_label = ",".join(str(d + 1) for d in deps) or "none"
             log(orchestrator_log_id(plan_id), "supervisor", f"TASK-{i+1:03d} · {task_title} · {mode} · deps={dep_label}")
         execute(
-            "UPDATE plans SET decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,status=?,orchestrator_used=?,error=?,finished_at=NULL WHERE id=?",
+            "UPDATE plans SET title=?,decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,status=?,orchestrator_used=?,error=?,finished_at=NULL WHERE id=?",
             (
-                disposition, obj["reason"], json.dumps(obj["evidence"], ensure_ascii=False),
+                mission_title, disposition, obj["reason"], json.dumps(obj["evidence"], ensure_ascii=False),
                 json.dumps(obj["questions"], ensure_ascii=False), obj["final_response"], "planned", used_model, "", plan_id,
             ),
         )
         log(orchestrator_log_id(plan_id), "supervisor", f"execution plan ready · {len(items)} task(s)")
         write_mission_docs(plan_id)
     except Exception as e:
-        execute("UPDATE plans SET status=?, error=? WHERE id=?", ("attention", str(e), plan_id))
-        log(orchestrator_log_id(plan_id), "supervisor", f"planning failed: {e}")
+        current_plan = one("SELECT * FROM plans WHERE id=?", (plan_id,)) or {}
+        if current_plan.get("status") in ("paused", "pausing") or int(current_plan.get("paused") or 0):
+            execute("UPDATE plans SET status=?,error='',finished_at=NULL WHERE id=?", ("paused", plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", "mission planning paused; no new task graph was created")
+        else:
+            execute("UPDATE plans SET status=?, error=? WHERE id=?", ("attention", str(e), plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", f"planning failed: {e}")
         write_mission_docs(plan_id)
 
 
@@ -3803,9 +3946,9 @@ def simulate_demo_task(plan, task_id, reasoning, command, file_changes=None, dur
     if not task:
         return
     agent = one("SELECT * FROM agents WHERE id=?", (task.get("agent_id"),)) or {}
-    model = task_model(plan, agent)
-    effort = task_effort(plan, agent)
-    tier = task_tier(plan, agent)
+    model = task_model(plan, agent, task)
+    effort = task_effort(plan, agent, task)
+    tier = task_tier(plan, agent, task)
     started = now()
     execute("UPDATE tasks SET status=?,started_at=?,error=? WHERE id=?", ("running", started, "", task_id))
     sid = create_agent_session(plan["id"], task_id, "demo-worker", model, effort, tier, task.get("mode") or "read", plan["workspace"])
@@ -3824,9 +3967,9 @@ def simulate_demo_task(plan, task_id, reasoning, command, file_changes=None, dur
     demo_event(sid, task_id, plan["id"], {"type":"item.started","item":{"id":cmd_id,"type":"command_execution","command":command,"aggregated_output":"","status":"in_progress"}})
     log(task_id, "stdout", f"$ {command}")
     time.sleep(max(0.2, duration * 0.45))
-    if (one("SELECT status FROM tasks WHERE id=?",(task_id,)) or {}).get("status")=="cancelled":
+    if (one("SELECT status FROM tasks WHERE id=?",(task_id,)) or {}).get("status") in ("cancelled", "paused_by_user") or plan_is_paused(plan["id"]):
         finish_agent_session(sid,"cancelled","User stopped demo agent")
-        log(task_id,"manual","demo agent stopped by user")
+        log(task_id,"manual","demo agent paused by user")
         return
     demo_event(sid, task_id, plan["id"], {"type":"item.completed","item":{"id":cmd_id,"type":"command_execution","command":command,"aggregated_output":"demo command completed successfully\n","exit_code":0,"status":"completed"}})
     if file_changes:
@@ -3839,9 +3982,9 @@ def simulate_demo_task(plan, task_id, reasoning, command, file_changes=None, dur
         {"text":"Verify the result","completed":True},
     ]}})
     time.sleep(max(0.2, duration * 0.55))
-    if (one("SELECT status FROM tasks WHERE id=?",(task_id,)) or {}).get("status")=="cancelled":
+    if (one("SELECT status FROM tasks WHERE id=?",(task_id,)) or {}).get("status") in ("cancelled", "paused_by_user") or plan_is_paused(plan["id"]):
         finish_agent_session(sid,"cancelled","User stopped demo agent")
-        log(task_id,"manual","demo agent stopped by user")
+        log(task_id,"manual","demo agent paused by user")
         return
     # Demo-mode queued steering: messages sent while Working become the next turn.
     for msg in queued_messages(task_id):
@@ -3875,7 +4018,7 @@ def build_demo_plan(plan_id):
         insert_demo_task(plan_id, 1, "Implement the primary change", "coder", "write", [0], demo_contract(goal, "Coder", "Implement the primary requested change inside the orchestrator-defined scope.", ["src/**", "tests/**"], ["Read architect findings", "Apply the smallest focused change", "Run targeted verification"], ["Requested behavior is implemented", "Diff stays focused", "Targeted checks pass"], ["git diff --check", "targeted test command"]))
         insert_demo_task(plan_id, 2, "Add focused verification", "tester", "write", [0], demo_contract(goal, "Tester", "Add or update the smallest meaningful verification for the requested outcome.", ["tests/**", "src/** only when test fixtures require it"], ["Identify the regression boundary", "Add focused coverage", "Run the relevant test slice"], ["Coverage demonstrates the requested behavior", "Verification passes"], ["targeted test command"]))
         insert_demo_task(plan_id, 3, "Review the integrated result", "reviewer", "read", [1,2], demo_contract(goal, "Reviewer", "Independently review the integrated result for scope compliance, regressions and missing verification.", ["workspace/** (read-only)"], ["Inspect integrated diff", "Check acceptance criteria", "Report residual risks"], ["No critical regression is found", "Verification result is explicit"], ["git diff --check", "test summary"]))
-        execute("UPDATE plans SET status=?,decision=?,decision_reason=?,evidence_json=?,final_response=?,orchestrator_used=? WHERE id=?", ("planned", "execute", "Demo preview intentionally exercises the execution path.", json.dumps(["Local demo simulator selected; no Codex worker was called."], ensure_ascii=False), "", plan["orchestrator_model"], plan_id))
+        execute("UPDATE plans SET title=?,status=?,decision=?,decision_reason=?,evidence_json=?,final_response=?,orchestrator_used=? WHERE id=?", (deterministic_mission_title(goal), "planned", "execute", "Demo preview intentionally exercises the execution path.", json.dumps(["Local demo simulator selected; no Codex worker was called."], ensure_ascii=False), "", plan["orchestrator_model"], plan_id))
         record_control_event(plan_id, "agentdock.disposition", {"decision": "execute", "reason": "Demo preview intentionally exercises the execution path.", "evidence": ["Local demo simulator selected; no Codex worker was called."], "task_count": 4})
         demo_event(sid, oid, plan_id, {"type":"item.completed","item":{"id":"orch-plan","type":"todo_list","items":[{"text":"Define safe task boundaries","completed":True},{"text":"Wait for user plan review","completed":False},{"text":"Execute approved task graph","completed":False}]}})
         demo_event(sid, oid, plan_id, {"type":"item.completed","item":{"id":"orch-msg","type":"agent_message","text":"Preview plan ready. Review task scope, dependencies, and agent assignments before starting execution."}})
@@ -3903,12 +4046,21 @@ def run_demo_execution(plan_id):
         log(oid,'supervisor','user approved plan · starting demo execution')
         # task 1
         simulate_demo_task(plan, byseq[0]['id'], "I am mapping the requested outcome to a narrow file and behavior boundary before implementation begins.", "rg --files | head -40", duration=2.0)
+        if plan_is_paused(plan_id):
+            write_mission_docs(plan_id)
+            return
         log(oid, "supervisor", "launching approved parallel preview wave: TASK-002 + TASK-003")
         th1=threading.Thread(target=simulate_demo_task,args=(plan,byseq[1]['id'],"The contract is explicit, so I can implement the focused change without making product or architecture decisions.","git diff --check"),kwargs={"file_changes":[{"path":"src/example.py","kind":"update"}],"duration":4.0},daemon=True)
         th2=threading.Thread(target=simulate_demo_task,args=(plan,byseq[2]['id'],"I am adding the smallest regression check that proves the requested behavior while avoiding unrelated coverage expansion.","python3 -m unittest discover -s tests"),kwargs={"file_changes":[{"path":"tests/test_example.py","kind":"add"}],"duration":4.0},daemon=True)
         th1.start(); th2.start(); th1.join(); th2.join()
+        if plan_is_paused(plan_id):
+            write_mission_docs(plan_id)
+            return
         log(oid,'supervisor','parallel wave complete · starting independent review')
         simulate_demo_task(plan,byseq[3]['id'],"I am reviewing the simulated integrated result against the execution contracts and verification evidence.","git diff --check && python3 -m unittest discover -s tests",duration=2.5)
+        if plan_is_paused(plan_id):
+            write_mission_docs(plan_id)
+            return
         final_tasks=rows("SELECT status FROM tasks WHERE plan_id=?",(plan_id,))
         all_done=bool(final_tasks) and all(t['status']=='done' for t in final_tasks)
         summary='Demo preview completed successfully. All activity was simulated locally and used no Codex quota.' if all_done else 'Demo mission stopped with one or more tasks requiring attention.'
@@ -4068,6 +4220,20 @@ def worker_resume_message(response, contract):
     )
 
 
+def same_worker_resume_handoff(task, instruction="Continue the same task from your last durable checkpoint."):
+    """Build the durable context sent when a worker continues its own thread."""
+    thread_id = str(task.get("worker_thread_id") or "").strip()
+    if not thread_id:
+        thread_id = str((latest_agent_session(task.get("id")) or {}).get("thread_id") or "").strip()
+    checkpoint = str(task.get("output") or "").strip()[-6000:]
+    return (
+        f"{instruction}\n"
+        f"Existing worker thread: {thread_id or 'not yet bound'}\n"
+        f"Last checkpoint/output:\n{checkpoint or 'No textual checkpoint was recorded.'}\n"
+        "Do not create a new session and do not redo completed work."
+    )
+
+
 def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=None):
     """Ask the same orchestrator thread to resolve a worker's structured question."""
     fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
@@ -4080,10 +4246,11 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
     if not consultation:
         return {"ok": False, "error": "Worker consultation record not found."}
     payload = _consultation_payload(consultation)
-    if ctx and (result or {}).get("write") and (result or {}).get("wt"):
-        remove_worktree(ctx["repo_root"], result["wt"])
-        if (result or {}).get("branch"):
-            delete_branch(ctx["repo_root"], result["branch"])
+    # Keep a write worker's isolated worktree alive while the orchestrator is
+    # deciding. The worker may have uncommitted progress and must resume that
+    # exact checkout after the handoff; cleanup belongs to successful
+    # integration or an explicit terminal cleanup path, never to a
+    # consultation boundary.
     purpose = "user_answer" if user_answer else "worker_consultation"
     answer_images = []
     if isinstance(user_answer, dict):
@@ -4295,10 +4462,16 @@ def resolve_worker_failure(plan, task, result, ctx=None):
     count = int(fresh.get("repair_count") or 0)
     if count >= 1:
         return False
-    if result.get("write") and result.get("wt") and ctx:
-        remove_worktree(ctx["repo_root"], result["wt"])
-        if result.get("branch"):
-            delete_branch(ctx["repo_root"], result["branch"])
+    worker_thread_id = str(fresh.get("worker_thread_id") or (latest_agent_session(fresh["id"]) or {}).get("thread_id") or "").strip()
+    if fresh.get("worker_resume_message") and not worker_thread_id:
+        message = "Worker conversation could not be resumed; explicit task recovery is required."
+        execute("UPDATE tasks SET status=?,error=?,repair_count=? WHERE id=?", ("attention", message, count + 1, fresh["id"]))
+        log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} recovery stopped without opening a new worker session")
+        write_mission_docs(plan["id"])
+        return False
+    # Preserve the worker checkout and thread while the orchestrator diagnoses
+    # a bounded failure. If the contract is revised, run_parallel_task will
+    # reuse this task's worktree and resume the same Codex conversation.
     log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} failed; root orchestrator is diagnosing one bounded recovery attempt")
     execute("UPDATE plans SET recovery_count=recovery_count+1 WHERE id=?", (plan["id"],))
     try:
@@ -4315,8 +4488,15 @@ def resolve_worker_failure(plan, task, result, ctx=None):
         if obj.get("action") in ("revise_contract", "answer_worker") and isinstance(obj.get("revised_contract"), dict) and obj.get("revised_contract"):
             contract = obj["revised_contract"]
             execute(
-                "UPDATE tasks SET contract_json=?, instructions=?, status='pending', error='', output='', started_at=NULL, finished_at=NULL, repair_count=? WHERE id=?",
-                (json.dumps(contract, ensure_ascii=False), contract.get("objective") or fresh.get("instructions") or "", count + 1, task["id"]),
+                "UPDATE tasks SET contract_json=?, instructions=?, status='pending', error='', output='', started_at=NULL, finished_at=NULL, repair_count=?, worker_thread_id=?, worker_resume_message=? WHERE id=?",
+                (
+                    json.dumps(contract, ensure_ascii=False),
+                    contract.get("objective") or fresh.get("instructions") or "",
+                    count + 1,
+                    worker_thread_id,
+                    same_worker_resume_handoff(fresh, "The previous worker turn failed. Continue the same task after applying this clarified contract."),
+                    task["id"],
+                ),
             )
             log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} recovery contract revised by {used}; worker will retry once")
             write_mission_docs(plan["id"])
@@ -4429,6 +4609,9 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
         release_plan_run(plan_id)
         return
     try:
+        if plan.get("status") in ("paused", "pausing") or int(plan.get("paused") or 0):
+            log(orchestrator_log_id(plan_id), "supervisor", "mission is paused; execution will resume only after an explicit user action")
+            return
         if int(plan.get("demo_mode") or 0):
             return run_demo_execution(plan_id)
         if plan.get("status") not in ("approved", "attention", "waiting_for_user"):
@@ -4446,6 +4629,16 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             write_mission_docs(plan_id)
             return
         tasks = all_tasks
+        # A worker resume is a short-lived control state. Once the mission
+        # runner owns the next turn, make it schedulable again while keeping
+        # the persisted worker_thread_id and resume handoff intact.
+        if any(t.get("status") == "resuming" for t in tasks):
+            execute(
+                "UPDATE tasks SET status='pending',error='',finished_at=NULL WHERE plan_id=? AND status='resuming'",
+                (plan_id,),
+            )
+            all_tasks = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
+            tasks = all_tasks
         if read_only_only:
             # A read-only continuation may run a safe read subgraph, but must
             # not pretend that write tasks (or reads depending on writes) are
@@ -4493,6 +4686,10 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             log(orchestrator_log_id(plan_id), "supervisor", "execution stopped by a safety preflight blocker")
             write_mission_docs(plan_id)
             return
+        if plan_is_paused(plan_id):
+            log(orchestrator_log_id(plan_id), "supervisor", "mission pause arrived during preflight; no worker wave was started")
+            write_mission_docs(plan_id)
+            return
         execute("UPDATE plans SET status=? WHERE id=?", ("running", plan_id))
         log(orchestrator_log_id(plan_id), "supervisor", "mission execution started")
         write_mission_docs(plan_id)
@@ -4532,6 +4729,10 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
         max_parallel = max(1, min(int(plan.get("max_parallel") or 4), MAX_PARALLEL_HARD))
 
         while pending:
+            if plan_is_paused(plan_id):
+                log(orchestrator_log_id(plan_id), "supervisor", "mission paused before the next worker wave")
+                write_mission_docs(plan_id)
+                return
             ready = ready_tasks(plan_id, pending)
             if not ready:
                 # Resolve queued worker consultations only after all currently
@@ -4547,9 +4748,13 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     return
                 waiting = [
                     task for task in pending.values()
-                    if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user")
+                    if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user")
                 ]
                 if waiting:
+                    if any(task.get("status") == "paused_by_user" for task in waiting):
+                        summary = "A worker is paused by you. Resume that worker to continue the dependent work."
+                        execute("UPDATE plans SET status=?,summary=?,error=?,finished_at=NULL WHERE id=?", ("attention", summary, "A worker is paused by the user.", plan_id))
+                        log(orchestrator_log_id(plan_id), "supervisor", summary)
                     log(orchestrator_log_id(plan_id), "supervisor", "no runnable tasks; waiting consultations remain durable")
                     break
                 if pending:
@@ -4568,6 +4773,22 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                 futs = [pool.submit(run_parallel_task, plan, task, ctx, wave_base_commit) for task in wave]
                 results = [f.result() for f in futs]
 
+            if plan_is_paused(plan_id):
+                # Pause is durable and wins any race with a worker finishing.
+                # Preserve its worktree/thread checkpoint; never integrate a
+                # result after the user has paused the mission.
+                for result in results:
+                    paused_task = result["task"]
+                    current_task = one("SELECT status FROM tasks WHERE id=?", (paused_task["id"],)) or {}
+                    if current_task.get("status") not in ("done", "executed"):
+                        execute(
+                            "UPDATE tasks SET status=?,error=?,finished_at=NULL,commit_hash=CASE WHEN ?<>'' THEN ? ELSE commit_hash END WHERE id=?",
+                            ("paused_by_user", "Paused by user", result.get("commit") or "", result.get("commit") or "", paused_task["id"]),
+                        )
+                log(orchestrator_log_id(plan_id), "supervisor", "mission pause applied; worker checkpoints and thread ids were preserved")
+                write_mission_docs(plan_id)
+                return
+
             # Integrate only after the whole wave has completed, so workers truly run from the same snapshot.
             pause_for_user = False
             for result in sorted(results, key=lambda r: r["task"]["seq"]):
@@ -4575,6 +4796,11 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                 if result.get("cancelled"):
                     log(orchestrator_log_id(plan_id), "supervisor", f"TASK-{task['seq']+1:03d} stopped by user; mission will require attention")
                     pending.pop(task["seq"], None)
+                    continue
+                if result.get("paused"):
+                    execute("UPDATE tasks SET status=?,error=?,finished_at=NULL WHERE id=?", ("paused_by_user", "Paused by user", task["id"]))
+                    pending[task["seq"]] = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
+                    log(orchestrator_log_id(plan_id), "supervisor", f"TASK-{task['seq']+1:03d} paused by user; dependent tasks remain waiting")
                     continue
                 if pause_for_user and result.get("waiting_for_orchestrator"):
                     # Keep the durable consultation queued. It will be sent
@@ -4664,6 +4890,14 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             write_mission_docs(plan_id)
             return
 
+        paused_rows = [task for task in task_rows if task.get("status") == "paused_by_user"]
+        if paused_rows:
+            summary = "A worker is paused by you. Resume it to continue the mission."
+            execute("UPDATE plans SET status=?,summary=?,error=?,finished_at=NULL WHERE id=?", ("attention", summary, "A worker is paused by the user.", plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", summary)
+            write_mission_docs(plan_id)
+            return
+
         if not all_done:
             summary = "Mission paused because one or more tasks did not complete; final synthesis was deferred."
             current_error = (one("SELECT error FROM plans WHERE id=?", (plan_id,)) or {}).get("error") or ""
@@ -4721,6 +4955,12 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
         log(orchestrator_log_id(plan_id), "supervisor", "mission finished: " + ("done" if all_done else "attention"))
         write_mission_docs(plan_id)
     except Exception as e:
+        current_plan = one("SELECT * FROM plans WHERE id=?", (plan_id,)) or {}
+        if current_plan.get("status") in ("paused", "pausing") or int(current_plan.get("paused") or 0):
+            execute("UPDATE plans SET status=?,error=?,apply_error=?,finished_at=NULL WHERE id=?", ("paused", "", "", plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", "mission paused; the current turn ended without resetting completed tasks")
+            write_mission_docs(plan_id)
+            return
         end_usage = quota_status(force=True, wait=True)
         execute("UPDATE plans SET status=?, error=?, apply_status=?, apply_error=?, usage_end_json=?, finished_at=? WHERE id=?", ("attention", str(e), "failed" if plan.get("status") == "awaiting_apply" else "", str(e), json.dumps(end_usage), now(), plan_id))
         log(orchestrator_log_id(plan_id), "supervisor", f"mission attention: {e}")
@@ -4815,19 +5055,23 @@ def run_orchestrator_followup(plan_id, prompt, image_paths=None):
         time.sleep(0.35)
         log(oid, 'supervisor', 'demo orchestrator received the manual instruction; task assignments remain user-controlled in Plan Review')
         return
+    log(orchestrator_log_id(plan_id), 'manual', f'user → orchestrator: {prompt}')
     turn = run_mission_orchestrator_turn(
         plan_id,
         "manual_message",
         prompt,
         mode="read",
         images=image_paths or [],
-        requested_model=plan.get("orchestrator_used") or plan.get("orchestrator_model"),
+        # This is a new orchestrator turn, so use the current mission setting.
+        # The model used by the previous turn must not pin future turns after
+        # the user changes Runtime settings.
+        requested_model=plan.get("orchestrator_model"),
         transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
     )
     log(
         orchestrator_log_id(plan_id),
         "manual",
-        f"manual orchestrator follow-up completed on thread {turn.get('thread_id', '')[:12]}",
+        "orchestrator answered the conversation message on the same mission thread",
     )
 
 
@@ -4994,28 +5238,286 @@ def run_manual_followup(task_id, prompt, image_paths=None):
     if plan and int(plan.get("demo_mode") or 0):
         return run_demo_manual_followup(task_id, prompt, image_paths)
     latest = latest_agent_session(task_id)
-    thread_id = (latest or {}).get("thread_id") or ""
+    thread_id = str(task.get("worker_thread_id") or (latest or {}).get("thread_id") or "")
+    if not thread_id:
+        raise ValueError("Bu agent için devam ettirilecek Codex conversation bulunamadı.")
     workspace = task.get("workspace") or ""
+    mode = task.get("mode") or "read"
     if not workspace or not Path(workspace).is_dir():
-        raise ValueError("Bu task'ın izole worktree'si artık mevcut değil. Yeni bir mission/task açarak devam et.")
+        # Successful isolated worktrees are cleaned up after integration. A
+        # completed worker must still be conversationally resumable, so use
+        # the final workspace for a read-only follow-up instead of opening a
+        # new worker session or pretending the old worktree still exists.
+        workspace = str((plan or {}).get("integration_workspace") or "")
+        if not workspace or not Path(workspace).is_dir():
+            workspace = str((plan or {}).get("workspace") or "")
+        if not workspace or not Path(workspace).is_dir():
+            raise ValueError("Bu task için devam ettirilecek workspace artık mevcut değil.")
+        if mode == "write":
+            mode = "read"
+            log(task_id, "manual", "completed worker conversation continued in the final workspace read-only")
     agent = one("SELECT * FROM agents WHERE id=?", (task.get("agent_id"),)) or {}
-    model = task_model(plan, agent)
-    effort = task_effort(plan, agent)
-    tier = task_tier(plan, agent)
+    model = task_model(plan, agent, task)
+    effort = task_effort(plan, agent, task)
+    tier = task_tier(plan, agent, task)
     old_status = task.get("status") or "done"
-    execute("UPDATE tasks SET status=?, error=? WHERE id=?", ("running", "", task_id))
-    log(task_id, "manual", "manual control: user follow-up started")
+    execute("UPDATE tasks SET status=?, error=?,pause_reason='' WHERE id=?", ("running", "", task_id))
+    log(task_id, "manual", "conversation message started on the same worker thread")
     try:
-        out = run_codex(prompt, workspace, task.get("mode") or "read", model, task_id, effort, tier,
+        out = run_codex(prompt, workspace, mode, model, task_id, effort, tier,
                         images=image_paths or [], resume_thread_id=thread_id, session_kind="manual")
-        final_status = "done" if old_status in ("done", "executed", "cancelled", "failed", "blocked") else old_status
+        final_status = "cancelled" if old_status == "cancelled" else ("done" if old_status in ("done", "executed", "failed", "blocked", "paused_by_user") else old_status)
         execute("UPDATE tasks SET status=?, output=?, error=?, finished_at=? WHERE id=?", (final_status, out, "", now(), task_id))
-        log(task_id, "manual", "manual control: follow-up completed")
+        log(task_id, "manual", "conversation response completed")
         write_mission_docs(plan["id"])
     except Exception as e:
         execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("attention", str(e), now(), task_id))
-        log(task_id, "manual", f"manual control failed: {e}")
+        log(task_id, "manual", f"conversation response failed: {e}")
         write_mission_docs(plan["id"])
+
+
+def pause_task(task_id, reason="Paused by user"):
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise ValueError("Task bulunamadı")
+    if task.get("status") in ("done", "executed", "cancelled"):
+        raise ValueError("Bu task artık duraklatılamaz")
+    thread_id = str(task.get("worker_thread_id") or (latest_agent_session(task_id) or {}).get("thread_id") or "").strip()
+    execute(
+        "UPDATE tasks SET status=?,error=?,pause_reason=?,worker_thread_id=?,finished_at=NULL WHERE id=?",
+        ("paused_by_user", reason, "user", thread_id, task_id),
+    )
+    interrupt_app_server(task_id)
+    with RUNNERS_LOCK:
+        proc = RUNNERS.get(task_id)
+    if proc:
+        terminate_process(proc)
+    log(task_id, "manual", "worker paused by user; same conversation will be resumed on request")
+    log(orchestrator_log_id(task["plan_id"]), "supervisor", f"TASK-{task['seq']+1:03d} paused by user")
+    write_mission_docs(task["plan_id"])
+    return {"ok": True, "status": "paused_by_user", "thread_id": thread_id}
+
+
+def resume_task(task_id):
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise ValueError("Task bulunamadı")
+    if task.get("status") not in ("paused_by_user", "failed", "attention"):
+        raise ValueError("Bu task devam ettirilebilir durumda değil")
+    plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],))
+    if plan and plan.get("pending_question_id"):
+        raise ValueError("Mission önce bekleyen kullanıcı sorusunun cevabını bekliyor")
+    thread_id = str(task.get("worker_thread_id") or (latest_agent_session(task_id) or {}).get("thread_id") or "").strip()
+    if not thread_id:
+        message = "Worker conversation is unavailable; explicit task recovery is required."
+        execute("UPDATE tasks SET status=?,error=?,pause_reason=? WHERE id=?", ("attention", message, "resume_requires_thread", task_id))
+        log(task_id, "supervisor", message)
+        write_mission_docs(task["plan_id"])
+        return {"ok": False, "status": "attention", "error": message}
+    execute("UPDATE tasks SET worker_thread_id=? WHERE id=?", (thread_id, task_id))
+    resume_message = same_worker_resume_handoff(task)
+    execute(
+        "UPDATE tasks SET status=?,error=?,pause_reason='',worker_resume_message=?,finished_at=NULL WHERE id=?",
+        ("resuming", "", resume_message, task_id),
+    )
+    log(task_id, "manual", "worker resume requested; continuing the same conversation")
+    if plan:
+        log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} resume requested on the same worker thread")
+        write_mission_docs(plan["id"])
+        if plan.get("status") in ("attention", "waiting_for_user"):
+            execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("approved", "", plan["id"]))
+        if plan.get("status") not in ("running", "paused", "pausing") and claim_plan_run(plan["id"]):
+            threading.Thread(target=run_plan, args=(plan["id"],), kwargs={"claimed": True}, daemon=True).start()
+    return {"ok": True, "status": "resuming", "thread_id": thread_id}
+
+
+def pause_plan(plan_id, reason="Paused by user"):
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if plan.get("status") in ("done", "cancelled", "blocked", "paused", "pausing"):
+        raise ValueError("Bu mission duraklatılamaz")
+    if plan.get("pending_question_id"):
+        raise ValueError("Mission önce bekleyen kullanıcı sorusunun cevabını bekliyor")
+    execute(
+        "UPDATE plans SET status=?,paused=1,pause_reason=?,pause_requested_at=?,error='',finished_at=NULL WHERE id=?",
+        ("pausing", reason, now(), plan_id),
+    )
+    running_tasks = rows(
+        "SELECT * FROM tasks WHERE plan_id=? AND status IN ('running','resuming')",
+        (plan_id,),
+    )
+    for task in running_tasks:
+        thread_id = str(task.get("worker_thread_id") or (latest_agent_session(task["id"]) or {}).get("thread_id") or "").strip()
+        execute(
+            "UPDATE tasks SET status=?,error=?,pause_reason=?,worker_thread_id=?,worker_resume_message=?,finished_at=NULL WHERE id=?",
+            ("paused_by_user", reason, "mission", thread_id, same_worker_resume_handoff(task, "The mission was paused by the user. Resume this same task when the mission continues."), task["id"]),
+        )
+        interrupt_app_server(task["id"])
+        with RUNNERS_LOCK:
+            proc = RUNNERS.get(task["id"])
+        if proc:
+            terminate_process(proc)
+    orchestrator_id = orchestrator_log_id(plan_id)
+    interrupt_app_server(orchestrator_id)
+    with RUNNERS_LOCK:
+        orchestrator_proc = RUNNERS.get(orchestrator_id)
+    if orchestrator_proc:
+        terminate_process(orchestrator_proc)
+    execute("UPDATE plans SET status=? WHERE id=?", ("paused", plan_id))
+    log(orchestrator_id, "manual", "mission paused by user; active turns were interrupted and checkpoints preserved")
+    write_mission_docs(plan_id)
+    return {"ok": True, "status": "paused", "paused_tasks": len(running_tasks)}
+
+
+def resume_plan(plan_id):
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if plan.get("status") not in ("paused", "attention", "waiting_for_user"):
+        raise ValueError("Bu mission şu anda devam ettirilebilir durumda değil")
+    if plan.get("pending_question_id"):
+        raise ValueError("Mission önce bekleyen kullanıcı sorusunun cevabını bekliyor")
+    if not str(plan.get("decision") or "").strip():
+        # A pause can arrive during the initial disposition turn. Resume that
+        # turn as planning; do not send an empty plan into execution.
+        execute(
+            "UPDATE plans SET status='planning',paused=0,pause_reason='',error='',pause_requested_at=NULL,finished_at=NULL WHERE id=?",
+            (plan_id,),
+        )
+        log(orchestrator_log_id(plan_id), "manual", "mission planning resumed; continuing the same orchestrator conversation")
+        write_mission_docs(plan_id)
+        if claim_plan_run(plan_id):
+            threading.Thread(target=build_plan, args=(plan_id,), daemon=True).start()
+            return {"ok": True, "status": "resuming"}
+        return {"ok": False, "status": "planning", "message": "Mission is already planning."}
+    if not one("SELECT id FROM tasks WHERE plan_id=? LIMIT 1", (plan_id,)):
+        # A no-task disposition can be waiting for a user, blocked, or an
+        # attention state from a prior attempt. Resume it by asking the same
+        # orchestrator conversation for a fresh disposition; never send an
+        # empty graph through execution.
+        execute(
+            """UPDATE plans SET status='planning',paused=0,pause_reason='',error='',
+               decision='',decision_reason='',evidence_json='[]',questions_json='[]',
+               final_response='',summary='',pending_question_id='',pending_question_json='{}',
+               pause_requested_at=NULL,finished_at=NULL WHERE id=?""",
+            (plan_id,),
+        )
+        log(orchestrator_log_id(plan_id), "manual", "mission disposition reopened; re-evaluating without creating an empty task graph")
+        write_mission_docs(plan_id)
+        if claim_plan_run(plan_id):
+            threading.Thread(target=build_plan, args=(plan_id,), daemon=True).start()
+            return {"ok": True, "status": "resuming"}
+        return {"ok": False, "status": "planning", "message": "Mission is already planning."}
+    mission_paused = rows(
+        "SELECT * FROM tasks WHERE plan_id=? AND status='paused_by_user' AND pause_reason='mission'",
+        (plan_id,),
+    )
+    missing_threads = [
+        task for task in mission_paused
+        if not str(task.get("worker_thread_id") or (latest_agent_session(task["id"]) or {}).get("thread_id") or "").strip()
+    ]
+    if missing_threads:
+        message = "A paused worker has no resumable conversation; explicit task recovery is required."
+        for task in missing_threads:
+            execute(
+                "UPDATE tasks SET status=?,error=?,pause_reason=? WHERE id=?",
+                ("attention", message, "resume_requires_thread", task["id"]),
+            )
+        execute(
+            "UPDATE plans SET status=?,paused=0,pause_reason='',error=?,finished_at=NULL WHERE id=?",
+            ("attention", message, plan_id),
+        )
+        log(orchestrator_log_id(plan_id), "supervisor", message)
+        write_mission_docs(plan_id)
+        return {"ok": False, "status": "attention", "error": message}
+    for task in mission_paused:
+        thread_id = str(task.get("worker_thread_id") or (latest_agent_session(task["id"]) or {}).get("thread_id") or "").strip()
+        execute(
+            "UPDATE tasks SET worker_thread_id=?,status='pending',error='',pause_reason='',finished_at=NULL WHERE id=?",
+            (thread_id, task["id"]),
+        )
+    # Only tasks paused as part of the mission-wide action are resumed here;
+    # a worker paused individually remains paused until its own Resume action.
+    execute(
+        "UPDATE tasks SET status='pending',error='',finished_at=NULL WHERE plan_id=? AND status='resuming'",
+        (plan_id,),
+    )
+    execute(
+        "UPDATE plans SET status=?,paused=0,pause_reason='',error='',pause_requested_at=NULL,resume_count=resume_count+1,finished_at=NULL WHERE id=?",
+        ("approved", plan_id),
+    )
+    log(orchestrator_log_id(plan_id), "manual", "mission resume requested; preserving completed tasks and conversation threads")
+    write_mission_docs(plan_id)
+    if claim_plan_run(plan_id):
+        threading.Thread(target=run_plan, args=(plan_id,), kwargs={"claimed": True}, daemon=True).start()
+        return {"ok": True, "status": "resuming"}
+    return {"ok": False, "status": "running", "message": "Mission is already running."}
+
+
+def mission_config(plan_id, data):
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    values = {
+        "orchestrator_model": (data.get("orchestrator_model") or plan.get("orchestrator_model") or DEFAULT_ORCHESTRATOR).strip(),
+        "orchestrator_effort": (data.get("orchestrator_effort") or plan.get("orchestrator_effort") or DEFAULT_ORCHESTRATOR_EFFORT).strip(),
+        "orchestrator_tier": (data.get("orchestrator_tier") or plan.get("orchestrator_tier") or DEFAULT_ORCHESTRATOR_TIER).strip(),
+        "worker_model": (data.get("worker_model") or plan.get("worker_model") or DEFAULT_WORKER).strip(),
+        "worker_effort": (data.get("worker_effort") or plan.get("worker_effort") or DEFAULT_WORKER_EFFORT).strip(),
+        "worker_tier": (data.get("worker_tier") or plan.get("worker_tier") or DEFAULT_WORKER_TIER).strip(),
+    }
+    validate_runtime_config(values["orchestrator_model"], values["orchestrator_effort"], values["orchestrator_tier"], "Orchestrator")
+    validate_runtime_config(values["worker_model"], values["worker_effort"], values["worker_tier"], "Worker default")
+    max_parallel = max(1, min(int(data.get("max_parallel") or plan.get("max_parallel") or 4), MAX_PARALLEL_HARD))
+    apply_remaining = bool(data.get("apply_remaining"))
+    execute(
+        """UPDATE plans SET orchestrator_model=?,orchestrator_effort=?,orchestrator_tier=?,
+           worker_model=?,worker_effort=?,worker_tier=?,max_parallel=? WHERE id=?""",
+        (values["orchestrator_model"], values["orchestrator_effort"], values["orchestrator_tier"],
+         values["worker_model"], values["worker_effort"], values["worker_tier"], max_parallel, plan_id),
+    )
+    if apply_remaining:
+        execute(
+            """UPDATE tasks SET model_override=?,reasoning_effort_override=?,service_tier_override=?
+               WHERE plan_id=? AND status IN ('pending','paused_by_user','failed','attention','waiting_for_orchestrator','waiting_for_user','blocked','resuming')""",
+            (values["worker_model"], values["worker_effort"], values["worker_tier"], plan_id),
+        )
+    record_control_event(plan_id, "agentdock.mission_config", {"config": values, "max_parallel": max_parallel, "apply_remaining": apply_remaining})
+    log(orchestrator_log_id(plan_id), "manual", "mission runtime settings updated" + (" for remaining work" if apply_remaining else " for future turns"))
+    write_mission_docs(plan_id)
+    return {"ok": True, "config": {**values, "max_parallel": max_parallel}, "apply_remaining": apply_remaining}
+
+
+def restart_as_new_mission(plan_id):
+    source = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not source:
+        raise ValueError("Mission bulunamadı")
+    new_id = str(uuid.uuid4())[:8]
+    execute(
+        """INSERT INTO plans(
+           id,goal,title,workspace,planner_engine,status,created_at,orchestrator_model,
+           worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,
+           worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,
+           automation_mode,attachments_json,demo_mode
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            new_id, source.get("goal") or "", deterministic_mission_title(source.get("goal")),
+            source.get("workspace") or "", source.get("planner_engine") or "codex-chatgpt", "planning", now(),
+            source.get("orchestrator_model") or DEFAULT_ORCHESTRATOR, source.get("worker_model") or DEFAULT_WORKER,
+            int(source.get("max_parallel") or 4), str(mission_dir(new_id)), "{}",
+            source.get("orchestrator_effort") or DEFAULT_ORCHESTRATOR_EFFORT,
+            source.get("worker_effort") or DEFAULT_WORKER_EFFORT,
+            source.get("orchestrator_tier") or DEFAULT_ORCHESTRATOR_TIER,
+            source.get("worker_tier") or DEFAULT_WORKER_TIER,
+            source.get("recovery_json") or json.dumps(RECOVERY_DEFAULTS), source.get("workspace_id") or "",
+            source.get("automation_mode") or "auto", "[]", int(source.get("demo_mode") or 0),
+        ),
+    )
+    write_mission_docs(new_id)
+    worker = build_demo_plan if int(source.get("demo_mode") or 0) else build_plan
+    threading.Thread(target=worker, args=(new_id,), daemon=True).start()
+    return {"ok": True, "plan_id": new_id, "status": "planning"}
 
 
 def task_diff(task):
@@ -5032,6 +5534,47 @@ def task_diff(task):
         r = git(workspace, "diff", "--stat", "--patch", check=False)
         return (r.stdout or r.stderr)[-120000:]
     return "Diff is no longer available for this task worktree."
+
+
+def timeline_for(target_id):
+    """Merge Codex events, control logs and user messages into one feed."""
+    events = rows(
+        "SELECT id,session_id,ts,event_type,item_type,payload_json FROM agent_events WHERE task_id=? ORDER BY id DESC LIMIT 600",
+        (target_id,),
+    )
+    logs = rows(
+        "SELECT id,ts,stream,line FROM logs WHERE task_id=? AND stream IN ('stderr','manual','supervisor','system') ORDER BY id DESC LIMIT 600",
+        (target_id,),
+    )
+    messages = []
+    if not str(target_id).startswith("orchestrator:"):
+        messages = rows(
+            "SELECT id,ts,text,status,error,attachments_json FROM task_messages WHERE task_id=? ORDER BY ts DESC,id DESC LIMIT 200",
+            (target_id,),
+        )
+    items = []
+    for item in reversed(events):
+        item["kind"] = "event"
+        item["payload"] = safe_json(item.pop("payload_json", "{}"), {})
+        item["order"] = int(item.get("id") or 0)
+        items.append(item)
+    for item in reversed(messages):
+        item["kind"] = "message"
+        item["order"] = int(item.get("id") or 0) if str(item.get("id") or "").isdigit() else 0
+        item["attachments"] = safe_json(item.pop("attachments_json", "[]"), [])
+        items.append(item)
+    for item in reversed(logs):
+        item["kind"] = "log"
+        item["order"] = int(item.get("id") or 0)
+        items.append(item)
+    rank = {"event": 1, "message": 2, "log": 3}
+    items.sort(key=lambda item: (int(item.get("ts") or 0), rank.get(item.get("kind"), 9), item.get("order", 0)))
+    # The UI renders one terminal-like stream. Expose a stable display
+    # sequence after merging the three persisted sources so callers never
+    # need to guess which local table's id should win a timestamp tie.
+    for sequence, item in enumerate(items, 1):
+        item["sequence"] = sequence
+    return {"session": latest_agent_session(target_id), "items": items}
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -5125,9 +5668,14 @@ class Handler(SimpleHTTPRequestHandler):
                     (task["id"],),
                 )
                 task["recent_logs"] = list(reversed(latest))
-                task["effective_model"] = (task.get("agent_model") or "").strip() or plan.get("worker_model") or DEFAULT_WORKER
-                task["effective_effort"] = (task.get("agent_effort") or "").strip() or plan.get("worker_effort") or DEFAULT_WORKER_EFFORT
-                task["effective_tier"] = (task.get("agent_tier") or "").strip() or plan.get("worker_tier") or DEFAULT_WORKER_TIER
+                agent_settings = {
+                    "model": task.get("agent_model") or "",
+                    "reasoning_effort": task.get("agent_effort") or "",
+                    "service_tier": task.get("agent_tier") or "",
+                }
+                task["effective_model"] = task_model(plan, agent_settings, task)
+                task["effective_effort"] = task_effort(plan, agent_settings, task)
+                task["effective_tier"] = task_tier(plan, agent_settings, task)
                 task["contract"] = safe_json(task.get("contract_json"), {})
             orch_logs = rows("SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 24", (orchestrator_log_id(pid),))
             orchestrator = {
@@ -5170,6 +5718,9 @@ class Handler(SimpleHTTPRequestHandler):
         if p.startswith("/api/messages/"):
             tid=p.split("/api/messages/",1)[1]
             return self.send_json({"messages":rows("SELECT * FROM task_messages WHERE task_id=? ORDER BY ts,id",(tid,))})
+        if p.startswith("/api/timeline/"):
+            tid = p.split("/api/timeline/", 1)[1]
+            return self.send_json(timeline_for(tid))
         if p.startswith("/api/diff/"):
             tid = p.split("/api/diff/",1)[1]
             task = one("SELECT * FROM tasks WHERE id=?", (tid,))
@@ -5268,8 +5819,8 @@ class Handler(SimpleHTTPRequestHandler):
                         saved_attachments.append(save_attachment(pid, item.get("name") or "image.png", item.get("mime") or "image/png", item["data_base64"]))
                 attachment_paths = [a["path"] for a in saved_attachments]
                 execute(
-                    "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json,demo_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (pid, goal, ws["repo_path"], "demo-simulator", "planning", now(), orchestrator_model, worker_model, max_parallel, str(mission_dir(pid)), "{}", orchestrator_effort, worker_effort, orchestrator_tier, worker_tier, json.dumps(RECOVERY_DEFAULTS), workspace_id, "auto", json.dumps(attachment_paths), 1),
+                    "INSERT INTO plans(id,goal,title,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json,demo_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (pid, goal, deterministic_mission_title(goal), ws["repo_path"], "demo-simulator", "planning", now(), orchestrator_model, worker_model, max_parallel, str(mission_dir(pid)), "{}", orchestrator_effort, worker_effort, orchestrator_tier, worker_tier, json.dumps(RECOVERY_DEFAULTS), workspace_id, "auto", json.dumps(attachment_paths), 1),
                 )
                 execute("UPDATE workspaces SET last_opened_at=? WHERE id=?", (now(), workspace_id))
                 write_mission_docs(pid)
@@ -5318,9 +5869,9 @@ class Handler(SimpleHTTPRequestHandler):
                         saved_attachments.append(save_attachment(pid, item.get("name") or "image.png", item.get("mime") or "image/png", item["data_base64"]))
                 attachment_paths = [a["path"] for a in saved_attachments]
                 execute(
-                    "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO plans(id,goal,title,workspace,planner_engine,status,created_at,orchestrator_model,worker_model,max_parallel,mission_dir,usage_start_json,orchestrator_effort,worker_effort,orchestrator_tier,worker_tier,recovery_json,workspace_id,automation_mode,attachments_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        pid, goal, str(Path(workspace).expanduser().resolve()), "codex-chatgpt", "planning", now(),
+                        pid, goal, deterministic_mission_title(goal), str(Path(workspace).expanduser().resolve()), "codex-chatgpt", "planning", now(),
                         orchestrator_model, worker_model, max_parallel, str(mission_dir(pid)), "{}",
                         orchestrator_effort, worker_effort, orchestrator_tier, worker_tier,
                         json.dumps(recovery, ensure_ascii=False), workspace_id, automation_mode,
@@ -5342,6 +5893,58 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "Bu mission için başka bir işlem zaten çalışıyor."}, 409)
                 threading.Thread(target=run_plan, args=(pid,), kwargs={"claimed": True}, daemon=True).start()
                 return self.send_json({"ok": True})
+
+            if p.startswith("/api/mission-config/"):
+                pid = p.split("/api/mission-config/", 1)[1]
+                return self.send_json(mission_config(pid, data))
+
+            if p.startswith("/api/pause-plan/"):
+                pid = p.split("/api/pause-plan/", 1)[1]
+                return self.send_json(pause_plan(pid, (data.get("reason") or "Paused by user").strip()))
+
+            if p.startswith("/api/resume-plan/"):
+                pid = p.split("/api/resume-plan/", 1)[1]
+                return self.send_json(resume_plan(pid))
+
+            if p.startswith("/api/reopen-plan/"):
+                pid = p.split("/api/reopen-plan/", 1)[1]
+                plan = one("SELECT * FROM plans WHERE id=?", (pid,))
+                if not plan:
+                    raise ValueError("Mission bulunamadı")
+                if plan.get("status") != "done":
+                    raise ValueError("Yalnızca tamamlanmış mission yeniden açılabilir")
+                has_tasks = bool(one("SELECT id FROM tasks WHERE plan_id=? LIMIT 1", (pid,)))
+                if not has_tasks:
+                    execute(
+                        """UPDATE plans SET status='planning',error='',decision='',decision_reason='',
+                           evidence_json='[]',questions_json='[]',final_response='',summary='',
+                           pending_question_id='',pending_question_json='{}',started_at=NULL,
+                           finished_at=NULL WHERE id=?""",
+                        (pid,),
+                    )
+                    log(orchestrator_log_id(pid), "manual", "no-task mission reopened; re-evaluating disposition in the same orchestrator conversation")
+                    write_mission_docs(pid)
+                    if claim_plan_run(pid):
+                        threading.Thread(target=build_plan, args=(pid,), daemon=True).start()
+                    return self.send_json({"ok": True, "status": "planning"})
+                execute("UPDATE plans SET status=?,error='',finished_at=NULL WHERE id=?", ("approved", pid))
+                log(orchestrator_log_id(pid), "manual", "mission reopened by user; completed tasks remain checkpoints")
+                write_mission_docs(pid)
+                if claim_plan_run(pid):
+                    threading.Thread(target=run_plan, args=(pid,), kwargs={"claimed": True}, daemon=True).start()
+                return self.send_json({"ok": True, "status": "resuming"})
+
+            if p.startswith("/api/restart-plan/"):
+                pid = p.split("/api/restart-plan/", 1)[1]
+                return self.send_json(restart_as_new_mission(pid))
+
+            if p.startswith("/api/pause-task/"):
+                tid = p.split("/api/pause-task/", 1)[1]
+                return self.send_json(pause_task(tid))
+
+            if p.startswith("/api/resume-task/"):
+                tid = p.split("/api/resume-task/", 1)[1]
+                return self.send_json(resume_task(tid))
 
             if p.startswith("/api/reconsider-plan/"):
                 pid = p.split("/api/reconsider-plan/", 1)[1]
