@@ -244,6 +244,50 @@ for line in sys.stdin:
 
 
 class ExecutionTests(AgentDockTestCase):
+    def test_git_lock_warns_for_read_only_but_blocks_writes_without_deletion(self):
+        repo = self.tmp / "lock-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+        (repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"],
+            check=True, capture_output=True, text=True,
+        )
+        lock = repo / ".git" / "index.lock"
+        lock.write_text("")
+
+        read_plan_id = self.add_plan("read-lock-plan", status="approved")
+        agentdock.execute("UPDATE plans SET workspace=? WHERE id=?", (str(repo), read_plan_id))
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("read-lock-task", read_plan_id, 0, "Inspect", "Inspect", "architect", "read", "[]", "pending", "{}"),
+        )
+        write_plan_id = self.add_plan("write-lock-plan", status="approved")
+        agentdock.execute("UPDATE plans SET workspace=? WHERE id=?", (str(repo), write_plan_id))
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("write-lock-task", write_plan_id, 0, "Change", "Change", "coder", "write", "[]", "pending", "{}"),
+        )
+
+        real_which = agentdock.shutil.which
+        with patch.object(
+            agentdock.shutil,
+            "which",
+            side_effect=lambda name: "codex" if name == "codex" else real_which(name),
+        ):
+            read_report = agentdock.run_preflight(
+                agentdock.one("SELECT * FROM plans WHERE id=?", (read_plan_id,)), False
+            )
+            with self.assertRaises(agentdock.PreflightBlocked):
+                agentdock.run_preflight(
+                    agentdock.one("SELECT * FROM plans WHERE id=?", (write_plan_id,)), True
+                )
+
+        self.assertEqual(read_report["status"], "ready")
+        self.assertTrue(any("read-only execution" in item for item in read_report["warnings"]))
+        self.assertTrue(lock.exists())
+
     def test_blocked_preflight_exposes_safe_actions_without_file_selection(self):
         plan_id = self.add_plan("missing-codex", status="approved")
         agentdock.execute(

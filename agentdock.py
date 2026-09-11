@@ -661,7 +661,7 @@ def save_attachment(plan_id, name, mime, data_b64, task_id=""):
     return {"id": aid, "name": safe_name, "mime": mime, "path": str(path), "size": len(raw)}
 
 
-def shell(args, cwd=None, input_text=None, check=True, timeout=None):
+def shell(args, cwd=None, input_text=None, check=True, timeout=None, env=None):
     p = subprocess.run(
         args,
         cwd=str(cwd) if cwd else None,
@@ -670,6 +670,7 @@ def shell(args, cwd=None, input_text=None, check=True, timeout=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
+        env=env,
     )
     if check and p.returncode != 0:
         raise RuntimeError((p.stderr or p.stdout or f"exit {p.returncode}")[-12000:])
@@ -683,14 +684,24 @@ def git(cwd, *args, check=True, input_text=None):
     return shell([exe, "-C", str(cwd), *args], input_text=input_text, check=check)
 
 
+def git_read(cwd, *args, check=True, input_text=None):
+    """Run an observational Git command without optional index refresh locks."""
+    exe = shutil.which("git")
+    if not exe:
+        raise RuntimeError("git PATH içinde bulunamadı")
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return shell([exe, "-C", str(cwd), *args], input_text=input_text, check=check, env=env)
+
+
 def repo_info(workspace):
     workspace = Path(workspace).expanduser().resolve()
     try:
-        root = Path(git(workspace, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
-        head = git(root, "rev-parse", "HEAD").stdout.strip()
+        root = Path(git_read(workspace, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+        head = git_read(root, "rev-parse", "HEAD").stdout.strip()
         rel = workspace.relative_to(root)
-        dirty = bool(git(root, "status", "--porcelain").stdout.strip())
-        branch = git(root, "branch", "--show-current", check=False).stdout.strip()
+        dirty = bool(git_read(root, "status", "--porcelain").stdout.strip())
+        branch = git_read(root, "branch", "--show-current", check=False).stdout.strip()
         return {"is_git": True, "root": str(root), "head": head, "rel": str(rel), "dirty": dirty, "branch": branch}
     except Exception:
         return {"is_git": False, "root": str(workspace), "head": "", "rel": ".", "dirty": False}
@@ -711,7 +722,7 @@ def doctor_log_id(plan_id):
 
 def _git_dir(repo_root, common=False):
     arg = "--git-common-dir" if common else "--git-dir"
-    raw = git(repo_root, "rev-parse", arg).stdout.strip()
+    raw = git_read(repo_root, "rev-parse", arg).stdout.strip()
     p = Path(raw)
     if not p.is_absolute():
         p = (Path(repo_root) / p).resolve()
@@ -719,7 +730,7 @@ def _git_dir(repo_root, common=False):
 
 
 def git_status_entries(repo_root):
-    out = git(repo_root, "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+    out = git_read(repo_root, "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
     entries = []
     parts = [x for x in out.split("\0") if x]
     i = 0
@@ -743,11 +754,11 @@ def git_status_entries(repo_root):
 
 def git_remote_details(repo_root):
     """Return remote fetch/push URLs without changing Git configuration."""
-    names = [x.strip() for x in git(repo_root, "remote", check=False).stdout.splitlines() if x.strip()]
+    names = [x.strip() for x in git_read(repo_root, "remote", check=False).stdout.splitlines() if x.strip()]
     remotes = []
     for name in names:
-        fetch = [x.strip() for x in git(repo_root, "config", "--get-all", f"remote.{name}.url", check=False).stdout.splitlines() if x.strip()]
-        push = [x.strip() for x in git(repo_root, "config", "--get-all", f"remote.{name}.pushurl", check=False).stdout.splitlines() if x.strip()]
+        fetch = [x.strip() for x in git_read(repo_root, "config", "--get-all", f"remote.{name}.url", check=False).stdout.splitlines() if x.strip()]
+        push = [x.strip() for x in git_read(repo_root, "config", "--get-all", f"remote.{name}.pushurl", check=False).stdout.splitlines() if x.strip()]
         remotes.append({"name": name, "fetch_urls": fetch, "push_urls": push or fetch})
     return remotes
 
@@ -783,7 +794,7 @@ def workspace_snapshot(workspace):
     entries = git_status_entries(root)
     tracked = [f"{e['xy']} {e['path']}" for e in entries if e["xy"] != "??"]
     untracked = [e["path"] for e in entries if e["xy"] == "??"]
-    upstream = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False).stdout.strip()
+    upstream = git_read(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False).stdout.strip()
     remotes = git_remote_details(root)
     snapshot.update({
         "classification": "GIT_WITH_REMOTE" if remotes else "LOCAL_GIT",
@@ -996,7 +1007,7 @@ def run_preflight(plan, has_write, phase="execution"):
         # These checks are deliberately read-only. Even stale worktree metadata
         # and Git locks are reported for an explicit user decision; they are
         # never pruned or removed by preflight.
-        dry = git(repo_root, "worktree", "prune", "--dry-run", check=False).stdout.strip()
+        dry = git_read(repo_root, "worktree", "prune", "--dry-run", check=False).stdout.strip()
         if dry:
             report["warnings"].append("Stale Git worktree metadata is present; no automatic prune was performed.")
         else:
@@ -1010,7 +1021,11 @@ def run_preflight(plan, has_write, phase="execution"):
             age = max(0, time.time() - lock.stat().st_mtime)
             opened = _path_is_open(lock)
             owner = "active" if opened else ("ownership unknown" if opened is None else f"{int(age)}s old")
-            report["blockers"].append(f"Git lock requires explicit resolution ({owner}): {lock}")
+            message = f"Git lock detected ({owner}): {lock}"
+            if has_write:
+                report["blockers"].append(message + "; write execution requires explicit resolution")
+            else:
+                report["warnings"].append(message + "; read-only execution will not remove or modify it")
 
         entries = git_status_entries(repo_root)
         tracked = [f"{e['xy']} {e['path']}" for e in entries if e["xy"] != "??"]
@@ -2435,8 +2450,8 @@ def validate_worker_changes(worktree, task):
 
 
 def validate_read_workspace(workspace, expected_head):
-    current_head = git(workspace, "rev-parse", "HEAD", check=False).stdout.strip()
-    dirty = git(workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False).stdout.strip()
+    current_head = git_read(workspace, "rev-parse", "HEAD", check=False).stdout.strip()
+    dirty = git_read(workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False).stdout.strip()
     if current_head != expected_head or dirty:
         raise RuntimeError("Read-only task workspace'i değiştirdi; değişiklik güvenlik için entegre edilmedi.")
 
