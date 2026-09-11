@@ -315,6 +315,292 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
         self.assertIn("Do not invent contact details", captured["prompt"])
         self.assertEqual(agentdock.one("SELECT worker_resume_message,status FROM tasks WHERE id=?", (task_id,))["status"], "executed")
 
+    def test_manual_followup_preserves_canonical_execution_state(self):
+        plan = self._orchestrator_plan("manual-followup-state")
+        states = ("failed", "blocked", "paused_by_user", "done")
+        for index, status in enumerate(states):
+            task_id = f"manual-followup-{index}"
+            thread_id = f"worker-thread-{index}"
+            agentdock.execute(
+                """INSERT INTO tasks(
+                    id,plan_id,seq,title,instructions,agent_id,mode,status,output,error,
+                    commit_hash,integration_status,worker_thread_id,finished_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    task_id,
+                    plan["id"],
+                    index,
+                    "Manual follow-up",
+                    "Preserve the execution result",
+                    "coder",
+                    "write",
+                    status,
+                    f"canonical output {status}",
+                    f"canonical error {status}",
+                    f"commit-{index}",
+                    f"integration-{status}",
+                    thread_id,
+                    4242 + index,
+                ),
+            )
+            agentdock.execute(
+                "INSERT INTO agent_sessions(id,plan_id,task_id,kind,thread_id,status,started_at) VALUES(?,?,?,?,?,?,?)",
+                (f"manual-session-{index}", plan["id"], task_id, "worker", thread_id, "completed", agentdock.now()),
+            )
+            before = agentdock.one(
+                """SELECT status,output,error,commit_hash,integration_status,
+                          worker_thread_id,finished_at FROM tasks WHERE id=?""",
+                (task_id,),
+            )
+            captured = {}
+
+            def fake_codex(*args, **kwargs):
+                captured.update(kwargs)
+                return f"chat reply {status}"
+
+            with patch.object(agentdock, "run_codex", side_effect=fake_codex):
+                result = agentdock.run_manual_followup(task_id, "Why did this task stop?")
+
+            self.assertEqual(result, f"chat reply {status}")
+            self.assertEqual(captured["resume_thread_id"], thread_id)
+            self.assertEqual(captured["session_kind"], "manual")
+            after = agentdock.one(
+                """SELECT status,output,error,commit_hash,integration_status,
+                          worker_thread_id,finished_at FROM tasks WHERE id=?""",
+                (task_id,),
+            )
+            self.assertEqual(after, before)
+
+    def test_manual_followup_failure_does_not_turn_task_into_attention(self):
+        plan = self._orchestrator_plan("manual-followup-error")
+        task_id = "manual-followup-error-task"
+        agentdock.execute(
+            """INSERT INTO tasks(
+                id,plan_id,seq,title,instructions,agent_id,mode,status,output,error,
+                commit_hash,integration_status,worker_thread_id,finished_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                task_id,
+                plan["id"],
+                0,
+                "Failed write task",
+                "Preserve the failed execution checkpoint",
+                "coder",
+                "write",
+                "failed",
+                "canonical failed output",
+                "original execution error",
+                "failed-commit",
+                "conflict",
+                "failed-worker-thread",
+                5151,
+            ),
+        )
+        agentdock.execute(
+            "INSERT INTO agent_sessions(id,plan_id,task_id,kind,thread_id,status,started_at) VALUES(?,?,?,?,?,?,?)",
+            ("manual-error-session", plan["id"], task_id, "worker", "failed-worker-thread", "completed", agentdock.now()),
+        )
+        before = agentdock.one(
+            "SELECT status,output,error,commit_hash,integration_status,finished_at FROM tasks WHERE id=?",
+            (task_id,),
+        )
+
+        def fail_manual_turn(*args, **kwargs):
+            raise RuntimeError("manual conversation failed")
+
+        with patch.object(agentdock, "run_codex", side_effect=fail_manual_turn):
+            with self.assertRaisesRegex(RuntimeError, "manual conversation failed"):
+                agentdock.run_manual_followup(task_id, "Why did this task fail?")
+
+        after = agentdock.one(
+            "SELECT status,output,error,commit_hash,integration_status,finished_at FROM tasks WHERE id=?",
+            (task_id,),
+        )
+        self.assertEqual(after, before)
+
+    def test_demo_manual_followup_preserves_canonical_execution_state(self):
+        plan = self._orchestrator_plan("demo-followup-state")
+        agentdock.execute("UPDATE plans SET demo_mode=1 WHERE id=?", (plan["id"],))
+        task_id = "demo-followup-task"
+        agentdock.execute(
+            """INSERT INTO tasks(
+                id,plan_id,seq,title,instructions,agent_id,mode,status,output,error,
+                commit_hash,integration_status,worker_thread_id,finished_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                task_id,
+                plan["id"],
+                0,
+                "Completed demo task",
+                "Preserve the demo execution checkpoint",
+                "coder",
+                "write",
+                "done",
+                "canonical demo output",
+                "",
+                "demo-commit",
+                "integrated",
+                "demo-worker-thread",
+                6161,
+            ),
+        )
+        before = agentdock.one(
+            "SELECT status,output,error,commit_hash,integration_status,worker_thread_id,finished_at FROM tasks WHERE id=?",
+            (task_id,),
+        )
+
+        with patch.object(agentdock.time, "sleep"):
+            response = agentdock.run_demo_manual_followup(task_id, "Explain the completed result.")
+
+        self.assertIn("preserving the task contract", response)
+        self.assertEqual(
+            agentdock.one(
+                "SELECT status,output,error,commit_hash,integration_status,worker_thread_id,finished_at FROM tasks WHERE id=?",
+                (task_id,),
+            ),
+            before,
+        )
+        self.assertEqual(
+            agentdock.one("SELECT kind,thread_id,status FROM agent_sessions WHERE task_id=? ORDER BY rowid DESC LIMIT 1", (task_id,)),
+            {"kind": "demo-manual", "thread_id": "demo-worker-thread", "status": "completed"},
+        )
+
+    def test_queued_manual_followup_does_not_replace_execution_output(self):
+        plan = self._orchestrator_plan("queued-followup-state")
+        task_id = "queued-followup-task"
+        thread_id = "queued-worker-thread"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,status,output,worker_thread_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                plan["id"],
+                0,
+                "Read task",
+                "Run the contracted inspection",
+                "researcher",
+                "read",
+                "pending",
+                "",
+                thread_id,
+            ),
+        )
+        agentdock.execute(
+            "INSERT INTO agent_sessions(id,plan_id,task_id,kind,thread_id,status,started_at) VALUES(?,?,?,?,?,?,?)",
+            ("queued-worker-session", plan["id"], task_id, "worker", thread_id, "completed", agentdock.now()),
+        )
+        message_id = "queued-followup-message"
+        agentdock.execute(
+            "INSERT INTO task_messages(id,task_id,plan_id,ts,text,status) VALUES(?,?,?,?,?,?)",
+            (message_id, task_id, plan["id"], agentdock.now(), "Please explain the result.", "queued"),
+        )
+        task = agentdock.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        calls = []
+
+        def fake_codex(*args, **kwargs):
+            calls.append(kwargs.get("session_kind"))
+            return "canonical execution result" if len(calls) == 1 else "manual chat reply"
+
+        with patch.object(agentdock, "run_codex", side_effect=fake_codex):
+            result = agentdock.run_task_once(plan, task, self.tmp)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(calls, ["worker", "manual"])
+        self.assertEqual(result["output"], "canonical execution result")
+        self.assertEqual(
+            agentdock.one("SELECT status,output FROM tasks WHERE id=?", (task_id,)),
+            {"status": "executed", "output": "canonical execution result"},
+        )
+        self.assertEqual(
+            agentdock.one("SELECT status,error FROM task_messages WHERE id=?", (message_id,)),
+            {"status": "delivered", "error": ""},
+        )
+
+    def test_pausing_consultation_stays_queued_after_orchestrator_interrupt(self):
+        plan = self._orchestrator_plan("paused-consultation")
+        task_id = "paused-consultation-task"
+        consultation_id = "paused-consultation-record"
+        agentdock.execute(
+            """INSERT INTO tasks(
+                id,plan_id,seq,title,instructions,agent_id,mode,status,waiting_reason,
+                consultation_id,worker_thread_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                task_id,
+                plan["id"],
+                0,
+                "Needs orchestrator decision",
+                "Wait for the orchestrator",
+                "coder",
+                "write",
+                "waiting_for_orchestrator",
+                "Which contact behavior is allowed?",
+                consultation_id,
+                "worker-consult-thread",
+            ),
+        )
+        agentdock.execute(
+            """INSERT INTO consultations(
+                id,plan_id,task_id,status,question,reason,evidence_json,options_json,
+                worker_thread_id,orchestrator_response_json,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                consultation_id,
+                plan["id"],
+                task_id,
+                "queued",
+                "Which contact behavior is allowed?",
+                "No verified contact details exist.",
+                json.dumps(["No mailto or tel link was found"]),
+                json.dumps(["Omit the field", "Use the existing tool"]),
+                "worker-consult-thread",
+                "{}",
+                agentdock.now(),
+            ),
+        )
+        task = agentdock.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+
+        def interrupt_consultation(*args, **kwargs):
+            agentdock.execute(
+                "UPDATE plans SET status=?,paused=1,pause_reason=? WHERE id=?",
+                ("pausing", "Paused by user", plan["id"]),
+            )
+            raise RuntimeError("orchestrator turn interrupted by pause")
+
+        with patch.object(agentdock, "run_mission_orchestrator_turn", side_effect=interrupt_consultation):
+            result = agentdock.resolve_worker_consultation(
+                plan,
+                task,
+                result={"consultation_id": consultation_id, "waiting_for_orchestrator": True},
+            )
+
+        self.assertTrue(result["paused"])
+        self.assertTrue(result["deferred"])
+        preserved_task = agentdock.one(
+            "SELECT status,error,waiting_reason,finished_at FROM tasks WHERE id=?",
+            (task_id,),
+        )
+        self.assertEqual(
+            preserved_task,
+            {
+                "status": "waiting_for_orchestrator",
+                "error": "",
+                "waiting_reason": "Which contact behavior is allowed?",
+                "finished_at": None,
+            },
+        )
+        preserved_consultation = agentdock.one(
+            "SELECT status,orchestrator_response_json,resolved_at FROM consultations WHERE id=?",
+            (consultation_id,),
+        )
+        self.assertEqual(
+            preserved_consultation,
+            {"status": "queued", "orchestrator_response_json": "{}", "resolved_at": None},
+        )
+        self.assertEqual(
+            agentdock.one("SELECT status,paused FROM plans WHERE id=?", (plan["id"],)),
+            {"status": "pausing", "paused": 1},
+        )
+
     def test_user_answer_is_persisted_before_same_thread_resolution(self):
         plan = self._orchestrator_plan("user-answer-plan")
         task_id = "user-answer-task"

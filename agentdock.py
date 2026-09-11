@@ -3421,18 +3421,11 @@ def run_task_once(plan, task, workspace, force_mode=None):
                 "output": output,
                 "error": "Worker needs an orchestrator decision",
             }
-        followups = consume_queued_messages(plan, task, workspace, model, effort, tier)
-        if followups:
-            output = followups[-1]
-            consultation = create_worker_consultation(plan, task, output)
-            if consultation:
-                return {
-                    "ok": False,
-                    "waiting_for_orchestrator": True,
-                    "consultation": consultation,
-                    "output": output,
-                    "error": "Worker needs an orchestrator decision",
-                }
+        # Queued user messages are conversational follow-ups, not a new
+        # execution checkpoint. Their replies are persisted in the manual
+        # session/timeline by consume_queued_messages; never replace the
+        # worker's canonical execution output or turn it into a consultation.
+        consume_queued_messages(plan, task, workspace, model, effort, tier)
         execute("UPDATE tasks SET status=?, output=?, error=?, finished_at=? WHERE id=?", ("executed", output, "", now(), task["id"]))
         write_mission_docs(plan["id"])
         return {"ok": True, "output": output}
@@ -3672,6 +3665,13 @@ def resolve_waiting_consultations(plan, tasks, ctx=None):
     """
     resolved_any = False
     for task in sorted(tasks or [], key=lambda item: item.get("seq", 0)):
+        if plan_is_paused(plan["id"]):
+            return {
+                "ok": False,
+                "paused": True,
+                "deferred": True,
+                "error": "Mission is paused; worker consultations remain queued.",
+            }
         if task.get("status") != "waiting_for_orchestrator" or not task.get("consultation_id"):
             continue
         fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
@@ -3684,6 +3684,8 @@ def resolve_waiting_consultations(plan, tasks, ctx=None):
             },
             ctx=ctx,
         )
+        if resolution.get("paused"):
+            return resolution
         if resolution.get("retry"):
             resolved_any = True
             continue
@@ -4087,13 +4089,10 @@ def run_demo_manual_followup(task_id, prompt, image_paths=None):
     plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],)) if task else None
     if not task or not plan:
         return
-    old_status = task.get("status") or "done"
     existing_thread = task.get("worker_thread_id") or (latest_agent_session(task_id) or {}).get("thread_id") or ""
-    execute("UPDATE tasks SET status=?,error=? WHERE id=?", ("running", "", task_id))
     sid = create_agent_session(plan["id"], task_id, "demo-manual", plan["worker_model"], plan["worker_effort"], plan["worker_tier"], task.get("mode") or "read", plan["workspace"])
     thread_id = existing_thread or f"demo-followup-{task_id}-{sid[:6]}"
     demo_event(sid, task_id, plan["id"], {"type":"thread.started","thread_id":thread_id})
-    execute("UPDATE tasks SET worker_thread_id=? WHERE id=?", (thread_id, task_id))
     demo_event(sid, task_id, plan["id"], {"type":"turn.started","turn_id":f"demo-manual-turn-{sid[:8]}"})
     log(task_id, "manual", f"demo manual input: {prompt or '[attachment only]'}")
     time.sleep(0.4)
@@ -4104,9 +4103,8 @@ def run_demo_manual_followup(task_id, prompt, image_paths=None):
     demo_event(sid, task_id, plan["id"], {"type":"item.completed","item":{"id":"manual-msg","type":"agent_message","text":note}})
     demo_event(sid, task_id, plan["id"], {"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}})
     finish_agent_session(sid, "completed", note)
-    final_status = "done" if old_status in ("done","executed","failed","blocked","cancelled") else old_status
-    execute("UPDATE tasks SET status=?,output=?,finished_at=? WHERE id=?", (final_status, note, now(), task_id))
     log(task_id, "manual", "demo manual follow-up completed · 0 quota used")
+    return note
 
 
 def worker_consultation_prompt(plan, task, consultation, user_answer=None):
@@ -4173,6 +4171,38 @@ def _consultation_payload(row):
         "worker_thread_id": row.get("worker_thread_id") or "",
         "status": row.get("status") or "",
         "task_id": row.get("task_id") or "",
+    }
+
+
+def _defer_consultation_for_paused_plan(plan, task, consultation, payload=None):
+    """Keep a worker question durable when a mission pause interrupts resolution."""
+    payload = payload or _consultation_payload(consultation)
+    question = (
+        payload.get("question")
+        or task.get("waiting_reason")
+        or "Worker consultation is waiting for the orchestrator."
+    )
+    execute(
+        """UPDATE tasks SET status=?,error=?,waiting_reason=?,finished_at=NULL
+           WHERE id=?""",
+        ("waiting_for_orchestrator", "", question, task["id"]),
+    )
+    execute(
+        """UPDATE consultations SET status=?,orchestrator_response_json=?,resolved_at=NULL
+           WHERE id=?""",
+        ("queued", "{}", consultation["id"]),
+    )
+    log(
+        orchestrator_log_id(plan["id"]),
+        "supervisor",
+        f"TASK-{task['seq']+1:03d} consultation kept queued because the mission is paused",
+    )
+    write_mission_docs(plan["id"])
+    return {
+        "ok": False,
+        "paused": True,
+        "deferred": True,
+        "error": "Mission is paused; worker consultation remains queued.",
     }
 
 
@@ -4246,6 +4276,8 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
     if not consultation:
         return {"ok": False, "error": "Worker consultation record not found."}
     payload = _consultation_payload(consultation)
+    if plan_is_paused(plan["id"]):
+        return _defer_consultation_for_paused_plan(plan, fresh, consultation, payload)
     # Keep a write worker's isolated worktree alive while the orchestrator is
     # deciding. The worker may have uncommitted progress and must resume that
     # exact checkout after the handoff; cleanup belongs to successful
@@ -4274,6 +4306,8 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
             images=answer_images,
             transient_retries=1 if recovery_settings(plan).get("auto_retry_transient") else 0,
         )
+        if plan_is_paused(plan["id"]):
+            return _defer_consultation_for_paused_plan(plan, fresh, consultation, payload)
         response = normalize_consultation_result(extract_json(turn["text"]))
         response["orchestrator_thread_id"] = turn.get("thread_id") or ""
         execute(
@@ -4349,6 +4383,8 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
         return {"ok": False, "blocked": True, "error": reason}
     except Exception as exc:
         message = f"Worker consultation could not be resolved: {exc}"
+        if plan_is_paused(plan["id"]):
+            return _defer_consultation_for_paused_plan(plan, fresh, consultation, payload)
         execute(
             "UPDATE tasks SET status=?,error=?,waiting_reason=? WHERE id=?",
             ("attention", message, payload.get("question") or "", fresh["id"]),
@@ -4739,6 +4775,10 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                 # runnable independent work has had a chance to execute. This
                 # keeps one worker's question from pausing unrelated workers.
                 queued_resolution = resolve_waiting_consultations(plan, list(pending.values()), ctx=ctx)
+                if queued_resolution.get("paused") or plan_is_paused(plan_id):
+                    log(orchestrator_log_id(plan_id), "supervisor", "mission pause preserved queued worker consultations")
+                    write_mission_docs(plan_id)
+                    return
                 if queued_resolution.get("resolved"):
                     tasks = [one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task for task in tasks]
                     pending = {task["seq"]: task for task in tasks if task.get("status") not in ("done", "executed")}
@@ -4811,6 +4851,10 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     resolution = resolve_worker_consultation(plan, task, result=result, ctx=ctx)
                     if resolution.get("retry"):
                         pending[task["seq"]] = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+                    elif resolution.get("paused"):
+                        log(orchestrator_log_id(plan_id), "supervisor", "mission pause preserved the active worker consultation")
+                        write_mission_docs(plan_id)
+                        return
                     elif resolution.get("waiting_for_user"):
                         pause_for_user = True
                     elif resolution.get("attention"):
@@ -4822,6 +4866,10 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     resolution = resolve_worker_consultation(plan, task, result=result, ctx=ctx)
                     if resolution.get("retry"):
                         pending[task["seq"]] = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+                    elif resolution.get("paused"):
+                        log(orchestrator_log_id(plan_id), "supervisor", "mission pause preserved the active worker consultation")
+                        write_mission_docs(plan_id)
+                        return
                     elif resolution.get("waiting_for_user"):
                         pause_for_user = True
                     elif resolution.get("attention"):
@@ -5260,20 +5308,17 @@ def run_manual_followup(task_id, prompt, image_paths=None):
     model = task_model(plan, agent, task)
     effort = task_effort(plan, agent, task)
     tier = task_tier(plan, agent, task)
-    old_status = task.get("status") or "done"
-    execute("UPDATE tasks SET status=?, error=?,pause_reason='' WHERE id=?", ("running", "", task_id))
     log(task_id, "manual", "conversation message started on the same worker thread")
     try:
         out = run_codex(prompt, workspace, mode, model, task_id, effort, tier,
                         images=image_paths or [], resume_thread_id=thread_id, session_kind="manual")
-        final_status = "cancelled" if old_status == "cancelled" else ("done" if old_status in ("done", "executed", "failed", "blocked", "paused_by_user") else old_status)
-        execute("UPDATE tasks SET status=?, output=?, error=?, finished_at=? WHERE id=?", (final_status, out, "", now(), task_id))
         log(task_id, "manual", "conversation response completed")
         write_mission_docs(plan["id"])
+        return out
     except Exception as e:
-        execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("attention", str(e), now(), task_id))
         log(task_id, "manual", f"conversation response failed: {e}")
         write_mission_docs(plan["id"])
+        raise
 
 
 def pause_task(task_id, reason="Paused by user"):
