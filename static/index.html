@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AgentDock — Mission Control</title>
-  <link rel="stylesheet" href="/styles.css?v=0.13.0">
+  <link rel="stylesheet" href="/styles.css?v=0.13.1">
 </head>
 <body>
 <div class="app-shell">
@@ -197,13 +197,6 @@
       <div class="live-section-head"><div><span class="eyebrow">AGENTS</span><h3>Orchestrator & workers</h3></div><span class="section-note">Classic working state, Codex-style activity, messages and pause controls.</span></div>
       <div id="liveGrid" class="terminal-grid"><div class="empty-terminal"><span>agentdock@local:~$</span> waiting for mission_</div></div>
 
-      <section class="surface task-surface">
-        <div class="surface-head">
-          <div><span class="eyebrow">TASK GRAPH</span><h3>Execution plan</h3></div>
-          <div id="planHistory" class="plan-history"></div>
-        </div>
-        <div id="taskGraph" class="task-graph empty-state">No execution plan yet.</div>
-      </section>
     </section>
 
     <!-- Agent profile settings -->
@@ -253,6 +246,6 @@
 <dialog id="logDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span id="logTitle">task.log</span><button onclick="document.getElementById('logDialog').close()" class="terminal-close">×</button></div><pre id="logText" class="full-log"></pre></dialog>
 <dialog id="planDiffDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span>integration.diff</span><button onclick="document.getElementById('planDiffDialog').close()" class="terminal-close">×</button></div><pre id="planDiffText" class="full-log"></pre></dialog>
 
-<script src="/app.js?v=0.13.0"></script>
+<script src="/app.js?v=0.13.1"></script>
 </body>
 </html>
