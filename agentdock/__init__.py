@@ -25,9 +25,10 @@ from . import (
     schemas,
     tasks,
     timeline,
+    version,
 )
 from .api import Handler
-from .app import main
+from .app import initialize_database, main, initialize_database as init_db
 from .codex import (
     engine_status,
     interrupt_app_server,
@@ -77,17 +78,14 @@ from .db import (
     claim_plan_run,
     create_agent_session,
     doctor_log_id,
-    ensure_workspace,
     execute,
     finish_agent_session,
-    init_db,
     latest_agent_session,
     log,
     one,
     plan_attachment_paths,
     record_codex_event,
     record_control_event,
-    recover_orphaned_runs,
     release_plan_run,
     rows,
     save_attachment,
@@ -120,12 +118,15 @@ from .mission import (
     pause_plan,
     pause_task,
     quota_payload,
+    ensure_workspace,
+    migrate_legacy_orchestrator_state,
     replan_mission,
     reset_plan_for_retry,
     restart_as_new_mission,
     resume_plan,
     resume_task,
     run_plan,
+    recover_orphaned_runs,
     start_plan,
     state_payload,
     stored_integration_context,
@@ -185,6 +186,7 @@ from .tasks import (
 )
 from .platform import open_terminal_at
 from .timeline import diff_payload, events_payload, latest_log_segment, logs_payload, messages_payload, mission_usage, task_diff, timeline_for, write_mission_docs
+from .version import VERSION
 
 
 __all__ = [
@@ -198,7 +200,8 @@ __all__ = [
     "PreflightBlocked", "PreflightWaitingForUser", "apply_preflight_action",
     "build_plan", "apply_plan", "pause_plan", "resume_plan", "pause_task", "resume_task",
     "replan_mission", "restart_as_new_mission", "mission_config", "answer_consultation",
-    "recover_orphaned_runs", "rows", "one", "execute", "log", "now", "safe_json",
+    "recover_orphaned_runs", "migrate_legacy_orchestrator_state", "rows", "one", "execute", "log", "now", "safe_json",
+    "VERSION",
     "STATE_ROOT", "DB", "WORKTREE_ROOT", "MISSION_ROOT", "ATTACHMENT_ROOT", "LEGACY_DB",
     "APP_SERVER_CONTROLS", "APP_SERVER_CONTROLS_LOCK", "RUNNERS", "RUNNERS_LOCK",
     "RECOVERY_DEFAULTS", "STATIC", "HOST", "PORT", "shutil", "sqlite3", "time",

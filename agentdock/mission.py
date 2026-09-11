@@ -49,7 +49,7 @@ from .db import (
     claim_plan_run,
     create_agent_session,
     doctor_log_id,
-    ensure_workspace,
+    ensure_workspace as persist_workspace,
     execute,
     finish_agent_session,
     latest_agent_session,
@@ -58,10 +58,12 @@ from .db import (
     plan_attachment_paths,
     record_codex_event,
     record_control_event,
+    recover_orphaned_runs as recover_storage_runs,
     release_plan_run,
     rows,
     save_attachment,
     workspace_summary,
+    migrate_legacy_orchestrator_state as migrate_storage_legacy_state,
 )
 from .git_ops import (
     delete_branch,
@@ -90,6 +92,7 @@ from .schemas import (
     extract_json,
     normalize_planner_result,
     planner_schema_path,
+    safe_json,
     validate_task_graph,
 )
 from .tasks import (
@@ -116,6 +119,20 @@ def health_payload():
         "codex_transport": config.CODEX_TRANSPORT,
         "server_time": config.now(),
     }
+
+
+def recover_orphaned_runs(write_docs=None):
+    if write_docs is None:
+        from .timeline import write_mission_docs as write_docs
+
+    return recover_storage_runs(write_docs=write_docs)
+
+
+def migrate_legacy_orchestrator_state(write_docs=None):
+    if write_docs is None:
+        from .timeline import write_mission_docs as write_docs
+
+    return migrate_storage_legacy_state(write_docs=write_docs)
 
 
 def state_payload():
@@ -253,6 +270,11 @@ def workspace_browse():
         "is_git": bool(info.get("is_git")),
         "branch": info.get("branch") or "",
     }
+
+
+def ensure_workspace(repo_path, name=None):
+    """Create or update a workspace with Git inspection owned by mission."""
+    return persist_workspace(repo_path, name, repo_info_func=repo_info)
 
 
 def create_workspace_request(data):

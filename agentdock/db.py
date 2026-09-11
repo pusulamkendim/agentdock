@@ -240,35 +240,7 @@ def init_db():
     con.commit()
     con.close()
 
-    from .schemas import consultation_schema_path, planner_schema_path
-    planner_schema_path()
-    consultation_schema_path()
-    recover_orphaned_runs()
-
-    # v0.7: materialize existing repository paths as first-class workspaces.
-    con = db()
-    existing = con.execute("SELECT id,workspace,workspace_id FROM plans ORDER BY created_at").fetchall()
-    for pl in existing:
-        repo_path = str(Path(pl["workspace"]).expanduser().resolve()) if pl["workspace"] else ""
-        if not repo_path:
-            continue
-        ws = con.execute("SELECT id FROM workspaces WHERE repo_path=?", (repo_path,)).fetchone()
-        if ws:
-            wid = ws["id"]
-        else:
-            wid = str(uuid.uuid4())[:8]
-            name = Path(repo_path).name or repo_path
-            from .git_ops import repo_info
-            info = repo_info(repo_path) if Path(repo_path).exists() else {"branch":""}
-            con.execute("INSERT INTO workspaces(id,name,repo_path,default_branch,created_at,last_opened_at) VALUES(?,?,?,?,?,?)",
-                        (wid,name,repo_path,info.get("branch") or "",config.now(),config.now()))
-        if not pl["workspace_id"]:
-            con.execute("UPDATE plans SET workspace_id=? WHERE id=?", (wid,pl["id"]))
-    con.commit()
-    con.close()
-    migrate_legacy_orchestrator_state()
-
-def recover_orphaned_runs():
+def recover_orphaned_runs(write_docs=None):
     """Move work interrupted by a server restart into an explicit retry state."""
     interrupted_at = config.now()
     with config.DB_LOCK:
@@ -321,12 +293,12 @@ def recover_orphaned_runs():
         con.commit()
         con.close()
     for plan_id in plan_ids:
-        from .timeline import write_mission_docs
         log(f"orchestrator:{plan_id}", "supervisor", message)
-        write_mission_docs(plan_id)
+        if write_docs:
+            write_docs(plan_id)
     return len(plan_ids)
 
-def migrate_legacy_orchestrator_state():
+def migrate_legacy_orchestrator_state(write_docs=None):
     """Bind old missions to an existing thread without silently creating one."""
     plans = rows("SELECT * FROM plans ORDER BY created_at")
     for plan in plans:
@@ -363,18 +335,43 @@ def migrate_legacy_orchestrator_state():
                    legacy_orchestrator_status=?,orchestrator_last_error=? WHERE id=?""",
                 (current or preferred, int(plan.get("orchestrator_generation") or 1), status, message, plan["id"]),
             )
-            from .timeline import write_mission_docs
             log(f"orchestrator:{plan['id']}", "supervisor", message)
-            write_mission_docs(plan["id"])
+            if write_docs:
+                write_docs(plan["id"])
         elif not current and not legacy and plan.get("status") not in ("done", "cancelled"):
             message = "Legacy mission: unified orchestrator session must be reconstructed explicitly."
             execute(
                 "UPDATE plans SET legacy_orchestrator_status=?,orchestrator_last_error=? WHERE id=?",
                 ("reconstruct_required", message, plan["id"]),
             )
-            from .timeline import write_mission_docs
             log(f"orchestrator:{plan['id']}", "supervisor", message)
-            write_mission_docs(plan["id"])
+            if write_docs:
+                write_docs(plan["id"])
+
+
+def materialize_existing_workspaces(repo_info_func=None):
+    """Backfill workspace rows for legacy plans using an injected inspector."""
+    con = db()
+    existing = con.execute("SELECT id,workspace,workspace_id FROM plans ORDER BY created_at").fetchall()
+    for plan in existing:
+        repo_path = str(Path(plan["workspace"]).expanduser().resolve()) if plan["workspace"] else ""
+        if not repo_path:
+            continue
+        workspace = con.execute("SELECT id FROM workspaces WHERE repo_path=?", (repo_path,)).fetchone()
+        if workspace:
+            workspace_id = workspace["id"]
+        else:
+            workspace_id = str(uuid.uuid4())[:8]
+            name = Path(repo_path).name or repo_path
+            info = repo_info_func(repo_path) if repo_info_func and Path(repo_path).exists() else {"branch": ""}
+            con.execute(
+                "INSERT INTO workspaces(id,name,repo_path,default_branch,created_at,last_opened_at) VALUES(?,?,?,?,?,?)",
+                (workspace_id, name, repo_path, info.get("branch") or "", config.now(), config.now()),
+            )
+        if not plan["workspace_id"]:
+            con.execute("UPDATE plans SET workspace_id=? WHERE id=?", (workspace_id, plan["id"]))
+    con.commit()
+    con.close()
 
 def rows(sql, args=()):
     con = db()
@@ -414,13 +411,27 @@ def release_plan_run(plan_id):
     with config.ACTIVE_PLAN_RUNS_LOCK:
         config.ACTIVE_PLAN_RUNS.discard(plan_id)
 
-def ensure_workspace(repo_path, name=None):
-    from .config import normalize_workspace_path
-    from .git_ops import repo_info
+
+def plan_is_paused(plan_id):
+    plan = one("SELECT status,paused FROM plans WHERE id=?", (plan_id,)) or {}
+    return plan.get("status") in ("paused", "pausing") or int(plan.get("paused") or 0) == 1
+
+
+def latest_orchestrator_session(plan_id):
+    return one(
+        """SELECT * FROM agent_sessions
+           WHERE plan_id=? AND kind LIKE '%orchestrator%'
+           ORDER BY CASE WHEN thread_id!='' THEN 0 ELSE 1 END, started_at DESC, rowid DESC
+           LIMIT 1""",
+        (plan_id,),
+    )
+
+def ensure_workspace(repo_path, name=None, repo_info_func=None):
+    normalize_workspace_path = config.normalize_workspace_path
     path = normalize_workspace_path(repo_path)
     canonical = str(path)
     current = one("SELECT * FROM workspaces WHERE repo_path=?", (canonical,))
-    info = repo_info(canonical)
+    info = repo_info_func(canonical) if repo_info_func else {"branch": ""}
     if current:
         execute("UPDATE workspaces SET last_opened_at=?, default_branch=CASE WHEN ?<>'' THEN ? ELSE default_branch END WHERE id=?",
                 (config.now(), info.get("branch") or "", info.get("branch") or "", current["id"]))

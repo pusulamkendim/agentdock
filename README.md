@@ -1,4 +1,4 @@
-# AgentDock v0.13 — Supervised Mission Control
+# AgentDock v0.13.0 — Supervised Mission Control
 
 AgentDock is a local multi-agent control plane for Codex. The orchestrator first decides what the mission needs; it creates worker tasks only when real execution is required. Write workers execute approved tasks in isolated Git worktrees. The normal path reuses the existing ChatGPT-authenticated Codex CLI and requires no API key.
 

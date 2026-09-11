@@ -4,7 +4,6 @@ import hashlib
 import mimetypes
 import json
 import os
-import re
 import select
 import queue
 import signal
@@ -36,13 +35,7 @@ from .git_ops import (
 from .schemas import safe_json
 from .timeline import write_mission_docs
 
-def is_transient_error(error):
-    text = str(error or "").lower()
-    # Quota exhaustion / auth failures should not be spam-retried.
-    hard = ("usage limit", "weekly limit", "not logged in", "unauthorized", "forbidden", "insufficient quota")
-    if any(x in text for x in hard):
-        return False
-    return any(re.search(p, text, re.I) for p in config.TRANSIENT_ERROR_PATTERNS)
+is_transient_error = config.is_transient_error
 
 def update_preflight(plan_id, status, report):
     execute(

@@ -143,6 +143,22 @@ TRANSIENT_ERROR_PATTERNS = [
     r"transport.*error", r"network.*error", r"broken pipe", r"server busy",
 ]
 
+
+def is_transient_error(error):
+    text = str(error or "").lower()
+    # Quota exhaustion and authentication failures should not be retried.
+    hard = (
+        "usage limit",
+        "weekly limit",
+        "not logged in",
+        "unauthorized",
+        "forbidden",
+        "insufficient quota",
+    )
+    if any(item in text for item in hard):
+        return False
+    return any(re.search(pattern, text, re.I) for pattern in TRANSIENT_ERROR_PATTERNS)
+
 MODEL_EFFORTS = {
     "gpt-6-astra": {"low", "medium", "high", "xhigh", "max"},
     "auto-best": {"low", "medium", "high", "xhigh", "max"},

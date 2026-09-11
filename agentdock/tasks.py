@@ -41,7 +41,7 @@ from .git_ops import (
     validate_worker_changes,
     workspace_fingerprint,
 )
-from .preflight import is_transient_error
+from .config import is_transient_error
 from .handoffs import create_worker_consultation, safe_json, task_dependency_context
 from .platform import open_terminal_at
 from .timeline import write_mission_docs

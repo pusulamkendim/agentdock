@@ -30,12 +30,15 @@ from .db import (
     latest_agent_session,
     log,
     one,
+    latest_orchestrator_session,
+    plan_is_paused,
     plan_attachment_paths,
     record_codex_event,
     rows,
 )
 from .git_ops import shell
 from .schemas import safe_json
+from .version import VERSION
 
 def validate_runtime_config(model, effort, tier, label):
     allowed = None
@@ -180,7 +183,7 @@ def _app_server_request(method, params=None, timeout=10):
 
     try:
         deadline = time.time() + timeout
-        send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "agentdock", "title": "AgentDock", "version": "0.4.0"}, "capabilities": {"experimentalApi": True}}})
+        send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "agentdock", "title": "AgentDock", "version": VERSION}, "capabilities": {"experimentalApi": True}}})
         read_until(1, deadline)
         send({"method": "initialized"})
         send({"id": 2, "method": method, **({"params": params} if params is not None else {})})
@@ -531,7 +534,7 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
     completed_status = "failed"
     try:
         request(1, "initialize", {
-            "clientInfo": {"name": "agentdock", "title": "AgentDock", "version": "0.13.0"},
+            "clientInfo": {"name": "agentdock", "title": "AgentDock", "version": VERSION},
             "capabilities": {"experimentalApi": True},
         })
         send({"method": "initialized", "params": {}})
@@ -627,7 +630,6 @@ def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None,
         return final
     except Exception as exc:
         current_status = (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") if task_id else ""
-        from .orchestrator import plan_is_paused
         stopped = current_status in ("cancelled", "paused_by_user", "pausing") or plan_is_paused(plan_id)
         finish_agent_session(session_id, "cancelled" if stopped else "failed", str(exc))
         raise
@@ -742,7 +744,6 @@ def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_
     final = parse_codex_final(stdout)
     if code != 0:
         current_status = (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") if task_id else ""
-        from .orchestrator import plan_is_paused
         stopped = current_status in ("cancelled", "paused_by_user", "pausing") or plan_is_paused(plan_id)
         finish_agent_session(session_id, "cancelled" if stopped else "failed", final)
         raise RuntimeError((stderr or stdout or f"process exit {code}")[-12000:])
@@ -802,8 +803,7 @@ def orchestrator_models(requested):
     return [requested or config.DEFAULT_ORCHESTRATOR]
 
 def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning_effort="", service_tier="default", mode="read", transient_retries=0, images=None, output_schema="", resume_thread_id="", session_kind="orchestrator"):
-    from .preflight import is_transient_error
-
+    is_transient_error = config.is_transient_error
     errors = []
     bound_thread_id = resume_thread_id or ""
     for model in orchestrator_models(requested_model):
@@ -829,7 +829,6 @@ def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning
                     continue
                 errors.append(f"{model}: {e}")
                 if not bound_thread_id:
-                    from .orchestrator import latest_orchestrator_session
                     latest = latest_orchestrator_session(infer_plan_id(task_id)) if task_id else None
                     bound_thread_id = (latest or {}).get("thread_id") or ""
                     resume_thread_id = bound_thread_id

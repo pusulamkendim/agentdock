@@ -30,8 +30,10 @@ from .db import (
     execute,
     finish_agent_session,
     latest_agent_session,
+    latest_orchestrator_session,
     log,
     one,
+    plan_is_paused,
     record_control_event,
     release_plan_run,
     rows,
@@ -46,10 +48,6 @@ from .handoffs import (
     worker_resume_message,
 )
 from .timeline import write_mission_docs
-
-def plan_is_paused(plan_id):
-    plan = one("SELECT status,paused FROM plans WHERE id=?", (plan_id,)) or {}
-    return plan.get("status") in ("paused", "pausing") or int(plan.get("paused") or 0) == 1
 
 def orchestrator_log_id(plan_id):
     return f"orchestrator:{plan_id}"
@@ -707,15 +705,6 @@ def resolve_worker_failure(plan, task, result, ctx=None):
         log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} recovery diagnosis failed: {e}")
         write_mission_docs(plan["id"])
         return False
-
-def latest_orchestrator_session(plan_id):
-    return one(
-        """SELECT * FROM agent_sessions
-           WHERE plan_id=? AND kind LIKE '%orchestrator%'
-           ORDER BY CASE WHEN thread_id!='' THEN 0 ELSE 1 END, started_at DESC, rowid DESC
-           LIMIT 1""",
-        (plan_id,),
-    )
 
 def orchestrator_session_usage(session_id):
     """Extract the provider-reported token usage for the latest orchestrator turn."""
