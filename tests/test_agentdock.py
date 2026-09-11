@@ -1,5 +1,6 @@
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -109,6 +110,55 @@ class ExecutionTests(AgentDockTestCase):
             result = agentdock.run_parallel_task(plan, task, ctx, "")
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "read result")
+
+    def test_apply_plan_applies_only_the_pending_integration_diff(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+        (repo / "value.txt").write_text("before\n")
+        subprocess.run(["git", "-C", str(repo), "add", "value.txt"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        base_commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        plan_id = "plan-apply"
+        integration = agentdock.WORKTREE_ROOT / plan_id / "integration"
+        integration.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-b", f"agentdock/{plan_id}/integration", str(integration), base_commit],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (integration / "value.txt").write_text("after\n")
+        subprocess.run(["git", "-C", str(integration), "add", "value.txt"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(integration), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "worker"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        agentdock.execute(
+            "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,base_commit,integration_workspace,apply_status) VALUES(?,?,?,?,?,?,?,?,?)",
+            (plan_id, "apply", str(repo), "test", "awaiting_apply", agentdock.now(), base_commit, str(integration), "ready"),
+        )
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,status) VALUES(?,?,?,?,?,?)",
+            ("task-apply", plan_id, 0, "worker", "worker", "done"),
+        )
+
+        with patch.object(agentdock, "run_preflight", return_value={}):
+            result = agentdock.apply_plan(plan_id)
+        self.assertTrue(result["applied"])
+        self.assertEqual((repo / "value.txt").read_text(), "after\n")
+        applied = agentdock.one("SELECT status,applied,apply_status FROM plans WHERE id=?", (plan_id,))
+        self.assertEqual(applied["status"], "done")
+        self.assertEqual(applied["applied"], 1)
+        self.assertEqual(applied["apply_status"], "applied")
 
 
 if __name__ == "__main__":
