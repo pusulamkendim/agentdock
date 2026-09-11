@@ -187,3 +187,12 @@ dialog{border:1px solid #d3d5cf;background:#fff;color:var(--ink);border-radius:1
 .global-mission-row>.mission-state{grid-area:state}.global-mission-row>.global-mission-title{grid-area:title}.global-mission-row>.global-mission-workspace{grid-area:workspace}.global-mission-row>.global-mission-runtime{grid-area:runtime}.global-mission-row>.global-mission-time{grid-area:time}.global-mission-row>.global-mission-status{grid-area:status}
 @media(max-width:1180px){.global-mission-row{grid-template-areas:"state title workspace time status"}}
 @media(max-width:820px){.global-mission-row{grid-template-areas:"state title status"}}
+
+/* Keep orchestrator session metadata readable instead of falling into an implicit row. */
+.orchestrator-thread-panel{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"label action" "thread thread" "turn legacy";gap:8px 14px;align-items:center}
+.orchestrator-thread-panel>.eyebrow{grid-area:label;min-width:0;line-height:1.25}
+.orchestrator-thread-panel>b{grid-area:thread;min-width:0;color:#465248;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.orchestrator-thread-panel>span:not(.eyebrow){grid-area:turn;min-width:0;color:#667168;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.orchestrator-thread-panel>small{grid-area:legacy;justify-self:end;min-width:0;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.orchestrator-thread-panel>button{grid-area:action;justify-self:end;white-space:nowrap}
+@media(min-width:1120px){.orchestrator-thread-panel{grid-template-columns:minmax(145px,.85fr) minmax(190px,1.45fr) minmax(120px,max-content) minmax(170px,1fr) auto;grid-template-areas:"label thread turn legacy action";gap:9px 14px}.orchestrator-thread-panel>b{white-space:nowrap}.orchestrator-thread-panel>small{justify-self:start}}
