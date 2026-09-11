@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AgentDock — Mission Control</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">›_</div>
+      <div><b>AgentDock</b><small>local agent swarm</small></div>
+    </div>
+
+    <nav class="side-nav">
+      <button class="nav active" data-view="overview"><span class="nav-icon">⌂</span><span>Overview</span></button>
+      <button class="nav" data-view="missions"><span class="nav-icon">▦</span><span>Missions</span></button>
+      <button class="nav" data-view="mission"><span class="nav-icon">＋</span><span>New mission</span></button>
+    </nav>
+
+    <div class="workspace-nav-head">
+      <span>WORKSPACES</span>
+      <button id="newWorkspaceSide" class="sidebar-add" title="Add workspace">+</button>
+    </div>
+    <div id="workspaceTree" class="workspace-tree"></div>
+
+    <div class="sidebar-secondary">
+      <button class="nav" data-view="agents"><span class="nav-icon">◇</span><span>Agent profiles</span></button>
+    </div>
+
+    <div class="sidebar-bottom">
+      <div class="system-label">SYSTEM</div>
+      <div id="engineStatus" class="engine-status"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="page-heading">
+        <div id="pageEyebrow" class="eyebrow">CONTROL CENTER</div>
+        <h1 id="pageTitle">Everything in one place.</h1>
+        <p id="pageSubtitle">Workspaces, missions and live agents without losing manual control.</p>
+      </div>
+      <div class="topbar-tools">
+        <div id="quotaStrip" class="quota-strip"></div>
+        <button id="refresh" class="icon-button" title="Refresh">↻</button>
+      </div>
+    </header>
+
+    <!-- Workspace-first landing -->
+    <section id="overview" class="view active">
+      <div class="overview-hero">
+        <div>
+          <div class="eyebrow">TODAY</div>
+          <h2>Mission control</h2>
+          <p>See what is running, where attention is needed, and jump into any agent instantly.</p>
+        </div>
+        <button id="overviewNewMission" class="primary large">New mission <span>⌘↵</span></button>
+      </div>
+
+      <div class="summary-grid" id="overviewSummary"></div>
+
+      <section class="surface overview-section">
+        <div class="surface-head">
+          <div><span class="eyebrow">ACTIVE</span><h3>In flight</h3></div>
+          <button class="link-button" data-jump="missions">View all missions →</button>
+        </div>
+        <div id="overviewMissions" class="mission-cards"></div>
+      </section>
+
+      <section class="overview-section">
+        <div class="surface-head no-border">
+          <div><span class="eyebrow">WORKSPACES</span><h3>Your repositories</h3></div>
+          <button id="overviewAddWorkspace" class="secondary">+ Add workspace</button>
+        </div>
+        <div id="overviewWorkspaces" class="workspace-grid"></div>
+      </section>
+    </section>
+
+    <!-- Global mission manager -->
+    <section id="missions" class="view">
+      <div class="view-toolbar">
+        <div class="filter-group">
+          <select id="missionFilterWorkspace" class="premium-select"><option value="">All workspaces</option></select>
+          <select id="missionFilterStatus" class="premium-select">
+            <option value="">All statuses</option>
+            <option value="active">Active</option>
+            <option value="attention">Needs attention</option>
+            <option value="done">Completed</option>
+          </select>
+        </div>
+        <button id="missionsNewMission" class="primary">+ New mission</button>
+      </div>
+      <div id="globalMissionBoard" class="global-mission-board"></div>
+      <button id="newWorkspaceBoard" class="hidden" aria-hidden="true"></button>
+      <div id="workspaceBoard" class="hidden"></div>
+    </section>
+
+    <!-- New mission composer -->
+    <section id="mission" class="view">
+      <div class="create-layout">
+        <section class="surface composer-card" id="missionDropZone">
+          <div class="surface-head composer-head">
+            <div>
+              <span class="eyebrow">NEW MISSION</span>
+              <h3>What should the swarm accomplish?</h3>
+            </div>
+            <div class="workspace-context">
+              <span>Workspace</span>
+              <select id="workspaceSelect" class="premium-select"></select>
+              <button id="newWorkspace" class="icon-button subtle" title="Add workspace">+</button>
+            </div>
+          </div>
+
+          <div class="composer-main">
+            <div id="missionAttachments" class="attachment-strip"></div>
+            <div class="prompt-box">
+              <span class="prompt-symbol">›</span>
+              <textarea id="goal" spellcheck="false" placeholder="Describe the outcome. Paste a screenshot with ⌘V or drop it here."></textarea>
+            </div>
+            <div class="composer-hint"><span id="workspacePath"></span><span>⌘V image paste · no API key · isolated worktrees</span></div>
+          </div>
+
+          <div class="runtime-row">
+            <div class="runtime-block">
+              <div class="runtime-label">ORCHESTRATOR</div>
+              <div class="runtime-controls">
+                <select id="orchestratorModel" class="premium-select"><option value="gpt-5.6-sol">GPT-5.6 Sol</option><option value="auto-best">Astra → Sol fallback</option><option value="gpt-6-astra">GPT-6 Astra</option></select>
+                <select id="orchestratorEffort" class="premium-select"></select>
+                <select id="orchestratorTier" class="premium-select"><option value="default">Standard</option><option value="fast">Fast</option></select>
+              </div>
+            </div>
+            <div class="runtime-arrow">→</div>
+            <div class="runtime-block">
+              <div class="runtime-label">WORKERS</div>
+              <div class="runtime-controls">
+                <select id="workerModel" class="premium-select"><option value="gpt-5.6-luna">GPT-5.6 Luna</option><option value="gpt-5.6-terra">GPT-5.6 Terra</option><option value="gpt-5.6-sol">GPT-5.6 Sol</option></select>
+                <select id="workerEffort" class="premium-select"></select>
+                <select id="workerTier" class="premium-select"><option value="default">Standard</option><option value="fast">Fast</option></select>
+              </div>
+            </div>
+            <div class="parallel-control"><span>PARALLEL</span><select id="maxParallel" class="premium-select"><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>8</option></select></div>
+          </div>
+
+          <div class="composer-footer">
+            <details class="advanced-config">
+              <summary>Advanced runtime settings</summary>
+              <div class="advanced-panel">
+                <div class="advanced-section">
+                  <h4>Safe recovery</h4>
+                  <p>Normally hidden. These deterministic repairs run before agents start.</p>
+                  <div class="toggle-grid">
+                    <label class="toggle"><input id="autoCleanGenerated" type="checkbox" checked><span>Clean generated files</span></label>
+                    <label class="toggle"><input id="autoRepairIgnores" type="checkbox" checked><span>Repair local ignore rules</span></label>
+                    <label class="toggle"><input id="autoRetryTransient" type="checkbox" checked><span>Retry transient failures</span></label>
+                    <label class="toggle"><input id="autoPruneWorktrees" type="checkbox" checked><span>Prune stale worktrees</span></label>
+                    <label class="toggle"><input id="autoResolveLocks" type="checkbox" checked><span>Resolve proven stale Git locks</span></label>
+                  </div>
+                </div>
+                <div class="advanced-section policy-section">
+                  <h4>Guardrails</h4>
+                  <label><span>Merge conflicts</span><select id="mergeConflictPolicy" class="premium-select"><option value="orchestrator" selected>Orchestrator resolves</option><option value="ask">Ask me</option></select></label>
+                  <label><span>Unknown local changes</span><select id="unknownChangesPolicy" class="premium-select"><option value="ask" selected>Ask me / block</option></select></label>
+                  <label><span>Destructive operations</span><select id="destructivePolicy" class="premium-select"><option value="never" selected>Never auto</option></select></label>
+                </div>
+              </div>
+            </details>
+            <div class="create-actions">
+              <span id="planMsg" class="composer-msg">Ready to plan.</span>
+              <button id="demoPlanBtn" class="secondary large preview-button"><span class="preview-dot"></span>Preview mission <small>no quota</small></button>
+              <button id="planBtn" class="primary large">Run with Codex <span>↵</span></button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- Mission execution detail -->
+    <section id="missionDetail" class="view">
+      <div class="mission-detail-top">
+        <button id="backToMissions" class="back-button">← Missions</button>
+        <div class="mission-detail-heading">
+          <div><span class="eyebrow">LIVE MISSION</span><h2 id="liveTitle">No mission selected</h2></div>
+          <div id="runStats" class="run-stats"></div>
+        </div>
+        <div id="missionBar" class="mission-bar empty"><span>Select a mission to inspect it.</span></div>
+        <div id="usagePanel" class="usage-panel"></div>
+      </div>
+
+      <section id="planReviewPanel" class="surface plan-review-panel" hidden></section>
+
+      <div class="live-section-head"><div><span class="eyebrow">AGENTS</span><h3>Orchestrator & workers</h3></div><span class="section-note">Classic working state, Codex-style activity, manual messages and stop controls.</span></div>
+      <div id="liveGrid" class="terminal-grid"><div class="empty-terminal"><span>agentdock@local:~$</span> waiting for mission_</div></div>
+
+      <section class="surface task-surface">
+        <div class="surface-head">
+          <div><span class="eyebrow">TASK GRAPH</span><h3>Execution plan</h3></div>
+          <div id="planHistory" class="plan-history"></div>
+        </div>
+        <div id="taskGraph" class="task-graph empty-state">No execution plan yet.</div>
+      </section>
+    </section>
+
+    <!-- Agent profile settings -->
+    <section id="agents" class="view">
+      <div class="view-toolbar">
+        <div><span class="eyebrow">AGENT PROFILES</span><h2 class="section-title">Reusable worker roles</h2></div>
+        <button id="newAgent" class="primary">+ New profile</button>
+      </div>
+      <div id="agentGrid" class="agent-grid"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="workspaceDialog" class="workspace-dialog">
+  <form method="dialog" id="workspaceForm" class="workspace-form">
+    <div class="dialog-title workspace-dialog-title">
+      <div><div class="eyebrow">WORKSPACE</div><h3>Add repository</h3><p>Choose a local Git repository. AgentDock will keep missions and worktrees scoped to it.</p></div>
+      <button type="button" class="dialog-x" onclick="document.getElementById('workspaceDialog').close()" aria-label="Close">×</button>
+    </div>
+    <label>NAME <span>(optional)</span><input id="workspaceName" placeholder="meditation-portal" autocomplete="off"></label>
+    <label>REPOSITORY PATH
+      <div class="path-picker-row"><input id="workspaceRepo" required placeholder="~/project or /Users/name/project" autocomplete="off"><button id="browseWorkspace" type="button" class="secondary browse-button">Choose folder…</button></div>
+      <small class="field-hint">You can paste <code>~/project</code>, a full macOS path, or choose the folder.</small>
+    </label>
+    <div id="workspaceError" class="form-error" role="alert" hidden></div>
+    <div id="workspaceDetected" class="repo-detected" hidden></div>
+    <div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="saveWorkspace" value="default" class="primary">Add workspace</button></div>
+  </form>
+</dialog>
+
+<dialog id="agentDialog"><form method="dialog" id="agentForm"><div class="dialog-title"><div><div class="eyebrow">WORKER PROFILE</div><h3>Configure agent</h3></div></div><input type="hidden" id="agentId"><label>NAME<input id="agentName" required></label><label>MODEL OVERRIDE <span>(optional)</span><input id="agentModel" placeholder="gpt-5.6-luna"></label><label>REASONING OVERRIDE <span>(optional)</span><select id="agentEffort"><option value="">Inherit mission</option><option value="none">None</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label><label>SPEED OVERRIDE <span>(optional)</span><select id="agentTier"><option value="">Inherit mission</option><option value="default">Standard</option><option value="fast">Fast</option></select></label><label>PERMISSION<select id="agentMode"><option value="read">Read-only</option><option value="write">Workspace write</option></select></label><label>BRIEF<textarea id="agentRole" required></textarea></label><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="saveAgent" value="default" class="primary">Save</button></div></form></dialog>
+
+<dialog id="taskDialog" class="inspector-dialog">
+  <div class="inspector-head"><div><div class="eyebrow">AGENT INSPECTOR</div><h3 id="taskDialogTitle">Task</h3><div id="taskRuntime" class="inspector-runtime"></div></div><div class="inspector-actions"><button id="openTerminalBtn" class="secondary compact">Open Terminal</button><button id="inspectStop" class="secondary compact danger">Stop</button><button onclick="document.getElementById('taskDialog').close()" class="terminal-close">×</button></div></div>
+  <div class="inspector-tabs"><button data-tab="activity" class="active">Activity</button><button data-tab="diff">Diff</button><button data-tab="contract">Contract</button><button data-tab="raw">Raw</button></div>
+  <div id="activityPane" class="inspector-pane active"><div id="activityFeed" class="activity-feed"></div></div>
+  <div id="diffPane" class="inspector-pane"><pre id="diffText" class="diff-view"></pre></div>
+  <div id="contractPane" class="inspector-pane"><div id="taskContract" class="contract-body"></div></div>
+  <div id="rawPane" class="inspector-pane"><pre id="inspectorRaw" class="full-log inspector-raw"></pre></div>
+  <div class="manual-control">
+    <div class="manual-label"><b>MANUAL CONTROL</b><span id="manualHint">Continue the same Codex thread. Paste a screenshot with ⌘V.</span></div>
+    <div id="conversationHistory" class="conversation-history"></div>
+    <div id="manualAttachments" class="attachment-strip"></div>
+    <div class="manual-composer"><textarea id="manualPrompt" placeholder="Message this agent…"></textarea><button id="manualSend" class="primary">Send ↵</button></div>
+  </div>
+</dialog>
+
+<dialog id="logDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span id="logTitle">task.log</span><button onclick="document.getElementById('logDialog').close()" class="terminal-close">×</button></div><pre id="logText" class="full-log"></pre></dialog>
+<dialog id="planDiffDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span>integration.diff</span><button onclick="document.getElementById('planDiffDialog').close()" class="terminal-close">×</button></div><pre id="planDiffText" class="full-log"></pre></dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>
