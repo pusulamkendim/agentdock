@@ -159,11 +159,10 @@ function renderLive(){
   renderDecisionPanel(p);
   renderConsultationPanel(p);
   renderPlanReview(p,tasks);
-  const rank={running:0,waiting_for_orchestrator:1,waiting_for_user:1,resuming:1,pending:2,failed:3,blocked:3,cancelled:3,attention:3,executed:4,done:4};
-  const sorted=[...tasks].sort((a,b)=>(rank[a.status]??4)-(rank[b.status]??4)||a.seq-b.seq);
-  const doctor=renderDoctor(live.doctor||{}),orch=renderOrchestrator(live.orchestrator||{}),threadPanel=renderOrchestratorThreadPanel(live.orchestrator||{});
+  const sorted=[...tasks].sort((a,b)=>(a.seq??0)-(b.seq??0));
+  const doctor=renderDoctor(live.doctor||{}),orch=renderOrchestrator(live.orchestrator||{});
   const showWorkers=tasks.length>0&&!['planned','approved'].includes(p.status);
-  $('liveGrid').innerHTML=doctor+orch+threadPanel+(showWorkers&&sorted.length?sorted.map(renderTerminal).join(''):(['planning','preflight'].includes(p.status)?'':showWorkers?'<div class="empty-terminal"><span>agentdock@local:~$</span> no tasks_':''));
+  $('liveGrid').innerHTML=doctor+orch+(showWorkers&&sorted.length?sorted.map(renderTerminal).join(''):(['planning','preflight'].includes(p.status)?'':showWorkers?'<div class="empty-terminal"><span>agentdock@local:~$</span> no tasks_':''));
   renderTaskGraph(tasks,p);
 }
 function renderUsage(){const p=live.plan||{},q=live.quota||state.quota||{},mu=live.mission_usage||{};if(p.demo_mode){$('usagePanel').innerHTML=`<div class="usage-card"><span>CODEX QUOTA</span><div>${quotaBucket('5H',q.five_hour)}${quotaBucket('WEEK',q.weekly)}</div></div><div class="usage-card mission-usage demo-usage"><span>MISSION USAGE · DEMO</span><b>0% quota used</b><small>Local simulation only. No Codex model call is made.</small></div>`;return}function delta(d){if(!d)return '—';if(d.reset_during_mission)return 'window reset';const v=d.used_percent_delta;return `${v>0?'+':''}${v}% used`}$('usagePanel').innerHTML=`<div class="usage-card"><span>CODEX QUOTA</span><div>${quotaBucket('5H',q.five_hour)}${quotaBucket('WEEK',q.weekly)}</div></div><div class="usage-card mission-usage"><span>MISSION USAGE${mu.live?' · LIVE':''}</span><b>5H ${delta(mu.five_hour_delta)}</b><b>WEEK ${delta(mu.weekly_delta)}</b><small>Official snapshots; task attribution is not guessed.</small></div>`}
@@ -193,13 +192,6 @@ function renderOrchestrator(o){
   const working=isWorking?`<div class="classic-working"><i></i><b>Working</b><span>(${elapsed(p.started_at||p.created_at,null,live.server_time)} · click to inspect)</span></div>`:'';
   const title=noTask?'Disposition decided':p.status==='planning'?'Analyzing mission and workspace':p.status==='planned'?'Plan ready for review':p.status==='approved'?'Waiting for execution':'Monitoring task graph and integration';
   return `<article class="agent-terminal orchestrator-terminal clickable ${esc(status)}" onclick="openOrchestratorInspector()"><div class="agent-titlebar"><span class="status-led"></span><span class="agent-name">SUPERVISOR / ORCHESTRATOR</span><span class="agent-index">root</span><span class="agent-model">${esc(configLabel(o.model||p.orchestrator_model||'',o.reasoning_effort||p.orchestrator_effort,o.service_tier||p.orchestrator_tier))}</span></div><div class="agent-task"><div class="task-path">mission / control-plane</div><strong>${esc(title)}</strong><p>${esc(waiting||'Owns the disposition, architecture, scope, dependencies, escalation decisions and final synthesis.')}</p></div><div class="mini-terminal orchestrator-log">${working}${recent}</div><div class="agent-footer"><span>control</span><span>${esc(effortLabels[o.reasoning_effort||p.orchestrator_effort]||'')}</span><span class="footer-spacer"></span><button class="text-button" onclick="event.stopPropagation();openOrchestratorInspector(true)">message</button><button class="text-button" onclick="event.stopPropagation();logs('orchestrator:${p.id}','orchestrator')">Raw log</button></div></article>`
-}
-function renderOrchestratorThreadPanel(o){
-  const p=live.plan||{},thread=o.thread_id||p.orchestrator_thread_id||'',legacy=o.legacy_state||p.legacy_orchestrator_status||'',consultations=o.consultations||[];
-  if(!thread&&!legacy&&!consultations.length)return '';
-  const waiting=consultations.filter(x=>['queued','waiting_for_user','resolving'].includes(x.status)).length;
-  const action=['reconstruct_required','reconciliation_required'].includes(legacy)?'<button class="secondary compact" onclick="reconstructOrchestrator(\''+p.id+'\')">'+(legacy==='reconciliation_required'?'Reconcile context':'Reconstruct context')+'</button>':'';
-  return '<div class="orchestrator-thread-panel"><span class="eyebrow">MISSION ORCHESTRATOR SESSION</span><b>'+esc(thread?'One conversation · '+short(thread,22):'Context reconstruction required')+'</b><span>generation '+esc(String(o.generation||p.orchestrator_generation||1))+' · '+esc(o.turn_status||p.orchestrator_turn_status||'idle')+(waiting?' · '+waiting+' consultation(s) waiting':'')+'</span>'+(legacy?'<small>'+esc(legacy==='reconciliation_required'?'Legacy history needs reconciliation':legacy==='reconstruct_required'?'Legacy mission needs explicit reconstruction':legacy)+'</small>':'')+action+'</div>';
 }
 function renderTerminal(t){
   const d=deps(t),logs=['waiting_for_orchestrator','waiting_for_user'].includes(t.status)?[]:(t.recent_logs||[]);let lines='';
