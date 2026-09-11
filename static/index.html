@@ -88,6 +88,8 @@
             <option value="">All statuses</option>
             <option value="active">Active</option>
             <option value="attention">Needs attention</option>
+            <option value="waiting_for_user">Waiting for me</option>
+            <option value="blocked">Blocked</option>
             <option value="done">Completed</option>
           </select>
         </div>
@@ -149,14 +151,10 @@
               <summary>Advanced runtime settings</summary>
               <div class="advanced-panel">
                 <div class="advanced-section">
-                  <h4>Safe recovery</h4>
-                  <p>Normally hidden. These deterministic repairs run before agents start.</p>
+                  <h4>Runtime recovery</h4>
+                  <p>Workspace preflight is read-only. If a choice is needed, AgentDock shows the affected files and asks before changing anything.</p>
                   <div class="toggle-grid">
-                    <label class="toggle"><input id="autoCleanGenerated" type="checkbox" checked><span>Clean generated files</span></label>
-                    <label class="toggle"><input id="autoRepairIgnores" type="checkbox" checked><span>Repair local ignore rules</span></label>
                     <label class="toggle"><input id="autoRetryTransient" type="checkbox" checked><span>Retry transient failures</span></label>
-                    <label class="toggle"><input id="autoPruneWorktrees" type="checkbox" checked><span>Prune stale worktrees</span></label>
-                    <label class="toggle"><input id="autoResolveLocks" type="checkbox" checked><span>Resolve proven stale Git locks</span></label>
                   </div>
                 </div>
                 <div class="advanced-section policy-section">
@@ -189,6 +187,7 @@
         <div id="usagePanel" class="usage-panel"></div>
       </div>
 
+      <section id="decisionPanel" class="surface decision-panel" hidden></section>
       <section id="planReviewPanel" class="surface plan-review-panel" hidden></section>
 
       <div class="live-section-head"><div><span class="eyebrow">AGENTS</span><h3>Orchestrator & workers</h3></div><span class="section-note">Classic working state, Codex-style activity, manual messages and stop controls.</span></div>

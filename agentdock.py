@@ -6,6 +6,7 @@ import json
 import os
 import re
 import select
+import queue
 import signal
 import shutil
 import shlex
@@ -35,6 +36,8 @@ ATTACHMENT_ROOT = STATE_ROOT / "attachments"
 DB_LOCK = threading.RLock()
 RUNNERS = {}
 RUNNERS_LOCK = threading.RLock()
+APP_SERVER_CONTROLS = {}
+APP_SERVER_CONTROLS_LOCK = threading.RLock()
 ACTIVE_PLAN_RUNS = set()
 ACTIVE_PLAN_RUNS_LOCK = threading.RLock()
 ENGINE_STATUS_CACHE = {"ts": 0.0, "value": None}
@@ -52,12 +55,24 @@ DEFAULT_ORCHESTRATOR_TIER = "default"
 DEFAULT_WORKER_TIER = "default"
 MAX_PARALLEL_HARD = 8
 VALID_TIERS = {"default", "fast"}
+MISSION_DECISIONS = {
+    "already_satisfied",
+    "answer_only",
+    "needs_user_input",
+    "blocked",
+    "execute",
+}
+NO_TASK_DECISIONS = {"already_satisfied", "answer_only", "needs_user_input", "blocked"}
+CODEX_TRANSPORT = os.environ.get("AGENTDOCK_CODEX_TRANSPORT", "exec").strip().lower()
 RECOVERY_DEFAULTS = {
-    "auto_clean_generated": True,
-    "auto_repair_ignores": True,
+    # Preflight is intentionally observational. These keys remain in the
+    # persisted policy for backwards compatibility, but are never executed
+    # implicitly; the corresponding repair must be an explicit UI action.
+    "auto_clean_generated": False,
+    "auto_repair_ignores": False,
     "auto_retry_transient": True,
-    "auto_remove_stale_worktrees": True,
-    "auto_resolve_git_locks": True,
+    "auto_remove_stale_worktrees": False,
+    "auto_resolve_git_locks": False,
     "unknown_local_changes": "ask",
     "merge_conflicts": "orchestrator",
     "destructive_operations": "never",
@@ -85,9 +100,17 @@ MODEL_EFFORTS = {
 PLANNER_SCHEMA = {
     "type": "object",
     "properties": {
+        "decision": {
+            "type": "string",
+            "enum": ["already_satisfied", "answer_only", "needs_user_input", "blocked", "execute"],
+        },
+        "reason": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 0, "maxItems": 32},
+        "final_response": {"type": "string"},
+        "questions": {"type": "array", "items": {"type": "string"}, "minItems": 0, "maxItems": 12},
         "tasks": {
             "type": "array",
-            "minItems": 2,
+            "minItems": 0,
             "maxItems": 12,
             "items": {
                 "type": "object",
@@ -132,7 +155,7 @@ PLANNER_SCHEMA = {
             },
         }
     },
-    "required": ["tasks"],
+    "required": ["decision", "reason", "evidence", "final_response", "questions", "tasks"],
     "additionalProperties": False,
 }
 
@@ -294,6 +317,13 @@ def init_db():
         ("finished_at", "INTEGER"),
         ("apply_status", "TEXT NOT NULL DEFAULT ''"),
         ("apply_error", "TEXT NOT NULL DEFAULT ''"),
+        ("decision", "TEXT NOT NULL DEFAULT ''"),
+        ("decision_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("questions_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("final_response", "TEXT NOT NULL DEFAULT ''"),
+        ("workspace_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("replan_note", "TEXT NOT NULL DEFAULT ''"),
     ]:
         ensure_column("plans", name, ddl)
     for name, ddl in [
@@ -564,13 +594,15 @@ def record_codex_event(session_id, task_id, plan_id, raw_line):
         obj = json.loads(raw_line)
     except Exception:
         return None
-    typ = str(obj.get("type") or "event")
-    item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+    params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+    typ = str(obj.get("type") or obj.get("method") or "event")
+    item = obj.get("item") if isinstance(obj.get("item"), dict) else params.get("item") if isinstance(params.get("item"), dict) else {}
     itype = str(item.get("type") or "")
     execute("INSERT INTO agent_events(session_id,plan_id,task_id,ts,event_type,item_type,payload_json) VALUES(?,?,?,?,?,?,?)",
             (session_id, plan_id or "", task_id or "", now(), typ, itype, json.dumps(obj, ensure_ascii=False)[:120000]))
-    if typ == "thread.started":
-        thread_id = str(obj.get("thread_id") or "")
+    if typ in ("thread.started", "thread/started"):
+        thread = obj.get("thread") if isinstance(obj.get("thread"), dict) else params.get("thread") if isinstance(params.get("thread"), dict) else {}
+        thread_id = str(obj.get("thread_id") or thread.get("id") or "")
         if thread_id:
             execute("UPDATE agent_sessions SET thread_id=? WHERE id=?", (thread_id, session_id))
     return obj
@@ -583,6 +615,17 @@ def finish_agent_session(session_id, status, final_response=""):
 
 def latest_agent_session(task_id):
     return one("SELECT * FROM agent_sessions WHERE task_id=? ORDER BY started_at DESC LIMIT 1", (task_id,))
+
+
+def record_control_event(plan_id, event_type, payload=None, task_id=""):
+    """Persist a human-readable control-plane event alongside raw Codex events."""
+    session = latest_agent_session(orchestrator_log_id(plan_id))
+    if not session:
+        return
+    obj = {"type": event_type, "plan_id": plan_id}
+    if isinstance(payload, dict):
+        obj.update(payload)
+    record_codex_event(session["id"], task_id or orchestrator_log_id(plan_id), plan_id, json.dumps(obj, ensure_ascii=False))
 
 
 def plan_attachment_paths(plan):
@@ -698,6 +741,71 @@ def git_status_entries(repo_root):
     return entries
 
 
+def git_remote_details(repo_root):
+    """Return remote fetch/push URLs without changing Git configuration."""
+    names = [x.strip() for x in git(repo_root, "remote", check=False).stdout.splitlines() if x.strip()]
+    remotes = []
+    for name in names:
+        fetch = [x.strip() for x in git(repo_root, "config", "--get-all", f"remote.{name}.url", check=False).stdout.splitlines() if x.strip()]
+        push = [x.strip() for x in git(repo_root, "config", "--get-all", f"remote.{name}.pushurl", check=False).stdout.splitlines() if x.strip()]
+        remotes.append({"name": name, "fetch_urls": fetch, "push_urls": push or fetch})
+    return remotes
+
+
+def workspace_snapshot(workspace):
+    """Build a bounded, deterministic, read-only snapshot for the planner."""
+    resolved = Path(workspace).expanduser().resolve()
+    info = repo_info(resolved)
+    snapshot = {
+        "workspace": str(resolved),
+        "classification": "NOT_GIT",
+        "repo_root": str(resolved),
+        "branch": "",
+        "head": "",
+        "upstream": "",
+        "remotes": [],
+        "tracked_changes": [],
+        "untracked_files": [],
+        "working_tree_clean": True,
+        "write_safety": {
+            "read_only_inspection": "available",
+            "isolated_write": "unavailable",
+            "requires_user_resolution": False,
+        },
+        "captured_at": now(),
+    }
+    if not info.get("is_git"):
+        snapshot["write_safety"]["requires_user_resolution"] = True
+        snapshot["write_safety"]["reason"] = "A write task needs a Git repository for AgentDock isolation."
+        return snapshot
+
+    root = Path(info["root"])
+    entries = git_status_entries(root)
+    tracked = [f"{e['xy']} {e['path']}" for e in entries if e["xy"] != "??"]
+    untracked = [e["path"] for e in entries if e["xy"] == "??"]
+    upstream = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False).stdout.strip()
+    remotes = git_remote_details(root)
+    snapshot.update({
+        "classification": "GIT_WITH_REMOTE" if remotes else "LOCAL_GIT",
+        "repo_root": str(root),
+        "branch": info.get("branch") or "",
+        "head": info.get("head") or "",
+        "workspace_rel": info.get("rel") or ".",
+        "upstream": upstream,
+        "remotes": remotes,
+        "tracked_changes": tracked[:100],
+        "untracked_files": untracked[:100],
+        "working_tree_clean": not entries,
+        "write_safety": {
+            "read_only_inspection": "available",
+            "isolated_write": "available",
+            "requires_user_resolution": bool(entries),
+            "reason": "Working tree changes need an explicit user choice before isolated writes." if entries else "Clean base is available for isolated writes.",
+        },
+    })
+    return snapshot
+
+
 def safe_generated_target(repo_root, rel_path):
     root = Path(repo_root).resolve()
     rel = Path(rel_path)
@@ -783,15 +891,75 @@ def update_preflight(plan_id, status, report):
     write_mission_docs(plan_id)
 
 
+class PreflightWaitingForUser(RuntimeError):
+    def __init__(self, message, report=None):
+        super().__init__(message)
+        self.report = report or {}
+
+
+class PreflightBlocked(RuntimeError):
+    def __init__(self, message, report=None):
+        super().__init__(message)
+        self.report = report or {}
+
+
+def preflight_action_options(has_write, affected_paths, has_read=False):
+    options = []
+    if affected_paths:
+        options.extend([
+            {
+                "id": "ignore",
+                "label": "Ignore selected files locally",
+                "description": "Adds only the selected paths to this repository's local .git/info/exclude.",
+                "requires_paths": True,
+            },
+            {
+                "id": "stage",
+                "label": "Add selected files to Git",
+                "description": "Stages the selected paths; AgentDock never commits them automatically.",
+                "requires_paths": True,
+            },
+            {
+                "id": "move",
+                "label": "Move selected files to AgentDock safe area",
+                "description": "Moves selected untracked files to the local AgentDock preservation area.",
+                "requires_paths": True,
+            },
+        ])
+    options.append({
+        "id": "continue_read_only",
+        "label": "Continue in read-only mode",
+        "description": "Run only read tasks and leave write tasks paused.",
+        "requires_paths": False,
+        "disabled": not has_read,
+    })
+    options.append({
+        "id": "verify_again",
+        "label": "Run verification again",
+        "description": "Repeat the read-only workspace checks after you resolve the reported condition.",
+        "requires_paths": False,
+    })
+    options.append({
+        "id": "cancel",
+        "label": "Cancel mission",
+        "description": "Stop this mission without changing the workspace.",
+        "requires_paths": False,
+    })
+    return options
+
+
 def run_preflight(plan, has_write, phase="execution"):
     plan_id = plan["id"]
-    settings = recovery_settings(plan)
     report = {
         "phase": phase,
         "status": "running",
+        "read_only": True,
         "checks": [],
+        "warnings": [],
         "repairs": [],
         "blockers": [],
+        "affected_paths": [],
+        "action_options": [],
         "started_at": now(),
         "finished_at": None,
     }
@@ -806,93 +974,196 @@ def run_preflight(plan, has_write, phase="execution"):
         report["blockers"].append("Codex CLI PATH içinde bulunamadı")
 
     workspace = Path(plan["workspace"]).expanduser().resolve()
+    snapshot = workspace_snapshot(workspace)
+    report["snapshot"] = snapshot
     info = repo_info(workspace)
+    task_modes = [t.get("mode") for t in rows("SELECT mode FROM tasks WHERE plan_id=?", (plan_id,))]
+    has_read = any(mode == "read" for mode in task_modes)
     if has_write and not info["is_git"]:
-        report["blockers"].append("Parallel write mission requires a Git repository")
+        report["blockers"].append("Write execution needs a Git repository for isolated worktrees")
+        report["action_options"] = preflight_action_options(has_write, [], has_read)
     elif info["is_git"]:
         repo_root = Path(info["root"])
         report["checks"].append(f"Git repository: {repo_root}")
         log(doctor_log_id(plan_id), "system", f"✓ Git repository {repo_root}")
+        if snapshot.get("branch"):
+            report["checks"].append(f"Branch: {snapshot['branch']}")
+        if snapshot.get("upstream"):
+            report["checks"].append(f"Upstream: {snapshot['upstream']}")
+        if snapshot.get("remotes"):
+            report["checks"].append("Remotes: " + ", ".join(x["name"] for x in snapshot["remotes"]))
 
-        if settings.get("auto_remove_stale_worktrees"):
-            dry = git(repo_root, "worktree", "prune", "--dry-run", check=False).stdout.strip()
-            git(repo_root, "worktree", "prune", check=False)
-            if dry:
-                report["repairs"].append("Pruned stale Git worktree metadata")
-                log(doctor_log_id(plan_id), "supervisor", "repaired stale Git worktree metadata")
-            else:
-                report["checks"].append("No stale Git worktrees")
+        # These checks are deliberately read-only. Even stale worktree metadata
+        # and Git locks are reported for an explicit user decision; they are
+        # never pruned or removed by preflight.
+        dry = git(repo_root, "worktree", "prune", "--dry-run", check=False).stdout.strip()
+        if dry:
+            report["warnings"].append("Stale Git worktree metadata is present; no automatic prune was performed.")
+        else:
+            report["checks"].append("No stale Git worktree metadata")
 
-        if settings.get("auto_resolve_git_locks"):
-            fixed, blocked = repair_known_git_locks(repo_root)
-            for item in fixed:
-                report["repairs"].append(f"Removed stale Git lock: {item}")
-                log(doctor_log_id(plan_id), "supervisor", f"removed stale Git lock {item}")
-            report["blockers"].extend(blocked)
+        gitdir = _git_dir(repo_root)
+        for name in ("index.lock", "HEAD.lock", "config.lock"):
+            lock = gitdir / name
+            if not lock.exists():
+                continue
+            age = max(0, time.time() - lock.stat().st_mtime)
+            opened = _path_is_open(lock)
+            owner = "active" if opened else ("ownership unknown" if opened is None else f"{int(age)}s old")
+            report["blockers"].append(f"Git lock requires explicit resolution ({owner}): {lock}")
 
-        if has_write:
-            entries = git_status_entries(repo_root)
-            generated_targets = []
-            unknown = []
-            tracked = []
-            for e in entries:
-                if e["xy"] == "??":
-                    target = safe_generated_target(repo_root, e["path"])
-                    if target:
-                        generated_targets.append(target)
-                    else:
-                        unknown.append(e["path"])
-                else:
-                    tracked.append(f"{e['xy']} {e['path']}")
-
-            if generated_targets and settings.get("auto_clean_generated"):
-                unique = sorted({str(x) for x in generated_targets}, key=lambda x: (len(Path(x).parts), x), reverse=True)
-                removed = []
-                for raw in unique:
-                    target = Path(raw)
-                    # A parent cache dir may already have removed this file.
-                    if target.exists() or target.is_symlink():
-                        _safe_remove_path(repo_root, target)
-                        try:
-                            removed.append(str(target.relative_to(repo_root)))
-                        except Exception:
-                            removed.append(str(target))
-                if removed:
-                    report["repairs"].append("Removed generated artifacts: " + ", ".join(removed[:20]))
-                    log(doctor_log_id(plan_id), "supervisor", "cleaned safe generated artifacts: " + ", ".join(removed[:12]))
-
-            if settings.get("auto_repair_ignores"):
-                missing = repair_local_ignore_rules(repo_root)
-                if missing:
-                    report["repairs"].append("Added generated-file rules to .git/info/exclude: " + ", ".join(missing))
-                    log(doctor_log_id(plan_id), "supervisor", "added safe generated-file rules to .git/info/exclude")
-                else:
-                    report["checks"].append("Local generated-file ignore rules present")
-
-            # Re-read after deterministic cleanup/ignore repair.
-            entries = git_status_entries(repo_root)
-            unknown = [e["path"] for e in entries if e["xy"] == "??"]
-            tracked = [f"{e['xy']} {e['path']}" for e in entries if e["xy"] != "??"]
-
-            if tracked:
-                report["blockers"].append("Tracked user changes detected: " + "; ".join(tracked[:12]))
-            if unknown:
-                report["blockers"].append("Unknown untracked user files detected: " + "; ".join(unknown[:12]))
-            if not tracked and not unknown:
-                report["checks"].append("Working tree clean")
-                log(doctor_log_id(plan_id), "system", "✓ working tree clean")
+        entries = git_status_entries(repo_root)
+        tracked = [f"{e['xy']} {e['path']}" for e in entries if e["xy"] != "??"]
+        unknown = [e["path"] for e in entries if e["xy"] == "??"]
+        affected = [e["path"] for e in entries]
+        report["affected_paths"] = affected[:100]
+        if has_write and affected:
+            report["blockers"].append("User changes detected; isolated write execution needs an explicit workspace choice: " + "; ".join(affected[:12]))
+            report["action_options"] = preflight_action_options(has_write, affected, has_read)
+        elif has_write:
+            report["checks"].append("Working tree clean")
+            log(doctor_log_id(plan_id), "system", "✓ working tree clean")
+        elif affected:
+            report["warnings"].append("Working tree has local changes; read-only inspection does not require a clean tree.")
+            report["checks"].append("Read-only mission may inspect the existing working tree")
+        else:
+            report["checks"].append("Working tree clean")
 
     report["finished_at"] = now()
     if report["blockers"]:
-        report["status"] = "blocked"
+        # Every blocked preflight must expose a safe next step even when the
+        # problem is not tied to a selectable file (for example a missing
+        # Codex binary or a Git lock).
+        if not report["action_options"]:
+            report["action_options"] = preflight_action_options(has_write, report["affected_paths"], has_read)
+        if not codex:
+            for option in report["action_options"]:
+                if option.get("id") == "continue_read_only":
+                    option["disabled"] = True
+        hard_blocker = any("Git lock" in item or "Codex CLI" in item or "needs a Git repository" in item for item in report["blockers"])
+        report["status"] = "blocked" if hard_blocker else "waiting_for_user"
         for b in report["blockers"]:
             log(doctor_log_id(plan_id), "stderr", b)
-        update_preflight(plan_id, "blocked", report)
-        raise RuntimeError("Preflight blocked: " + " | ".join(report["blockers"]))
+        update_preflight(plan_id, report["status"], report)
+        record_control_event(plan_id, "agentdock.preflight", {"status": report["status"], "message": "Preflight needs an explicit user decision before execution."})
+        message = "Preflight waiting for user: " if report["status"] == "waiting_for_user" else "Preflight blocked: "
+        exc = PreflightWaitingForUser if report["status"] == "waiting_for_user" else PreflightBlocked
+        raise exc(message + " | ".join(report["blockers"]), report)
     report["status"] = "ready"
     update_preflight(plan_id, "ready", report)
-    log(doctor_log_id(plan_id), "supervisor", f"preflight ready · repairs={len(report['repairs'])}")
+    record_control_event(plan_id, "agentdock.preflight", {"status": "ready", "message": "Read-only workspace checks complete."})
+    log(doctor_log_id(plan_id), "supervisor", "preflight ready · read-only checks complete")
     return report
+
+
+def selected_preflight_paths(repo_root, plan_id, selected):
+    """Validate paths supplied by the explicit preflight action UI."""
+    if not isinstance(selected, list) or not selected:
+        raise ValueError("En az bir dosya seçilmelidir")
+    root = Path(repo_root).resolve()
+    current = {x["path"]: x for x in git_status_entries(root)}
+    result = []
+    for raw in selected[:100]:
+        rel = str(raw or "").replace("\\", "/").lstrip("./")
+        if not rel or rel not in current or rel.startswith("../") or "/../" in f"/{rel}":
+            raise ValueError(f"Preflight dosya seçimi geçersiz: {raw}")
+        target = (root / rel).resolve()
+        if target == root or root not in target.parents:
+            raise ValueError(f"Preflight dosya seçimi repository dışına çıkıyor: {raw}")
+        result.append((rel, target, current[rel]))
+    return result
+
+
+def apply_preflight_action(plan_id, action, selected=None):
+    """Apply one user-confirmed, narrow workspace action and optionally resume."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    report = safe_json(plan.get("preflight_json"), {})
+    if plan.get("status") not in ("waiting_for_user", "blocked"):
+        raise ValueError("Bu mission şu anda bir preflight kararı beklemiyor")
+    action = str(action or "").strip()
+    if action not in {"ignore", "stage", "move", "continue_read_only", "verify_again", "cancel"}:
+        raise ValueError("Geçersiz preflight aksiyonu")
+
+    if action == "cancel":
+        execute("UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?", ("cancelled", "Mission cancelled by user", now(), plan_id))
+        log(orchestrator_log_id(plan_id), "supervisor", "mission cancelled by user during preflight")
+        write_mission_docs(plan_id)
+        return {"ok": True, "status": "cancelled"}
+
+    info = repo_info(plan["workspace"])
+    if not info.get("is_git"):
+        raise ValueError("Bu aksiyon için workspace bir Git repository olmalı")
+    root = Path(info["root"])
+    selected_rows = selected_preflight_paths(root, plan_id, selected) if action in {"ignore", "stage", "move"} else []
+    changed = []
+    if action == "ignore":
+        common = _git_dir(root, common=True)
+        exclude = common / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text(errors="replace") if exclude.exists() else ""
+        lines = existing.splitlines()
+        current = {line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")}
+        rules = ["/" + rel for rel, _, _ in selected_rows]
+        missing = [rule for rule in rules if rule not in current]
+        if missing:
+            prefix = "" if not existing or existing.endswith("\n") else "\n"
+            with exclude.open("a") as handle:
+                handle.write(prefix + "\n# AgentDock explicit local ignore action\n")
+                for rule in missing:
+                    handle.write(rule + "\n")
+            changed = missing
+        log(orchestrator_log_id(plan_id), "supervisor", "user explicitly added local ignore rules: " + ", ".join(rules))
+    elif action == "stage":
+        git(root, "add", "--", *[rel for rel, _, _ in selected_rows])
+        changed = [rel for rel, _, _ in selected_rows]
+        log(orchestrator_log_id(plan_id), "supervisor", "user explicitly staged files (no commit created): " + ", ".join(changed))
+    elif action == "move":
+        safe_root = ATTACHMENT_ROOT / plan_id / "preflight-preserved"
+        moved = []
+        for rel, target, entry in selected_rows:
+            if entry.get("xy") != "??":
+                raise ValueError(f"Yalnızca untracked dosyalar safe area'ya taşınabilir: {rel}")
+            if not target.exists() and not target.is_symlink():
+                raise ValueError(f"Dosya artık bulunamadı: {rel}")
+            destination = safe_root / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists() or destination.is_symlink():
+                raise ValueError(f"Safe area hedefi zaten var: {destination}")
+            shutil.move(str(target), str(destination))
+            moved.append({"path": rel, "preserved_at": str(destination)})
+        changed = moved
+        log(orchestrator_log_id(plan_id), "supervisor", "user explicitly moved files to AgentDock safe area: " + ", ".join(x["path"] for x in moved))
+    elif action == "continue_read_only":
+        tasks = rows("SELECT mode FROM tasks WHERE plan_id=?", (plan_id,))
+        if not any(t.get("mode") == "read" for t in tasks):
+            raise ValueError("Bu mission içinde read-only çalıştırılabilecek task yok")
+        execute("UPDATE plans SET status=?,error=? WHERE id=?", ("approved", "", plan_id))
+        if claim_plan_run(plan_id):
+            threading.Thread(target=run_plan, args=(plan_id,), kwargs={"claimed": True, "read_only_only": True}, daemon=True).start()
+        return {"ok": True, "status": "approved", "resuming": True, "read_only_only": True}
+
+    refreshed = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    phase = report.get("phase") or "execution"
+    has_write = any(t.get("mode") == "write" for t in rows("SELECT mode FROM tasks WHERE plan_id=?", (plan_id,)))
+    try:
+        latest_report = run_preflight(refreshed, has_write, phase=phase)
+    except PreflightWaitingForUser as exc:
+        return {"ok": True, "status": "waiting_for_user", "report": exc.report, "changed": changed}
+    except PreflightBlocked as exc:
+        return {"ok": True, "status": "blocked", "report": exc.report, "changed": changed}
+
+    if phase == "execution":
+        execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("approved", "", plan_id))
+        log(orchestrator_log_id(plan_id), "supervisor", "preflight resolved by user; resuming mission automatically")
+        if claim_plan_run(plan_id):
+            threading.Thread(target=run_plan, args=(plan_id,), kwargs={"claimed": True}, daemon=True).start()
+        return {"ok": True, "status": "approved", "resuming": True, "report": latest_report, "changed": changed}
+    execute("UPDATE plans SET status=?,apply_status=?,apply_error=?,error=? WHERE id=?", ("awaiting_apply", "ready", "", "", plan_id))
+    log(orchestrator_log_id(plan_id), "supervisor", "apply preflight resolved by user; diff is ready for review")
+    write_mission_docs(plan_id)
+    return {"ok": True, "status": "awaiting_apply", "report": latest_report, "changed": changed}
 
 
 def reset_plan_for_retry(plan):
@@ -968,7 +1239,7 @@ def engine_status(force=False):
 
     codex = shutil.which("codex")
     out = {
-        "codex": {"installed": bool(codex), "path": codex, "version": "", "login": "unknown", "models": []},
+        "codex": {"installed": bool(codex), "path": codex, "version": "", "login": "unknown", "models": [], "app_server": bool(codex), "transport": CODEX_TRANSPORT},
         "git": {"installed": bool(shutil.which("git")), "path": shutil.which("git")},
     }
     if codex:
@@ -1228,6 +1499,9 @@ def write_mission_docs(plan_id):
     usage = mission_usage(plan)
     recovery = recovery_settings(plan)
     preflight = safe_json(plan.get("preflight_json"), {})
+    evidence = safe_json(plan.get("evidence_json"), [])
+    questions = safe_json(plan.get("questions_json"), [])
+    snapshot = safe_json(plan.get("workspace_snapshot_json"), {})
     mission = f"""# AgentDock Mission {plan_id}
 
 - Status: `{plan['status']}`
@@ -1239,10 +1513,25 @@ def write_mission_docs(plan_id):
 - Started: `{plan.get('started_at') or ''}`
 - Finished: `{plan.get('finished_at') or ''}`
 - Apply: `{plan.get('apply_status') or 'not applicable'}`
+- Mission disposition: `{plan.get('decision') or 'not decided'}`
 
 ## Goal
 
 {plan['goal']}
+
+## Mission disposition
+
+- Decision: `{plan.get('decision') or 'not decided'}`
+- Reason: {plan.get('decision_reason') or 'Not decided yet.'}
+- Final response: {plan.get('final_response') or '—'}
+- Evidence: {', '.join(str(x) for x in evidence) or '—'}
+- Questions: {', '.join(str(x) for x in questions) or '—'}
+
+## Workspace snapshot
+
+```json
+{json.dumps(snapshot, ensure_ascii=False, indent=2)}
+```
 
 ## Recovery policy
 
@@ -1295,7 +1584,7 @@ def write_mission_docs(plan_id):
 """
         (td / f"TASK-{t['seq']+1:03d}.md").write_text(content)
     preflight_md = ["# Preflight & Recovery", "", f"Status: `{plan.get('preflight_status') or 'not run'}`", ""]
-    for title, key in (("Checks", "checks"), ("Repairs", "repairs"), ("Blockers", "blockers")):
+    for title, key in (("Checks", "checks"), ("Warnings", "warnings"), ("Repairs", "repairs"), ("Blockers", "blockers"), ("Action options", "action_options")):
         preflight_md += [f"## {title}", ""]
         values = preflight.get(key) or []
         preflight_md += [f"- {x}" for x in values] or ["- None"]
@@ -1326,8 +1615,14 @@ def parse_codex_final(stdout):
             obj = json.loads(line)
         except Exception:
             continue
-        item = obj.get("item") or {}
-        if obj.get("type") == "item.completed" and item.get("type") == "agent_message":
+        params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+        item = obj.get("item") or params.get("item") or {}
+        item_type = str(item.get("type") or "").replace("-", "_")
+        if obj.get("type") == "item.completed" and item_type in ("agent_message", "agentMessage"):
+            text = normalize(item.get("text") or item.get("message"))
+            if text:
+                final.append(text)
+        if obj.get("method") == "item/completed" and item_type in ("agentMessage", "agent_message"):
             text = normalize(item.get("text") or item.get("message"))
             if text:
                 final.append(text)
@@ -1344,30 +1639,49 @@ def pretty_codex_event(line):
         obj = json.loads(raw)
     except Exception:
         return raw
-    typ = obj.get("type") or "event"
-    item = obj.get("item") or {}
-    itype = item.get("type") or ""
-    if itype in ("agent_message", "message"):
+    typ = obj.get("type") or obj.get("method") or "event"
+    params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+    item = obj.get("item") or params.get("item") or {}
+    itype = str(item.get("type") or "")
+    normalized_type = re.sub(r"(?<!^)(?=[A-Z])", "_", itype).replace("-", "_").lower()
+    if normalized_type in ("agent_message", "message"):
         text = item.get("text") or item.get("message") or ""
+        try:
+            parsed = json.loads(text) if isinstance(text, str) else None
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and ("decision" in parsed or "tasks" in parsed):
+            return "planner response captured · structured disposition parsed"
         return f"agent: {text}" if text else typ
-    if itype in ("command_execution", "command"):
+    if normalized_type in ("command_execution", "command"):
         cmd = item.get("command") or item.get("cmd") or ""
         status = item.get("status") or ""
         return f"cmd {status}: {cmd}".strip()
-    if itype in ("reasoning", "analysis"):
-        text = item.get("text") or item.get("summary") or ""
+    if normalized_type in ("reasoning", "analysis"):
+        summary = item.get("summary")
+        if isinstance(summary, list):
+            summary_parts = []
+            for part in summary:
+                if isinstance(part, str):
+                    summary_parts.append(part)
+                elif isinstance(part, dict):
+                    value = part.get("text") or part.get("summary") or part.get("content") or ""
+                    if value:
+                        summary_parts.append(str(value))
+            summary = " ".join(summary_parts)
+        text = item.get("text") or summary or ""
         return f"thinking: {text}" if text else typ
-    if itype == "file_change":
+    if normalized_type == "file_change":
         changes = item.get("changes") or []
         detail = ", ".join(f"{c.get('kind','?')} {c.get('path','')}" for c in changes[:8])
         return f"files {item.get('status','')}: {detail}".strip()
-    if itype == "todo_list":
+    if normalized_type == "todo_list":
         todos = item.get("items") or []
         done = sum(1 for x in todos if x.get("completed"))
         return f"todo: {done}/{len(todos)} complete"
-    if itype == "web_search":
+    if normalized_type == "web_search":
         return f"web search: {item.get('query','')}"
-    if itype in ("mcp_tool_call", "collab_tool_call"):
+    if normalized_type in ("mcp_tool_call", "collab_tool_call"):
         return f"tool {item.get('status','')}: {item.get('tool') or item.get('server') or itype}"
     text = obj.get("text") or obj.get("message") or ""
     if isinstance(text, str) and text:
@@ -1387,8 +1701,264 @@ def infer_plan_id(task_id):
     return task.get("plan_id", "") if task else ""
 
 
+def _app_server_sandbox(workspace, mode):
+    if mode == "write":
+        return {"type": "workspaceWrite", "writableRoots": [str(workspace)]}
+    return {"type": "readOnly", "access": {"type": "fullAccess"}}
+
+
+def app_server_input_items(prompt, images=None, task_id=None):
+    items = []
+    if str(prompt or "").strip():
+        items.append({"type": "text", "text": str(prompt)})
+    for raw in images or []:
+        path = Path(str(raw)).expanduser().resolve()
+        if path.is_file():
+            items.append({"type": "localImage", "path": str(path)})
+        else:
+            log(task_id, "supervisor", f"App Server image attachment skipped because it no longer exists: {path}")
+    return items or [{"type": "text", "text": "Continue the assigned task."}]
+
+
+def run_codex_app_server(prompt, workspace, mode="read", model="", task_id=None, reasoning_effort="", service_tier="default",
+                         images=None, resume_thread_id="", session_kind="worker", output_schema=""):
+    """Run one Codex turn through the line-delimited App Server protocol.
+
+    The client is intentionally short-lived per turn. This gives AgentDock the
+    App Server event vocabulary and resumable thread ids without introducing a
+    daemon lifecycle dependency; resume_thread_id keeps the conversation
+    continuous. The legacy exec transport remains available as the default.
+    """
+    del service_tier  # App Server currently receives the model/effort controls used here.
+    workspace = str(Path(workspace).expanduser().resolve())
+    if not Path(workspace).is_dir():
+        raise RuntimeError(f"Workspace bulunamadı: {workspace}")
+    exe = shutil.which("codex")
+    if not exe:
+        raise RuntimeError("codex CLI PATH içinde bulunamadı")
+    plan_id = infer_plan_id(task_id)
+    session_id = create_agent_session(plan_id, task_id or "", session_kind, model, reasoning_effort, "default", mode, workspace)
+    proc = subprocess.Popen(
+        [exe, "app-server", "--stdio"],
+        cwd=workspace,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    with RUNNERS_LOCK:
+        if task_id:
+            RUNNERS[task_id] = proc
+    stderr_buf = []
+    messages = []
+    stdout_queue = queue.Queue()
+    send_lock = threading.Lock()
+    deferred_messages = []
+
+    def drain_stderr():
+        try:
+            for line in iter(proc.stderr.readline, ""):
+                stderr_buf.append(line)
+                log(task_id, "stderr", line.rstrip("\n"))
+        except Exception:
+            pass
+
+    threading.Thread(target=drain_stderr, daemon=True).start()
+
+    def drain_stdout():
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                stdout_queue.put(("line", line))
+        finally:
+            stdout_queue.put(("eof", ""))
+
+    # Reading App Server stdout on its own thread avoids a subtle interaction
+    # between select() and TextIOWrapper's user-space read buffer: one read can
+    # contain several JSON messages, while the file descriptor then appears
+    # non-readable even though another complete line is already buffered.
+    threading.Thread(target=drain_stdout, daemon=True).start()
+
+    def send(obj):
+        with send_lock:
+            if proc.poll() is not None:
+                raise RuntimeError("Codex App Server process is no longer running")
+            proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+
+    def read_message(deadline):
+        while time.time() < deadline:
+            remaining = max(0.05, deadline - time.time())
+            try:
+                kind, line = stdout_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if kind == "eof":
+                break
+            try:
+                return json.loads(line)
+            except Exception:
+                log(task_id, "stdout", line.rstrip("\n"))
+        detail = "".join(stderr_buf)[-2000:]
+        raise RuntimeError(f"Codex app-server bağlantısı sonlandı veya zaman aşımına uğradı. {detail}".strip())
+
+    def persist(message):
+        messages.append(message)
+        raw = json.dumps(message, ensure_ascii=False)
+        record_codex_event(session_id, task_id or "", plan_id, raw)
+        log(task_id, "stdout", pretty_codex_event(raw))
+
+    def answer_server_request(message):
+        method = str(message.get("method") or "")
+        if not message.get("id") or not method:
+            return
+        if "requestApproval" in method:
+            # AgentDock's controlled worker path never auto-approves an
+            # unexpected server approval request. The user can steer/retry.
+            send({"id": message["id"], "result": {"decision": "decline"}})
+            log(task_id, "supervisor", "App Server approval request declined by AgentDock safety policy")
+
+    def request(request_id, method, params):
+        send({"id": request_id, "method": method, "params": params})
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            message = read_message(deadline)
+            persist(message)
+            if message.get("method"):
+                answer_server_request(message)
+            if message.get("id") == request_id:
+                if message.get("error"):
+                    raise RuntimeError(str(message["error"]))
+                return message.get("result") or {}
+            if message.get("method"):
+                # JSON-RPC notifications are allowed to arrive before the
+                # response to a request. Keep them for the turn event loop
+                # instead of losing a fast completion notification.
+                deferred_messages.append(message)
+        raise RuntimeError(f"Codex app-server {method} isteği zaman aşımına uğradı")
+
+    def next_event(deadline):
+        if deferred_messages:
+            return deferred_messages.pop(0)
+        return read_message(deadline)
+
+    final = ""
+    completed_status = "failed"
+    try:
+        request(1, "initialize", {
+            "clientInfo": {"name": "agentdock", "title": "AgentDock", "version": "0.11.0"},
+            "capabilities": {"experimentalApi": True},
+        })
+        send({"method": "initialized", "params": {}})
+        thread_params = {"model": model or DEFAULT_WORKER, "cwd": workspace, "serviceName": "agentdock"}
+        if resume_thread_id:
+            thread_result = request(2, "thread/resume", {"threadId": resume_thread_id})
+        else:
+            thread_result = request(2, "thread/start", thread_params)
+        thread = thread_result.get("thread") if isinstance(thread_result, dict) else {}
+        thread_id = str((thread or {}).get("id") or resume_thread_id or "")
+        if thread_id:
+            execute("UPDATE agent_sessions SET thread_id=? WHERE id=?", (thread_id, session_id))
+
+        turn_params = {
+            "threadId": thread_id,
+            "input": app_server_input_items(prompt, images, task_id),
+            "cwd": workspace,
+            "model": model or DEFAULT_WORKER,
+            "effort": reasoning_effort or DEFAULT_WORKER_EFFORT,
+            "approvalPolicy": "never",
+            "sandboxPolicy": _app_server_sandbox(workspace, mode),
+            "summary": "concise",
+        }
+        if output_schema:
+            schema_path = Path(output_schema).expanduser().resolve()
+            if not schema_path.is_file():
+                raise RuntimeError(f"Codex output schema bulunamadı: {schema_path}")
+            turn_params["outputSchema"] = json.loads(schema_path.read_text())
+        turn_result = request(3, "turn/start", turn_params)
+        turn = turn_result.get("turn") if isinstance(turn_result, dict) else {}
+        turn_id = str((turn or {}).get("id") or "")
+        if task_id and thread_id and turn_id:
+            with APP_SERVER_CONTROLS_LOCK:
+                APP_SERVER_CONTROLS[task_id] = {
+                    "send": send,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "next_request_id": 1000,
+                    "pending": {},
+                }
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            message = next_event(deadline)
+            persist(message)
+            if message.get("method"):
+                answer_server_request(message)
+            if message.get("id"):
+                with APP_SERVER_CONTROLS_LOCK:
+                    control = APP_SERVER_CONTROLS.get(task_id) if task_id else None
+                    message_id = control.get("pending", {}).pop(message["id"], None) if control else None
+                if message_id:
+                    if message.get("error"):
+                        error = str(message["error"])
+                        execute("UPDATE task_messages SET status=?,error=? WHERE id=?", ("failed", error, message_id))
+                        log(task_id, "manual", f"App Server steer failed: {error}")
+                    else:
+                        execute("UPDATE task_messages SET status=?,error=? WHERE id=?", ("delivered", "", message_id))
+                        log(task_id, "manual", "App Server steer delivered to the active turn")
+            method = message.get("method") or ""
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            if method in ("turn/completed", "turn/failed"):
+                event_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                event_turn_id = str(params.get("turnId") or event_turn.get("id") or "")
+                if not turn_id or not event_turn_id or event_turn_id == turn_id:
+                    completed_status = str(event_turn.get("status") or params.get("status") or ("failed" if method == "turn/failed" else "completed"))
+                    break
+        else:
+            raise RuntimeError("Codex app-server turn zaman aşımına uğradı")
+
+        if completed_status not in ("completed", "complete", "success"):
+            raise RuntimeError(f"Codex turn tamamlanmadı: {completed_status}")
+        final = parse_codex_final("\n".join(json.dumps(x, ensure_ascii=False) for x in messages))
+        if not final:
+            final = "App Server turn completed without an agent message."
+        finish_agent_session(session_id, "completed", final)
+        return final
+    except Exception as exc:
+        cancelled = bool(task_id and (one("SELECT status FROM tasks WHERE id=?", (task_id,)) or {}).get("status") == "cancelled")
+        finish_agent_session(session_id, "cancelled" if cancelled else "failed", str(exc))
+        raise
+    finally:
+        with APP_SERVER_CONTROLS_LOCK:
+            control = APP_SERVER_CONTROLS.pop(task_id, None) if task_id else None
+            pending_message_ids = list((control or {}).get("pending", {}).values())
+        for message_id in pending_message_ids:
+            execute("UPDATE task_messages SET status=?,error=? WHERE id=? AND status=?", ("failed", "App Server turn ended before this message was delivered", message_id, "sending"))
+        with RUNNERS_LOCK:
+            if task_id:
+                RUNNERS.pop(task_id, None)
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=1)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
 def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_effort="", service_tier="default",
               images=None, resume_thread_id="", session_kind="worker", output_schema=""):
+    if CODEX_TRANSPORT in ("app-server", "app_server"):
+        return run_codex_app_server(prompt, workspace, mode, model, task_id, reasoning_effort, service_tier,
+                                    images=images, resume_thread_id=resume_thread_id, session_kind=session_kind,
+                                    output_schema=output_schema)
     workspace = str(Path(workspace).expanduser().resolve())
     if not Path(workspace).is_dir():
         raise RuntimeError(f"Workspace bulunamadı: {workspace}")
@@ -1472,6 +2042,39 @@ def run_codex(prompt, workspace, mode="read", model="", task_id=None, reasoning_
     return final
 
 
+def steer_app_server(task_id, message_id, prompt, image_paths=None):
+    """Deliver a user message to an active App Server turn when possible."""
+    with APP_SERVER_CONTROLS_LOCK:
+        control = APP_SERVER_CONTROLS.get(task_id)
+        if not control:
+            return False
+        request_id = control["next_request_id"]
+        control["next_request_id"] += 1
+        control["pending"][request_id] = message_id
+        thread_id = control["thread_id"]
+        turn_id = control["turn_id"]
+
+    request = {
+        "id": request_id,
+        "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "input": app_server_input_items(prompt, image_paths, task_id),
+            "expectedTurnId": turn_id,
+        },
+    }
+    try:
+        control["send"](request)
+        log(task_id, "manual", "user message sent to the active App Server turn")
+        return True
+    except Exception as exc:
+        with APP_SERVER_CONTROLS_LOCK:
+            control["pending"].pop(request_id, None)
+        execute("UPDATE task_messages SET status=?,error=? WHERE id=?", ("failed", str(exc), message_id))
+        log(task_id, "manual", f"App Server steer could not be sent: {exc}")
+        return False
+
+
 def orchestrator_models(requested):
     if requested == "auto-best":
         return ["gpt-6-astra", "gpt-5.6-sol"]
@@ -1500,14 +2103,23 @@ def run_orchestrator(prompt, workspace, requested_model, task_id=None, reasoning
     raise RuntimeError("\n\n".join(errors))
 
 
-def planner_prompt(goal, agents, worker_model, worker_effort, worker_tier, max_parallel):
+def planner_prompt(goal, agents, worker_model, worker_effort, worker_tier, max_parallel, snapshot=None, planner_instruction=""):
     roster = "\n".join(
         [f"- {a['id']}: {a['name']} — {a['role']} — default mode={a['mode']}" for a in agents]
     )
+    snapshot = snapshot or {}
+    extra = f"\nUSER / CONTROL-PLANE INSTRUCTION:\n{planner_instruction}\n" if planner_instruction else ""
     return f"""You are the root orchestrator of a local multi-agent coding harness. Workers use a smaller execution model and MUST NOT be forced to make product, architecture, scope, or prioritization decisions.
 
 GOAL:
 {goal}
+
+MISSION DISPOSITION FIRST:
+Before creating any worker task, inspect the workspace and decide what this mission actually requires. Creating tasks is optional. A mission that is already satisfied, asks only for an explanation, needs a missing user/product decision, or cannot be performed safely must have zero tasks.
+
+DETERMINISTIC WORKSPACE SNAPSHOT (read-only, captured before this model call):
+{json.dumps(snapshot, ensure_ascii=False, indent=2)}
+{extra}
 
 WORKER DEFAULT:
 model={worker_model}
@@ -1522,6 +2134,11 @@ AVAILABLE WORKER PROFILES:
 
 Return ONLY valid JSON with this exact shape:
 {{
+  "decision": "already_satisfied|answer_only|needs_user_input|blocked|execute",
+  "reason": "short reason for the disposition",
+  "evidence": ["workspace facts or checks actually inspected"],
+  "final_response": "user-facing result when no worker task is needed, or an empty string for execute",
+  "questions": ["concrete question for the user when decision is needs_user_input"],
   "tasks": [
     {{
       "title": "...",
@@ -1546,7 +2163,13 @@ Return ONLY valid JSON with this exact shape:
 }}
 
 Rules:
-- Produce 2-12 focused tasks.
+- `tasks` may contain 0-12 tasks.
+- Use `already_satisfied` only when evidence proves the requested outcome already holds.
+- Use `answer_only` for a direct explanation/report that does not require a worker.
+- Use `needs_user_input` when a product, scope, priority, credential, or other user decision is missing. Include 1-3 concrete questions and keep tasks empty.
+- Use `blocked` for a safety, authority, permission, or destructive-operation boundary. Never present a blocked mission as complete; keep tasks empty.
+- Use `execute` only when work is actually required, and then include at least one task. A simple change or verification may use exactly one task.
+- If the user explicitly asks to create an execution plan anyway, honor that request with the smallest honest read or write task graph; do not invent changes.
 - Decompose aggressively when independent work can run in parallel.
 - Dependencies are zero-based indexes of earlier tasks.
 - Tasks with no dependency relationship may run at the same time.
@@ -1554,7 +2177,7 @@ Rules:
 - Parallel write tasks MUST be logically independent and target disjoint files/modules whenever possible.
 - Do not serialize tasks merely because they belong to the same goal.
 - Include integration-aware verification after implementation when appropriate.
-- Include a final independent review task for code-changing goals.
+- Include a final independent review task for code-changing goals when it materially improves safety; do not manufacture a second task for a simple change.
 - Every contract must be sufficiently detailed for a smaller worker model to execute without re-planning the task.
 - Give bounded allowed_paths. If an exact file is not yet known, specify a narrow directory/pattern and the exact symbol/behavior to locate.
 - Acceptance criteria must be testable. Avoid vague requirements such as "make it robust" without defining what robust means here.
@@ -1576,6 +2199,54 @@ def extract_json(text):
     if not m:
         raise ValueError("Orchestrator geçerli JSON döndürmedi")
     return json.loads(m.group(0))
+
+
+def normalize_planner_result(obj):
+    """Validate disposition invariants before materializing any tasks."""
+    if not isinstance(obj, dict):
+        raise ValueError("Orchestrator plan response must be an object")
+    decision = str(obj.get("decision") or "").strip()
+    tasks = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
+    # Keep compatibility with pre-disposition planner responses already in the
+    # local database/test fixtures, while all new model calls use the strict
+    # schema above.
+    if not decision and tasks:
+        decision = "execute"
+    if decision not in MISSION_DECISIONS:
+        raise ValueError(f"Invalid mission disposition: {decision or 'missing'}")
+    if len(tasks) > 12:
+        raise ValueError("Orchestrator returned more than 12 tasks")
+    if decision == "execute" and not tasks:
+        raise ValueError("execute disposition requires at least one task")
+    if decision != "execute" and tasks:
+        raise ValueError(f"{decision} disposition must not contain tasks")
+
+    evidence = obj.get("evidence") if isinstance(obj.get("evidence"), list) else []
+    questions = obj.get("questions") if isinstance(obj.get("questions"), list) else []
+    evidence = [str(x) for x in evidence if str(x).strip()][:32]
+    questions = [str(x) for x in questions if str(x).strip()][:12]
+    reason = str(obj.get("reason") or "").strip()
+    final_response = str(obj.get("final_response") or "").strip()
+    if not reason and decision == "execute" and tasks:
+        reason = "Execution tasks returned by a legacy planner response."
+    if not reason:
+        raise ValueError("Planner disposition reason is required")
+    if decision == "already_satisfied" and not evidence:
+        raise ValueError("already_satisfied requires evidence")
+    if decision == "needs_user_input" and not questions:
+        raise ValueError("needs_user_input requires at least one question")
+    if decision == "blocked" and not final_response:
+        final_response = reason
+    if decision in ("already_satisfied", "answer_only") and not final_response:
+        final_response = reason
+    return {
+        "decision": decision,
+        "reason": reason,
+        "evidence": evidence,
+        "final_response": final_response,
+        "questions": questions,
+        "tasks": tasks,
+    }
 
 
 def task_dependency_context(task):
@@ -2042,12 +2713,20 @@ def build_plan(plan_id):
     if not plan:
         return
     try:
+        # Capture repository/workspace facts before the model is asked to make
+        # a disposition. This is read-only and is also shown as evidence.
+        log(orchestrator_log_id(plan_id), "supervisor", "analyzing workspace before deciding whether tasks are needed")
+        snapshot = workspace_snapshot(plan["workspace"])
+        execute("UPDATE plans SET workspace_snapshot_json=? WHERE id=?", (json.dumps(snapshot, ensure_ascii=False), plan_id))
         log(orchestrator_log_id(plan_id), "supervisor", "capturing Codex quota baseline")
         start_usage = quota_status(force=True, wait=True)
         execute("UPDATE plans SET usage_start_json=? WHERE id=?", (json.dumps(start_usage), plan_id))
         agents = rows("SELECT * FROM agents ORDER BY created_at")
-        prompt = planner_prompt(plan["goal"], agents, plan["worker_model"], plan["worker_effort"], plan["worker_tier"], plan["max_parallel"])
-        log(orchestrator_log_id(plan_id), "supervisor", "planning mission and writing execution contracts")
+        prompt = planner_prompt(
+            plan["goal"], agents, plan["worker_model"], plan["worker_effort"], plan["worker_tier"],
+            plan["max_parallel"], snapshot=snapshot, planner_instruction=plan.get("replan_note") or "",
+        )
+        log(orchestrator_log_id(plan_id), "supervisor", "workspace analysis complete · disposition is now being decided")
         recovery = recovery_settings(plan)
         text, used_model = run_orchestrator(
             prompt, plan["workspace"], plan["orchestrator_model"], orchestrator_log_id(plan_id),
@@ -2056,12 +2735,58 @@ def build_plan(plan_id):
             images=plan_attachment_paths(plan),
             output_schema=planner_schema_path(),
         )
-        obj = extract_json(text)
-        items = obj.get("tasks") or []
-        if not items:
-            raise ValueError("Orchestrator görev üretmedi")
+        obj = normalize_planner_result(extract_json(text))
+        items = obj["tasks"]
         valid_ids = {a["id"] for a in agents}
-        for i, it in enumerate(items[:12]):
+        disposition = obj["decision"]
+        disposition_label = {
+            "already_satisfied": "Already satisfied",
+            "answer_only": "Answer only",
+            "needs_user_input": "Waiting for user input",
+            "blocked": "Blocked for safety or authority",
+            "execute": "Execution required",
+        }[disposition]
+        record_control_event(plan_id, "agentdock.workspace", {
+            "classification": snapshot.get("classification"),
+            "repo_root": snapshot.get("repo_root"),
+            "branch": snapshot.get("branch"),
+            "upstream": snapshot.get("upstream"),
+            "remote_names": [x.get("name") for x in snapshot.get("remotes") or []],
+            "working_tree_clean": snapshot.get("working_tree_clean"),
+        })
+        log(orchestrator_log_id(plan_id), "supervisor", f"mission disposition · {disposition_label}")
+        log(orchestrator_log_id(plan_id), "supervisor", f"reason · {obj['reason']}")
+        for evidence in obj["evidence"]:
+            log(orchestrator_log_id(plan_id), "supervisor", f"evidence · {evidence}")
+        for question in obj["questions"]:
+            log(orchestrator_log_id(plan_id), "supervisor", f"question · {question}")
+        record_control_event(plan_id, "agentdock.disposition", {
+            "decision": disposition,
+            "reason": obj["reason"],
+            "evidence": obj["evidence"],
+            "final_response": obj["final_response"],
+            "questions": obj["questions"],
+            "task_count": len(items),
+        })
+
+        if disposition in NO_TASK_DECISIONS:
+            status = "done" if disposition in ("already_satisfied", "answer_only") else ("waiting_for_user" if disposition == "needs_user_input" else "blocked")
+            summary = obj["final_response"] or obj["reason"]
+            error = obj["reason"] if disposition == "blocked" else ""
+            finished = now() if status == "done" else None
+            execute(
+                "UPDATE plans SET decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,summary=?,error=?,status=?,orchestrator_used=?,finished_at=? WHERE id=?",
+                (
+                    disposition, obj["reason"], json.dumps(obj["evidence"], ensure_ascii=False),
+                    json.dumps(obj["questions"], ensure_ascii=False), obj["final_response"], summary,
+                    error, status, used_model, finished, plan_id,
+                ),
+            )
+            log(orchestrator_log_id(plan_id), "supervisor", f"no execution needed · {len(items)} tasks created")
+            write_mission_docs(plan_id)
+            return
+
+        for i, it in enumerate(items):
             agent_id = it.get("agent_id") if it.get("agent_id") in valid_ids else agents[0]["id"]
             deps = [d for d in it.get("depends_on", []) if isinstance(d, int) and 0 <= d < i]
             mode = it.get("mode", "read") if it.get("mode") in ("read", "write") else "read"
@@ -2074,13 +2799,61 @@ def build_plan(plan_id):
                     agent_id, mode, json.dumps(deps), "pending", json.dumps(contract, ensure_ascii=False),
                 ),
             )
-        execute("UPDATE plans SET status=?, orchestrator_used=? WHERE id=?", ("planned", used_model, plan_id))
-        log(orchestrator_log_id(plan_id), "supervisor", f"plan ready: {len(items[:12])} tasks")
+            record_control_event(plan_id, "agentdock.task", {
+                "seq": i,
+                "title": it.get("title", f"Task {i+1}"),
+                "agent_id": agent_id,
+                "mode": mode,
+                "depends_on": deps,
+            })
+            task_title = it.get("title") or f"Task {i+1}"
+            dep_label = ",".join(str(d + 1) for d in deps) or "none"
+            log(orchestrator_log_id(plan_id), "supervisor", f"TASK-{i+1:03d} · {task_title} · {mode} · deps={dep_label}")
+        execute(
+            "UPDATE plans SET decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,status=?,orchestrator_used=?,error=?,finished_at=NULL WHERE id=?",
+            (
+                disposition, obj["reason"], json.dumps(obj["evidence"], ensure_ascii=False),
+                json.dumps(obj["questions"], ensure_ascii=False), obj["final_response"], "planned", used_model, "", plan_id,
+            ),
+        )
+        log(orchestrator_log_id(plan_id), "supervisor", f"execution plan ready · {len(items)} task(s)")
         write_mission_docs(plan_id)
     except Exception as e:
         execute("UPDATE plans SET status=?, error=? WHERE id=?", ("attention", str(e), plan_id))
         log(orchestrator_log_id(plan_id), "supervisor", f"planning failed: {e}")
         write_mission_docs(plan_id)
+
+
+def replan_mission(plan_id, mode="reconsider", user_note=""):
+    """Start a fresh disposition pass after an explicit user action."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise ValueError("Mission bulunamadı")
+    if plan.get("status") in ("planning", "preflight", "running"):
+        raise ValueError("Mission zaten çalışıyor")
+    if mode == "force_execute" and plan.get("decision") in ("blocked", "needs_user_input"):
+        raise ValueError("Güvenlik veya eksik kullanıcı kararı varken execution planı zorlanamaz")
+    instructions = {
+        "force_execute": "The user explicitly requested an execution plan anyway. If no file change is needed, create the smallest honest read-only verification task rather than inventing a write.",
+        "verify": "Run a fresh read-only verification of the original mission and workspace before deciding. Keep zero tasks if the outcome is already satisfied.",
+        "reconsider": "Reconsider the mission disposition using fresh workspace evidence. Do not create tasks unless actual work is required.",
+        "answer": "The user supplied a decision or answer. Re-evaluate the original mission with this answer and choose the correct disposition.",
+    }
+    note = instructions.get(mode, instructions["reconsider"])
+    if user_note:
+        note += "\nUser note:\n" + str(user_note).strip()[:6000]
+    execute(
+        "DELETE FROM tasks WHERE plan_id=?",
+        (plan_id,),
+    )
+    execute(
+        "UPDATE plans SET status=?,decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,summary=?,error=?,replan_note=?,finished_at=NULL,started_at=NULL,apply_status='',apply_error='' WHERE id=?",
+        ("planning", "", "", "[]", "[]", "", "", "", note, plan_id),
+    )
+    log(orchestrator_log_id(plan_id), "supervisor", f"new disposition pass requested · {mode}")
+    write_mission_docs(plan_id)
+    threading.Thread(target=build_plan, args=(plan_id,), daemon=True).start()
+    return {"ok": True, "status": "planning"}
 
 
 
@@ -2193,7 +2966,8 @@ def build_demo_plan(plan_id):
         insert_demo_task(plan_id, 1, "Implement the primary change", "coder", "write", [0], demo_contract(goal, "Coder", "Implement the primary requested change inside the orchestrator-defined scope.", ["src/**", "tests/**"], ["Read architect findings", "Apply the smallest focused change", "Run targeted verification"], ["Requested behavior is implemented", "Diff stays focused", "Targeted checks pass"], ["git diff --check", "targeted test command"]))
         insert_demo_task(plan_id, 2, "Add focused verification", "tester", "write", [0], demo_contract(goal, "Tester", "Add or update the smallest meaningful verification for the requested outcome.", ["tests/**", "src/** only when test fixtures require it"], ["Identify the regression boundary", "Add focused coverage", "Run the relevant test slice"], ["Coverage demonstrates the requested behavior", "Verification passes"], ["targeted test command"]))
         insert_demo_task(plan_id, 3, "Review the integrated result", "reviewer", "read", [1,2], demo_contract(goal, "Reviewer", "Independently review the integrated result for scope compliance, regressions and missing verification.", ["workspace/** (read-only)"], ["Inspect integrated diff", "Check acceptance criteria", "Report residual risks"], ["No critical regression is found", "Verification result is explicit"], ["git diff --check", "test summary"]))
-        execute("UPDATE plans SET status=?,orchestrator_used=? WHERE id=?", ("planned", plan["orchestrator_model"], plan_id))
+        execute("UPDATE plans SET status=?,decision=?,decision_reason=?,evidence_json=?,final_response=?,orchestrator_used=? WHERE id=?", ("planned", "execute", "Demo preview intentionally exercises the execution path.", json.dumps(["Local demo simulator selected; no Codex worker was called."], ensure_ascii=False), "", plan["orchestrator_model"], plan_id))
+        record_control_event(plan_id, "agentdock.disposition", {"decision": "execute", "reason": "Demo preview intentionally exercises the execution path.", "evidence": ["Local demo simulator selected; no Codex worker was called."], "task_count": 4})
         demo_event(sid, oid, plan_id, {"type":"item.completed","item":{"id":"orch-plan","type":"todo_list","items":[{"text":"Define safe task boundaries","completed":True},{"text":"Wait for user plan review","completed":False},{"text":"Execute approved task graph","completed":False}]}})
         demo_event(sid, oid, plan_id, {"type":"item.completed","item":{"id":"orch-msg","type":"agent_message","text":"Preview plan ready. Review task scope, dependencies, and agent assignments before starting execution."}})
         demo_event(sid, oid, plan_id, {"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}})
@@ -2462,7 +3236,18 @@ def apply_plan(plan_id):
             raise ValueError("Tüm task'lar tamamlanmadan apply yapılamaz")
         ctx = stored_integration_context(plan)
         execute("UPDATE plans SET apply_status=?, apply_error=? WHERE id=?", ("checking", "", plan_id))
-        run_preflight(plan, True, phase="apply")
+        try:
+            run_preflight(plan, True, phase="apply")
+        except PreflightWaitingForUser as exc:
+            execute("UPDATE plans SET status=?,apply_status=?,apply_error=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", "waiting_for_user", str(exc), str(exc), plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", "apply paused · waiting for an explicit preflight choice")
+            write_mission_docs(plan_id)
+            return {"ok": False, "waiting_for_user": True, "status": "waiting_for_user", "report": exc.report}
+        except PreflightBlocked as exc:
+            execute("UPDATE plans SET status=?,apply_status=?,apply_error=?,error=?,finished_at=? WHERE id=?", ("blocked", "blocked", str(exc), str(exc), now(), plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", "apply stopped by a safety preflight blocker")
+            write_mission_docs(plan_id)
+            return {"ok": False, "blocked": True, "status": "blocked", "report": exc.report}
         patch = integration_patch(ctx)
         if not patch.strip():
             execute(
@@ -2495,7 +3280,7 @@ def apply_plan(plan_id):
         release_plan_run(plan_id)
 
 
-def run_plan(plan_id, claimed=False):
+def run_plan(plan_id, claimed=False, read_only_only=False):
     if not claimed and not claim_plan_run(plan_id):
         log(orchestrator_log_id(plan_id), "supervisor", "duplicate run request ignored; another run is active")
         return
@@ -2506,9 +3291,40 @@ def run_plan(plan_id, claimed=False):
     try:
         if int(plan.get("demo_mode") or 0):
             return run_demo_execution(plan_id)
-        if plan.get("status") not in ("approved", "attention"):
+        if plan.get("status") not in ("approved", "attention", "waiting_for_user"):
             raise ValueError("Planı önce Plan Review ekranından onayla.")
-        tasks = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
+        all_tasks = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
+        if not all_tasks:
+            # A disposition with zero tasks is a completed answer, a user
+            # question, or a safety block. It must never enter execution
+            # preflight or create a misleading worker queue.
+            log(orchestrator_log_id(plan_id), "supervisor", "no tasks in mission; execution preflight skipped")
+            write_mission_docs(plan_id)
+            return
+        tasks = all_tasks
+        if read_only_only:
+            # A read-only continuation may run a safe read subgraph, but must
+            # not pretend that write tasks (or reads depending on writes) are
+            # complete. Remove every task that depends, directly or
+            # transitively, on a write task.
+            read_seqs = {t["seq"] for t in all_tasks if t.get("mode") == "read"}
+            changed = True
+            while changed:
+                changed = False
+                for task in all_tasks:
+                    if task["seq"] not in read_seqs:
+                        continue
+                    dependencies = json.loads(task.get("depends_json") or "[]")
+                    if any(dep not in read_seqs for dep in dependencies):
+                        read_seqs.remove(task["seq"])
+                        changed = True
+            tasks = [t for t in all_tasks if t["seq"] in read_seqs]
+            if not tasks:
+                execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", "No independent read-only task can run until the write-task dependency is resolved.", plan_id))
+                log(orchestrator_log_id(plan_id), "supervisor", "read-only continuation paused; all read tasks depend on write work")
+                write_mission_docs(plan_id)
+                return
+            log(orchestrator_log_id(plan_id), "supervisor", f"read-only continuation selected {len(tasks)} task(s); write tasks remain paused")
         has_write = any(t["mode"] == "write" for t in tasks)
         ctx = None
         if plan.get("status") == "attention":
@@ -2517,8 +3333,19 @@ def run_plan(plan_id, claimed=False):
             tasks = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
             has_write = any(t["mode"] == "write" for t in tasks)
         execute("UPDATE plans SET status=?, error=?, summary=?, applied=?, apply_status=?, apply_error=?, started_at=?, finished_at=NULL WHERE id=?", ("preflight", "", "", 0, "", "", now(), plan_id))
-        log(orchestrator_log_id(plan_id), "supervisor", "mission execution requested; running self-healing preflight")
-        run_preflight(plan, has_write, phase="execution")
+        log(orchestrator_log_id(plan_id), "supervisor", "mission execution requested; running read-only preflight")
+        try:
+            run_preflight(plan, has_write, phase="execution")
+        except PreflightWaitingForUser as exc:
+            execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", str(exc), plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", "execution paused · waiting for an explicit preflight choice")
+            write_mission_docs(plan_id)
+            return
+        except PreflightBlocked as exc:
+            execute("UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?", ("blocked", str(exc), now(), plan_id))
+            log(orchestrator_log_id(plan_id), "supervisor", "execution stopped by a safety preflight blocker")
+            write_mission_docs(plan_id)
+            return
         execute("UPDATE plans SET status=? WHERE id=?", ("running", plan_id))
         log(orchestrator_log_id(plan_id), "supervisor", "mission execution started")
         write_mission_docs(plan_id)
@@ -2537,7 +3364,7 @@ def run_plan(plan_id, claimed=False):
             }
 
         plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
-        pending = {t["seq"]: t for t in rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))}
+        pending = {t["seq"]: t for t in tasks if t.get("status") not in ("done", "executed")}
         max_parallel = max(1, min(int(plan.get("max_parallel") or 4), MAX_PARALLEL_HARD))
 
         while pending:
@@ -2585,7 +3412,22 @@ def run_plan(plan_id, claimed=False):
             write_mission_docs(plan_id)
 
         task_rows = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
-        all_done = bool(task_rows) and all(t["status"] == "done" for t in task_rows)
+        all_done = bool(task_rows) and all(t["status"] in ("done", "executed") for t in task_rows)
+
+        if read_only_only and not all_done:
+            selected_read_seqs = {t["seq"] for t in tasks}
+            read_done = all(
+                t["status"] in ("done", "executed")
+                for t in task_rows
+                if t["seq"] in selected_read_seqs
+            )
+            write_pending = any(t["mode"] == "write" and t["status"] not in ("done", "executed") for t in task_rows)
+            if read_done and write_pending:
+                summary = "Read-only checks completed. Write tasks remain paused until the workspace choice is resolved."
+                execute("UPDATE plans SET status=?,summary=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", summary, "Write tasks are waiting for an explicit preflight choice.", plan_id))
+                log(orchestrator_log_id(plan_id), "supervisor", "read-only continuation complete; write tasks remain waiting for user")
+                write_mission_docs(plan_id)
+                return
 
         synth_workspace = ctx["integration_workspace"] if has_write else Path(plan["workspace"])
         try:
@@ -2602,7 +3444,18 @@ def run_plan(plan_id, claimed=False):
 
         if all_done and has_write:
             # Re-check the user's working tree before presenting the integrated patch.
-            run_preflight(plan, True, phase="apply")
+            try:
+                run_preflight(plan, True, phase="apply")
+            except PreflightWaitingForUser as exc:
+                execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", str(exc), plan_id))
+                log(orchestrator_log_id(plan_id), "supervisor", "integration ready but waiting for an explicit workspace choice before apply")
+                write_mission_docs(plan_id)
+                return
+            except PreflightBlocked as exc:
+                execute("UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?", ("blocked", str(exc), now(), plan_id))
+                log(orchestrator_log_id(plan_id), "supervisor", "apply stopped by a safety preflight blocker")
+                write_mission_docs(plan_id)
+                return
             if not integration_patch(ctx).strip():
                 execute("UPDATE plans SET status=?, applied=0, apply_status=?, apply_error=?, finished_at=? WHERE id=?", ("done", "no_changes", "", now(), plan_id))
                 cleanup_successful_plan(ctx, plan_id)
@@ -2792,9 +3645,10 @@ class Handler(SimpleHTTPRequestHandler):
             engines = engine_status()
             return self.send_json({
                 "ok": True,
-                "version": "0.10.0",
+                "version": "0.11.0",
                 "db": str(DB),
                 "engines": engines,
+                "codex_transport": CODEX_TRANSPORT,
                 "server_time": now(),
             })
         if p == "/api/state":
@@ -2803,6 +3657,9 @@ class Handler(SimpleHTTPRequestHandler):
                 pl["tasks"] = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (pl["id"],))
                 pl["repo"] = repo_info(pl["workspace"])
                 pl["attachments"] = rows("SELECT id,name,mime,path,created_at FROM attachments WHERE plan_id=? ORDER BY created_at", (pl["id"],))
+                pl["evidence"] = safe_json(pl.get("evidence_json"), [])
+                pl["questions"] = safe_json(pl.get("questions_json"), [])
+                pl["workspace_snapshot"] = safe_json(pl.get("workspace_snapshot_json"), {})
             workspaces = [workspace_summary(w) for w in rows("SELECT * FROM workspaces ORDER BY last_opened_at DESC, created_at DESC")]
             return self.send_json(
                 {
@@ -2829,6 +3686,9 @@ class Handler(SimpleHTTPRequestHandler):
             if not plan:
                 return self.send_json({"error": "plan not found"}, 404)
             plan["attachments"] = rows("SELECT id,name,mime,path,created_at FROM attachments WHERE plan_id=? ORDER BY created_at", (pid,))
+            plan["evidence"] = safe_json(plan.get("evidence_json"), [])
+            plan["questions"] = safe_json(plan.get("questions_json"), [])
+            plan["workspace_snapshot"] = safe_json(plan.get("workspace_snapshot_json"), {})
             tasks = rows(
                 """SELECT t.*, a.name AS agent_name, a.role AS agent_role, a.model AS agent_model,
                           a.reasoning_effort AS agent_effort, a.service_tier AS agent_tier
@@ -3044,12 +3904,22 @@ class Handler(SimpleHTTPRequestHandler):
                 pid = p.split("/")[-1]
                 plan=one("SELECT * FROM plans WHERE id=?",(pid,))
                 if not plan: raise ValueError('Mission bulunamadı')
-                if plan.get('status') not in ('approved','attention'):
+                if plan.get('status') not in ('approved','attention','waiting_for_user'):
                     raise ValueError('Planı önce review edip onayla.')
                 if not claim_plan_run(pid):
                     return self.send_json({"error": "Bu mission için başka bir işlem zaten çalışıyor."}, 409)
                 threading.Thread(target=run_plan, args=(pid,), kwargs={"claimed": True}, daemon=True).start()
                 return self.send_json({"ok": True})
+
+            if p.startswith("/api/reconsider-plan/"):
+                pid = p.split("/api/reconsider-plan/", 1)[1]
+                mode = (data.get("mode") or "reconsider").strip()
+                note = (data.get("note") or "").strip()
+                return self.send_json(replan_mission(pid, mode=mode, user_note=note))
+
+            if p.startswith("/api/preflight-action/"):
+                pid = p.split("/api/preflight-action/", 1)[1]
+                return self.send_json(apply_preflight_action(pid, data.get("action"), data.get("paths") or []))
 
             if p.startswith("/api/run-task/"):
                 return self.send_json({"error": "Direct task execution is disabled; start the approved mission instead."}, 410)
@@ -3075,10 +3945,20 @@ class Handler(SimpleHTTPRequestHandler):
                 mid=str(uuid.uuid4())[:10]
                 with RUNNERS_LOCK:
                     is_running=bool(RUNNERS.get(tid))
-                status='queued' if is_running or task.get('status') in ('running','executed') else 'sending'
+                with APP_SERVER_CONTROLS_LOCK:
+                    app_server_active = tid in APP_SERVER_CONTROLS
+                status='sending' if app_server_active else ('queued' if is_running or task.get('status') in ('running','executed') else 'sending')
                 execute("INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)", (mid,tid,task['plan_id'],now(),prompt,json.dumps(image_paths),status))
                 if status=='sending':
-                    threading.Thread(target=run_manual_followup_message,args=(mid,),daemon=True).start()
+                    if app_server_active:
+                        if not steer_app_server(tid, mid, prompt, image_paths):
+                            # The active turn may have completed between the
+                            # availability check and the steer request. The
+                            # helper records that race as a failed message so
+                            # it is visible instead of being silently lost.
+                            pass
+                    else:
+                        threading.Thread(target=run_manual_followup_message,args=(mid,),daemon=True).start()
                 else:
                     log(tid,'manual','user message queued for the next Codex turn')
                 return self.send_json({"ok":True,"queued":status=='queued',"message_id":mid})
@@ -3155,7 +4035,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     init_db()
     url = f"http://{HOST}:{PORT}"
-    print(f"AgentDock v0.10 running at {url}")
+    print(f"AgentDock v0.11 running at {url}")
     print("Auth mode: Codex CLI signed in with ChatGPT (Plus supported).")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

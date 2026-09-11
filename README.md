@@ -1,6 +1,6 @@
-# AgentDock v0.10 — Supervised Mission Control
+# AgentDock v0.11 — Supervised Mission Control
 
-AgentDock is a local multi-agent control plane for Codex. A strong orchestrator (Sol/Astra when available) proposes a task graph; worker agents (typically Luna) execute approved tasks in isolated Git worktrees. The normal path reuses the existing ChatGPT-authenticated Codex CLI and requires no API key.
+AgentDock is a local multi-agent control plane for Codex. The orchestrator first decides what the mission needs; it creates worker tasks only when real execution is required. Write workers execute approved tasks in isolated Git worktrees. The normal path reuses the existing ChatGPT-authenticated Codex CLI and requires no API key.
 
 ## What changed in v0.9
 
@@ -95,6 +95,49 @@ without using Codex quota.
 - Write missions stop at `awaiting_apply` so you can inspect the final integration diff and click **Apply changes**.
 - SQLite uses WAL/foreign-key enforcement, and the repository includes a standard-library unittest smoke suite.
 
+## What changed in v0.11
+
+### Disposition before task creation
+
+Every mission now follows a disposition-first control flow:
+
+```text
+Mission
+   ↓
+Read-only workspace snapshot
+   ↓
+Orchestrator disposition
+   ├── already_satisfied  → no tasks; show evidence
+   ├── answer_only        → no tasks; return the answer
+   ├── needs_user_input   → no tasks; wait for a decision
+   ├── blocked            → no tasks; explain the safety/authority block
+   └── execute            → create the smallest necessary task graph
+```
+
+The planner contract is strict and bounded to zero through twelve tasks. An execution disposition requires at least one task; all other dispositions require zero tasks. A simple change can therefore be one task, while independent work can still be represented as a parallel graph.
+
+No-task missions never enter execution preflight or create misleading queued worker cards. The mission view shows **No execution needed**, the final response, the evidence, and friendly actions to create a plan anyway, ask the orchestrator to reconsider, or run verification again.
+
+### Deterministic workspace analysis
+
+Before the planner is called, AgentDock records a read-only workspace snapshot containing Git classification (`NOT_GIT`, `LOCAL_GIT`, or `GIT_WITH_REMOTE`), repository root, branch, HEAD, upstream, remotes, tracked/untracked changes, and write-safety facts. This lets a Git verification mission finish with zero tasks when the repository already satisfies the request.
+
+### Read-only preflight and explicit recovery
+
+Preflight reports state but does not delete files, edit `.git/info/exclude`, remove locks, or prune worktree metadata automatically. If a write mission encounters existing user changes, the UI shows the affected paths and asks for an explicit choice: add selected files to Git, ignore them locally, move untracked files to AgentDock's preservation area, continue read-only when valid, or cancel. The chosen scope is shown before the action and no commit is created automatically.
+
+The Activity view renders workspace analysis, disposition, reasoning summaries, task dependencies, commands, file changes, preflight, and user decisions as readable events. Structured planner JSON remains available in **Raw** for diagnostics.
+
+### Optional Codex App Server transport
+
+The default `codex exec --json` transport remains available. To test the opt-in App Server adapter:
+
+```bash
+AGENTDOCK_CODEX_TRANSPORT=app-server python3 agentdock.py
+```
+
+The adapter records thread, turn, plan, reasoning, command, file-change, and completion events while preserving AgentDock's approval and workspace safety gates. See the [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
+
 ## Quick start
 
 ```bash
@@ -167,7 +210,7 @@ Then:
 ```bash
 pkill -f "agentdock.py" 2>/dev/null || true
 cd ~/Downloads
-unzip agentdock-v09-supervised-control.zip
+unzip agentdock-v11-supervised-control.zip
 cd agentdock
 python3 agentdock.py
 ```
@@ -192,4 +235,4 @@ Open `http://127.0.0.1:8765` if needed.
 
 ## Safety boundaries
 
-AgentDock never blanket-runs `git clean -fd`, resets tracked user work, or deletes unknown files. Write workers remain isolated in Git worktrees. Unknown product/architecture decisions are escalated rather than guessed.
+AgentDock never blanket-runs `git clean -fd`, resets tracked user work, edits `.git/info/exclude`, removes Git locks, or deletes unknown files during preflight. Write workers remain isolated in Git worktrees. Unknown product/architecture decisions are escalated rather than guessed.

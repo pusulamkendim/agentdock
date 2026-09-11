@@ -1,6 +1,6 @@
 [project]
 name = "agentdock"
-version = "0.10.0"
+version = "0.11.0"
 description = "Local supervised multi-agent control plane for Codex"
 requires-python = ">=3.11"
 dependencies = []
@@ -8,4 +8,3 @@ dependencies = []
 [tool.agentdock]
 start-command = "python3 agentdock.py"
 test-command = "python3 -m unittest discover -s tests -v"
-
