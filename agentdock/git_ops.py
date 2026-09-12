@@ -465,20 +465,34 @@ def changed_git_paths(repo_root):
         found.update(x for x in result.stdout.split("\0") if x)
     return sorted(found)
 
-def normalize_allowed_pattern(pattern):
+def canonical_allowed_pattern(pattern):
+    """Normalize planner path language before validation or enforcement.
+
+    Planner contracts often annotate a path with human guidance, while the
+    runtime matcher needs only the actual pattern.  Keep that translation in
+    one place and collapse every workspace-wide glob to the same canonical
+    global marker so callers can reject it for write tasks.
+    """
     value = str(pattern or "").strip().replace("\\", "/")
-    value = re.sub(r"\s*\([^)]*\)\s*$", "", value)
-    value = re.sub(r"\s+only when\b.*$", "", value, flags=re.I)
+    previous = None
+    while value and value != previous:
+        previous = value
+        value = re.sub(r"\s*\([^)]*\)\s*$", "", value).strip()
+        value = re.sub(r"\s+only\s+when\b.*$", "", value, flags=re.I).strip()
     value = value.lstrip("./")
-    if value.startswith("workspace/"):
-        value = value[len("workspace/"):]
-    return value.rstrip("/") or "**"
+    while value.startswith("workspace/"):
+        value = value[len("workspace/"):].lstrip("./")
+    value = value.rstrip("/")
+    glob_free = re.sub(r"\[[^]]*\]|\{[^}]*\}|[*?]", "", value).replace("/", "")
+    if not value or value in ("*", "**", "**/*") or not glob_free.strip():
+        return "**"
+    return value
 
 def path_matches_allowed(rel_path, pattern):
     rel = str(rel_path).replace("\\", "/").lstrip("./")
-    pat = normalize_allowed_pattern(pattern)
-    if pat in ("*", "**"):
-        return True
+    pat = canonical_allowed_pattern(pattern)
+    if pat == "**":
+        return False
     if pat.endswith("/**"):
         prefix = pat[:-3].rstrip("/")
         return rel == prefix or rel.startswith(prefix + "/")

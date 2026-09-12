@@ -105,22 +105,35 @@ def manual_followup_delivery_status(task_id):
 
     A finished Codex process does not mean a write task is finished: contract
     validation, commit and integration still own its checkout.  Those states
-    must queue interventions even when the process registries are empty.
+    must queue interventions even when the process registries are empty.  An
+    active App Server turn is the one deliberate exception for a task still in
+    ``running``: its existing turn can safely accept a live steer.
     """
     task = one("SELECT status FROM tasks WHERE id=?", (task_id,))
     with config.MANUAL_FOLLOWUP_DRAINS_LOCK:
         if task_id in config.MANUAL_FOLLOWUP_DRAINS:
             return "queued"
-    if task and task.get("status") in config.TASK_INTERVENTION_QUEUE_STATUSES:
-        return "queued"
     with config.APP_SERVER_CONTROLS_LOCK:
-        if task_id in config.APP_SERVER_CONTROLS:
-            return "sending"
+        app_server_active = task_id in config.APP_SERVER_CONTROLS
+    task_status = task.get("status") if task else None
+    if task_status == "running" and app_server_active:
+        return "sending"
+    if task and task_status in config.TASK_INTERVENTION_QUEUE_STATUSES:
+        return "queued"
+    if task:
+        # Every standalone conversation goes through the durable per-task
+        # consumer.  The consumer starts immediately for terminal/paused
+        # tasks, but the queue is what serializes concurrent callers.
+        return "queued"
+    if app_server_active:
+        # Preserve the legacy control-registry behavior for a control that has
+        # no corresponding task row (used by recovery/compatibility callers).
+        return "sending"
     with config.RUNNERS_LOCK:
         if config.RUNNERS.get(task_id):
             return "queued"
-    # A completed task can still have a resumable worker conversation.  Start
-    # the manual turn immediately; task execution state stays untouched.
+    # Preserve the legacy fallback for callers that have a live control or
+    # runner but no persisted task row.
     return "sending"
 
 
@@ -154,7 +167,11 @@ def send_task_followup(task_id, prompt, attachments=None):
             raise ValueError("Task bulunamadı")
         status = manual_followup_delivery_status(task_id)
         with config.APP_SERVER_CONTROLS_LOCK:
-            app_server_active = status == "sending" and task_id in config.APP_SERVER_CONTROLS
+            app_server_active = (
+                status == "sending"
+                and task.get("status") == "running"
+                and task_id in config.APP_SERVER_CONTROLS
+            )
         execute(
             "INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)",
             (
@@ -167,19 +184,18 @@ def send_task_followup(task_id, prompt, attachments=None):
                 status,
             ),
         )
-    if status == "sending":
-        if app_server_active:
-            # The transport records a race as a visible failed message if the
-            # active turn finishes between the check and the steer request.
-            steer_app_server(task_id, message_id, prompt, image_paths)
-        else:
-            threading.Thread(
-                target=run_manual_followup_message,
-                args=(message_id,),
-                daemon=True,
-            ).start()
+    if app_server_active:
+        # The transport records a race as a visible failed message if the
+        # active turn finishes between the check and the steer request.
+        steered = steer_app_server(task_id, message_id, prompt, image_paths)
+        if not steered:
+            current_message = one("SELECT status FROM task_messages WHERE id=?", (message_id,)) or {}
+            if current_message.get("status") == "sending":
+                execute("UPDATE task_messages SET status=?,error=? WHERE id=?", ("queued", "", message_id))
+                drain_queued_manual_followups(task_id)
     else:
-        log(task_id, "manual", "user message queued for the next Codex turn")
+        drain_queued_manual_followups(task_id)
+        log(task_id, "manual", "user message queued for the next standalone Codex turn")
     return {"ok": True, "queued": status == "queued", "message_id": message_id}
 
 

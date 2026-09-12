@@ -81,8 +81,32 @@ class ContractAndRecoveryTests(AgentDockTestCase):
     def test_allowed_path_matching_is_conservative(self):
         self.assertTrue(agentdock.path_matches_allowed("src/app.py", "src/**"))
         self.assertTrue(agentdock.path_matches_allowed("tests/test_app.py", "tests/** only when fixtures require it"))
-        self.assertTrue(agentdock.path_matches_allowed("README.md", "workspace/** (read-only)"))
+        self.assertFalse(agentdock.path_matches_allowed("README.md", "workspace/** (read-only)"))
         self.assertFalse(agentdock.path_matches_allowed(".env", "src/**"))
+
+    def test_allowed_path_patterns_share_one_canonical_language(self):
+        global_patterns = (
+            "workspace/** (read-only)",
+            "** only when necessary",
+            "./**",
+            "**/",
+            "**/*",
+        )
+        for pattern in global_patterns:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(agentdock.canonical_allowed_pattern(pattern), "**")
+                self.assertFalse(agentdock.path_matches_allowed("src/app.py", pattern))
+        self.assertEqual(agentdock.canonical_allowed_pattern("./src/** (generated files)"), "src/**")
+        self.assertTrue(agentdock.path_matches_allowed("src/app.py", "./src/** (generated files)"))
+        self.assertEqual(agentdock.canonical_allowed_pattern("_fixtures/**"), "_fixtures/**")
+
+    def test_runtime_rejects_annotated_global_write_pattern(self):
+        task = {
+            "contract_json": json.dumps({"allowed_paths": ["workspace/** (read-only)"]}),
+        }
+        with patch.object(agentdock.git_ops, "changed_git_paths", return_value=["README.md"]):
+            with self.assertRaisesRegex(RuntimeError, "README.md"):
+                agentdock.validate_worker_changes(self.tmp, task)
 
     def test_restart_moves_running_mission_to_attention(self):
         plan_id = self.add_plan(status="running")
@@ -220,6 +244,10 @@ class ContractAndRecoveryTests(AgentDockTestCase):
             ([task(contract=self.planner_contract("Write without a boundary", []))], "bounded allowed_paths"),
             ([task(contract=self.planner_contract("Write everywhere", ["**"]))], "bounded allowed_paths"),
             ([task(contract=self.planner_contract("Write across the workspace", ["workspace/**"]))], "bounded allowed_paths"),
+            ([task(contract=self.planner_contract("Write across the workspace", ["workspace/** (read-only)"]))], "bounded allowed_paths"),
+            ([task(contract=self.planner_contract("Write across the workspace", ["** only when necessary"]))], "bounded allowed_paths"),
+            ([task(contract=self.planner_contract("Write across the workspace", ["./**"]))], "bounded allowed_paths"),
+            ([task(contract=self.planner_contract("Write across the workspace", ["**/"]))], "bounded allowed_paths"),
         ]
         for graph, message in cases:
             with self.subTest(message=message):
@@ -629,8 +657,103 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
             agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("integrating", task_id))
             self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
             agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("done", task_id))
-            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "sending")
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
         finally:
+            with config.RUNNERS_LOCK:
+                config.RUNNERS.clear()
+                config.RUNNERS.update(old_runners)
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS.clear()
+                config.APP_SERVER_CONTROLS.update(old_controls)
+
+    def test_running_task_prefers_active_app_server_steering(self):
+        plan_id = self.add_plan("live-steering-status", status="running")
+        task_id = "live-steering-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,mode,status,worker_thread_id) VALUES(?,?,?,?,?,?,?,?)",
+            (task_id, plan_id, 0, "Steer safely", "Steer safely", "write", "running", "worker-thread"),
+        )
+        with config.RUNNERS_LOCK:
+            old_runners = dict(config.RUNNERS)
+            config.RUNNERS.clear()
+        with config.APP_SERVER_CONTROLS_LOCK:
+            old_controls = dict(config.APP_SERVER_CONTROLS)
+            config.APP_SERVER_CONTROLS.clear()
+            config.APP_SERVER_CONTROLS[task_id] = object()
+        try:
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "sending")
+            with patch.object(tasks, "steer_app_server", return_value=True) as steer:
+                response = tasks.send_task_followup(task_id, "Use the existing contact link.")
+            self.assertFalse(response["queued"])
+            steer.assert_called_once()
+            self.assertEqual(
+                agentdock.one("SELECT status FROM task_messages WHERE id=?", (response["message_id"],))["status"],
+                "sending",
+            )
+
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS.clear()
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
+            agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("executed", task_id))
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS[task_id] = object()
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
+            agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("done", task_id))
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
+        finally:
+            with config.RUNNERS_LOCK:
+                config.RUNNERS.clear()
+                config.RUNNERS.update(old_runners)
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS.clear()
+                config.APP_SERVER_CONTROLS.update(old_controls)
+
+    def test_standalone_followups_use_one_per_task_consumer(self):
+        plan_id = self.add_plan("standalone-followup-serialization", status="running")
+        task_id = "standalone-followup-serialization-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,mode,status,worker_thread_id) VALUES(?,?,?,?,?,?,?,?)",
+            (task_id, plan_id, 0, "Completed task", "Explain the result", "write", "done", "worker-thread"),
+        )
+        with config.RUNNERS_LOCK:
+            old_runners = dict(config.RUNNERS)
+            config.RUNNERS.clear()
+        with config.APP_SERVER_CONTROLS_LOCK:
+            old_controls = dict(config.APP_SERVER_CONTROLS)
+            config.APP_SERVER_CONTROLS.clear()
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def deliver(message_id):
+            calls.append(message_id)
+            if len(calls) == 1:
+                started.set()
+                release.wait(2)
+            agentdock.execute("UPDATE task_messages SET status=?,error=? WHERE id=?", ("delivered", "", message_id))
+
+        try:
+            with patch.object(tasks, "run_manual_followup_message", side_effect=deliver):
+                first = tasks.send_task_followup(task_id, "First explanation")
+                self.assertTrue(first["queued"])
+                self.assertTrue(started.wait(2))
+                second = tasks.send_task_followup(task_id, "Second explanation")
+                self.assertTrue(second["queued"])
+                self.assertEqual(calls, [first["message_id"]])
+                release.set()
+                deadline = time.time() + 2
+                while len(calls) < 2 and time.time() < deadline:
+                    time.sleep(0.01)
+
+            self.assertEqual(calls, [first["message_id"], second["message_id"]])
+            self.assertEqual(
+                agentdock.one("SELECT status FROM task_messages WHERE id=?", (second["message_id"],))["status"],
+                "delivered",
+            )
+        finally:
+            release.set()
+            with config.MANUAL_FOLLOWUP_DRAINS_LOCK:
+                config.MANUAL_FOLLOWUP_DRAINS.discard(task_id)
             with config.RUNNERS_LOCK:
                 config.RUNNERS.clear()
                 config.RUNNERS.update(old_runners)

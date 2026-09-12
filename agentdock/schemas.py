@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config
+from .git_ops import canonical_allowed_pattern
 PLANNER_SCHEMA = {
     "type": "object",
     "properties": {
@@ -176,15 +177,8 @@ def _validate_task_contract(contract, index, mode):
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise _planner_task_error(index, f"contract.{field} must be an array of strings")
     if mode == "write":
-        allowed_paths = [path.strip().replace("\\", "/") for path in contract["allowed_paths"]]
-        unlimited = {"", ".", "./", "/", "*", "**", "**/*"}
-        normalized_paths = []
-        for path in allowed_paths:
-            normalized = path
-            if normalized.startswith("workspace/"):
-                normalized = normalized[len("workspace/"):]
-            normalized_paths.append(normalized.lstrip("./"))
-        if not allowed_paths or any(path in unlimited for path in normalized_paths):
+        normalized_paths = [canonical_allowed_pattern(path) for path in contract["allowed_paths"]]
+        if not normalized_paths or any(path == "**" for path in normalized_paths):
             raise _planner_task_error(index, "write tasks require bounded allowed_paths")
 
 

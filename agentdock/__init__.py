@@ -93,6 +93,7 @@ from .db import (
     workspace_summary,
 )
 from .git_ops import (
+    canonical_allowed_pattern,
     changed_git_paths,
     fingerprint_diff,
     path_matches_allowed,
@@ -199,7 +200,7 @@ __all__ = [
     "run_manual_followup", "run_manual_followup_message", "run_single_task",
     "drain_queued_manual_followups", "claim_task_integration",
     "resolve_merge_conflict", "integrate_write_result",
-    "manual_followup_delivery_status", "timeline_for", "task_diff", "validate_task_graph",
+    "manual_followup_delivery_status", "timeline_for", "task_diff", "validate_task_graph", "canonical_allowed_pattern",
     "PreflightBlocked", "PreflightWaitingForUser", "apply_preflight_action",
     "build_plan", "apply_plan", "pause_plan", "resume_plan", "pause_task", "resume_task",
     "replan_mission", "restart_as_new_mission", "mission_config", "answer_consultation",
