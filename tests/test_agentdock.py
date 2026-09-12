@@ -3,13 +3,14 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import agentdock
-from agentdock import config, mission, orchestrator, tasks
+from agentdock import config, integration, mission, orchestrator, tasks
 
 
 class AgentDockTestCase(unittest.TestCase):
@@ -610,6 +611,153 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
                 config.APP_SERVER_CONTROLS.clear()
                 config.APP_SERVER_CONTROLS.update(old_controls)
 
+    def test_integration_owned_task_queues_followup_even_without_a_runner(self):
+        plan_id = self.add_plan("integration-window-status", status="running")
+        task_id = "integration-window-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,mode,status,worker_thread_id) VALUES(?,?,?,?,?,?,?,?)",
+            (task_id, plan_id, 0, "Integrate safely", "Integrate safely", "write", "executed", "worker-thread"),
+        )
+        with config.RUNNERS_LOCK:
+            old_runners = dict(config.RUNNERS)
+            config.RUNNERS.clear()
+        with config.APP_SERVER_CONTROLS_LOCK:
+            old_controls = dict(config.APP_SERVER_CONTROLS)
+            config.APP_SERVER_CONTROLS.clear()
+        try:
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
+            agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("integrating", task_id))
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
+            agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("done", task_id))
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "sending")
+        finally:
+            with config.RUNNERS_LOCK:
+                config.RUNNERS.clear()
+                config.RUNNERS.update(old_runners)
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS.clear()
+                config.APP_SERVER_CONTROLS.update(old_controls)
+
+    def test_followup_queued_during_integration_drains_after_task_is_done(self):
+        plan_id = self.add_plan("integration-window-drain", status="running")
+        task_id = "integration-window-drain-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,mode,status,worker_thread_id) VALUES(?,?,?,?,?,?,?,?)",
+            (task_id, plan_id, 0, "Integrate safely", "Integrate safely", "write", "executed", "worker-thread"),
+        )
+        with config.RUNNERS_LOCK:
+            old_runners = dict(config.RUNNERS)
+            config.RUNNERS.clear()
+        with config.APP_SERVER_CONTROLS_LOCK:
+            old_controls = dict(config.APP_SERVER_CONTROLS)
+            config.APP_SERVER_CONTROLS.clear()
+        try:
+            response = tasks.send_task_followup(task_id, "Please explain the integration result.")
+            self.assertTrue(response["queued"])
+            message_id = response["message_id"]
+            self.assertEqual(
+                agentdock.one("SELECT status FROM task_messages WHERE id=?", (message_id,))["status"],
+                "queued",
+            )
+            self.assertTrue(agentdock.claim_task_integration(task_id))
+            self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", (task_id,))["status"], "integrating")
+
+            delivered = []
+
+            def deliver(message_id):
+                delivered.append(message_id)
+                agentdock.execute("UPDATE task_messages SET status=? WHERE id=?", ("delivered", message_id))
+
+            with patch.object(tasks, "run_manual_followup_message", side_effect=deliver):
+                agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("done", task_id))
+                self.assertTrue(tasks.drain_queued_manual_followups(task_id))
+                deadline = time.time() + 2
+                while not delivered and time.time() < deadline:
+                    time.sleep(0.01)
+
+            self.assertEqual(delivered, [message_id])
+            self.assertEqual(
+                agentdock.one("SELECT status FROM task_messages WHERE id=?", (message_id,))["status"],
+                "delivered",
+            )
+            self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", (task_id,))["status"], "done")
+        finally:
+            with config.MANUAL_FOLLOWUP_DRAINS_LOCK:
+                config.MANUAL_FOLLOWUP_DRAINS.discard(task_id)
+            with config.RUNNERS_LOCK:
+                config.RUNNERS.clear()
+                config.RUNNERS.update(old_runners)
+            with config.APP_SERVER_CONTROLS_LOCK:
+                config.APP_SERVER_CONTROLS.clear()
+                config.APP_SERVER_CONTROLS.update(old_controls)
+
+    def test_followup_stays_queued_until_integration_cleanup_finishes(self):
+        plan_id = self.add_plan("integration-cleanup-window", status="running")
+        task_id = "integration-cleanup-window-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,mode,status,worker_thread_id) VALUES(?,?,?,?,?,?,?,?)",
+            (task_id, plan_id, 0, "Integrate safely", "Integrate safely", "write", "executed", "worker-thread"),
+        )
+        cleanup_started = threading.Event()
+        allow_cleanup = threading.Event()
+
+        def delayed_cleanup(*args, **kwargs):
+            cleanup_started.set()
+            self.assertTrue(allow_cleanup.wait(2))
+
+        result = {
+            "task": agentdock.one("SELECT * FROM tasks WHERE id=?", (task_id,)),
+            "ok": True,
+            "commit": "",
+            "wt": str(self.tmp / "unused-worker-worktree"),
+            "branch": "worker",
+        }
+        with patch.object(integration, "remove_worktree", side_effect=delayed_cleanup), patch.object(
+            integration, "delete_branch"
+        ):
+            worker = threading.Thread(
+                target=integration.integrate_write_result,
+                args=(
+                    agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)),
+                    {"repo_root": self.tmp, "integration_dir": self.tmp},
+                    result,
+                ),
+            )
+            worker.start()
+            self.assertTrue(cleanup_started.wait(2))
+            self.assertEqual(
+                agentdock.one("SELECT status FROM tasks WHERE id=?", (task_id,))["status"],
+                "integrating",
+            )
+            self.assertEqual(agentdock.manual_followup_delivery_status(task_id), "queued")
+            allow_cleanup.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+
+        self.assertEqual(
+            agentdock.one("SELECT status,integration_status FROM tasks WHERE id=?", (task_id,)),
+            {"status": "done", "integration_status": "no_changes"},
+        )
+
+    def test_done_manual_followup_forces_read_only_mode(self):
+        plan = self._orchestrator_plan("done-followup-read-only")
+        task_id = "done-followup-read-only-task"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,status,worker_thread_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (task_id, plan["id"], 0, "Completed write", "Explain the result", "coder", "write", "done", "done-thread"),
+        )
+        captured = {}
+
+        def fake_codex(*args, **kwargs):
+            captured["mode"] = args[2]
+            return "read-only explanation"
+
+        with patch.object(tasks, "run_codex", side_effect=fake_codex):
+            result = agentdock.run_manual_followup(task_id, "Explain the completed result.")
+
+        self.assertEqual(result, "read-only explanation")
+        self.assertEqual(captured["mode"], "read")
+
     def test_pausing_consultation_stays_queued_after_orchestrator_interrupt(self):
         plan = self._orchestrator_plan("paused-consultation")
         task_id = "paused-consultation-task"
@@ -968,6 +1116,158 @@ class TimelineAndRuntimeControlTests(AgentDockTestCase):
 
 
 class ExecutionTests(AgentDockTestCase):
+    def test_parallel_write_claims_integration_before_validation(self):
+        plan_id = self.add_plan("integration-ownership-before-validation", status="running")
+        task_id = "integration-ownership-before-validation-task"
+        agentdock.execute(
+            """INSERT INTO tasks(
+                id,plan_id,seq,title,instructions,agent_id,mode,status,contract_json
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                task_id,
+                plan_id,
+                0,
+                "Bounded write",
+                "Bounded write",
+                "coder",
+                "write",
+                "pending",
+                json.dumps({"objective": "Bounded write", "allowed_paths": ["src/**"]}),
+            ),
+        )
+        plan = agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,))
+        task = agentdock.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        observed_statuses = []
+
+        def finish_worker(*args, **kwargs):
+            agentdock.execute(
+                "UPDATE tasks SET status=?,output=? WHERE id=?",
+                ("executed", "worker result", task_id),
+            )
+            return {"ok": True, "output": "worker result"}
+
+        def validate_during_integration(*args, **kwargs):
+            observed_statuses.append(
+                agentdock.one("SELECT status FROM tasks WHERE id=?", (task_id,))["status"]
+            )
+            return []
+
+        with patch.object(
+            tasks,
+            "create_worker_worktree",
+            return_value=(self.tmp / "worker-worktree", self.tmp / "worker-worktree", "worker-branch"),
+        ), patch.object(tasks, "run_task_with_recovery", side_effect=finish_worker), patch.object(
+            tasks, "validate_worker_changes", side_effect=validate_during_integration
+        ), patch.object(tasks, "commit_worker_changes", return_value="worker-commit"):
+            result = tasks.run_parallel_task(
+                plan,
+                task,
+                {"integration_workspace": self.tmp},
+                "base-commit",
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(observed_statuses, ["integrating"])
+        self.assertEqual(
+            agentdock.one("SELECT status,commit_hash FROM tasks WHERE id=?", (task_id,)),
+            {"status": "integrating", "commit_hash": "worker-commit"},
+        )
+
+    def test_merge_conflict_resolver_continues_cherry_pick_and_preserves_clean_changes(self):
+        repo = self.tmp / "conflict-with-clean-change-repo"
+        repo.mkdir()
+
+        def git(*args, check=True):
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=check,
+                capture_output=True,
+                text=True,
+            )
+
+        git("init", "-b", "main")
+        (repo / "a.txt").write_text("base A\n")
+        (repo / "b.txt").write_text("base B\n")
+        git("add", "a.txt", "b.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+
+        git("checkout", "-b", "worker")
+        (repo / "a.txt").write_text("worker A\n")
+        (repo / "b.txt").write_text("worker B\n")
+        git("add", "a.txt", "b.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "worker A + B")
+        worker_commit = git("rev-parse", "HEAD").stdout.strip()
+
+        git("checkout", "main")
+        (repo / "a.txt").write_text("integration A\n")
+        git("add", "a.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "integration A")
+
+        plan_id = "conflict-preserve-clean-change"
+        integration_dir = self.tmp / "integration-worktree"
+        integration_branch = f"agentdock/{plan_id}/integration"
+        git("worktree", "add", "-b", integration_branch, str(integration_dir), "main")
+        try:
+            def integration_git(*args, check=True):
+                return subprocess.run(
+                    ["git", "-C", str(integration_dir), *args],
+                    check=check,
+                    capture_output=True,
+                    text=True,
+                )
+
+            agentdock.execute(
+                "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,recovery_json) VALUES(?,?,?,?,?,?,?)",
+                (plan_id, "Preserve clean cherry-pick changes", str(repo), "test", "running", agentdock.now(), json.dumps(agentdock.RECOVERY_DEFAULTS)),
+            )
+            task = {
+                "id": "conflict-preserve-task",
+                "plan_id": plan_id,
+                "seq": 0,
+                "title": "Resolve A without losing B",
+                "contract_json": json.dumps({"allowed_paths": ["a.txt", "b.txt"]}),
+            }
+            agentdock.execute(
+                "INSERT INTO tasks(id,plan_id,seq,title,instructions,mode,status,contract_json) VALUES(?,?,?,?,?,?,?,?)",
+                (task["id"], plan_id, task["seq"], task["title"], task["title"], "write", "executed", task["contract_json"]),
+            )
+
+            def resolve_only_a(*args, **kwargs):
+                (integration_dir / "a.txt").write_text("resolved A\n")
+                return {"text": "Resolved only A; preserved the clean B application.", "model": "gpt-5.6-sol"}
+
+            result = {
+                "task": task,
+                "ok": True,
+                "commit": worker_commit,
+                "wt": str(self.tmp / "unused-worker-worktree"),
+                "branch": "worker",
+            }
+            recovered = integration.integrate_write_result(
+                agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)),
+                {"repo_root": repo, "integration_dir": integration_dir},
+                result,
+                orchestrator_turn=resolve_only_a,
+            )
+
+            self.assertTrue(recovered)
+            self.assertEqual((integration_dir / "a.txt").read_text(), "resolved A\n")
+            self.assertEqual((integration_dir / "b.txt").read_text(), "worker B\n")
+            self.assertEqual(integration_git("status", "--porcelain").stdout, "")
+            self.assertEqual(integration_git("log", "-1", "--pretty=%s").stdout.strip(), "worker A + B")
+            task_state = agentdock.one(
+                "SELECT status,integration_status FROM tasks WHERE id=?",
+                (task["id"],),
+            )
+            self.assertEqual(task_state, {"status": "done", "integration_status": "resolved_by_orchestrator"})
+        finally:
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "remove", "--force", str(integration_dir)],
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "-C", str(repo), "worktree", "prune"], capture_output=True, text=True)
+
     def test_merge_conflict_resolver_rejects_unrelated_changes_before_staging(self):
         repo = self.tmp / "conflict-repo"
         repo.mkdir()

@@ -96,6 +96,7 @@ from .schemas import (
     validate_task_graph,
 )
 from .tasks import (
+    drain_queued_manual_followups,
     mark_read_result_done,
     queued_messages,
     run_parallel_task,
@@ -629,7 +630,7 @@ def reset_plan_for_retry(plan, preserve_completed=False):
 def ready_tasks(plan_id, pending):
     ready = []
     for seq, task in sorted(pending.items()):
-        if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user", "pausing", "resuming"):
+        if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user", "pausing", "resuming", "integrating"):
             continue
         deps = json.loads(task.get("depends_json") or "[]")
         if not deps:
@@ -1251,7 +1252,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                 and plan.get("integration_workspace")
                 and Path(str(plan.get("integration_workspace"))).is_dir()
                 and any(
-                    task.get("status") in ("done", "executed", "waiting_for_orchestrator", "waiting_for_user")
+                    task.get("status") in ("done", "executed", "integrating", "waiting_for_orchestrator", "waiting_for_user")
                     for task in tasks
                 )
             )
@@ -1304,7 +1305,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     return
                 waiting = [
                     task for task in pending.values()
-                    if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user")
+                    if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user", "integrating")
                 ]
                 if waiting:
                     if any(task.get("status") == "paused_by_user" for task in waiting):
@@ -1402,6 +1403,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     integrate_write_result(plan, ctx, result)
                 else:
                     mark_read_result_done(result)
+                drain_queued_manual_followups(task["id"])
                 pending.pop(task["seq"], None)
             log(orchestrator_log_id(plan_id), "supervisor", "wave complete; integrated successful results and resolved escalations")
             write_mission_docs(plan_id)
@@ -1720,7 +1722,7 @@ def pause_task(task_id, reason="Paused by user"):
     task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not task:
         raise ValueError("Task bulunamadı")
-    if task.get("status") in ("done", "executed", "cancelled"):
+    if task.get("status") in ("done", "executed", "integrating", "cancelled"):
         raise ValueError("Bu task artık duraklatılamaz")
     thread_id = str(task.get("worker_thread_id") or (latest_agent_session(task_id) or {}).get("thread_id") or "").strip()
     execute(

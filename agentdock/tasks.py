@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from . import config
 from .codex import run_codex, steer_app_server, task_input_attachment_paths, terminate_process
 from .db import (
+    claim_task_integration,
     create_agent_session,
     execute,
     finish_agent_session,
@@ -57,12 +58,25 @@ def run_single_task(task_id):
     result = run_task_once(plan, task, workspace, force_mode=task["mode"])
     if result["ok"]:
         execute("UPDATE tasks SET status=? WHERE id=?", ("done", task_id))
+        drain_queued_manual_followups(task_id)
 
 
 def run_manual_followup_message(message_id):
     """Deliver one persisted user message without changing task execution state."""
     message = one("SELECT * FROM task_messages WHERE id=?", (message_id,))
     if not message:
+        return
+    task = one("SELECT status FROM tasks WHERE id=?", (message["task_id"],))
+    if task and task.get("status") in config.TASK_INTERVENTION_QUEUE_STATUSES:
+        # A task may enter the scheduler-owned integration window after the
+        # API persisted a standalone follow-up but before its delivery thread
+        # starts. Put it back in the durable queue; never open a second turn
+        # on the worker checkout.
+        execute(
+            "UPDATE task_messages SET status=?,error=? WHERE id=?",
+            ("queued", "", message_id),
+        )
+        log(message["task_id"], "manual", "follow-up deferred until task integration ownership ends")
         return
     execute("UPDATE task_messages SET status=? WHERE id=?", ("sending", message_id))
     try:
@@ -80,10 +94,25 @@ def run_manual_followup_message(message_id):
             "UPDATE task_messages SET status=?,error=? WHERE id=?",
             ("failed", str(exc), message_id),
         )
+    # A second message can arrive while this standalone manual turn is
+    # running. Once the runner has released the checkout, hand the durable
+    # queue to the single drain consumer instead of leaving it stranded.
+    drain_queued_manual_followups(message["task_id"])
 
 
 def manual_followup_delivery_status(task_id):
-    """Choose delivery based on a live runner, not a historical task status."""
+    """Choose delivery from durable task ownership and live controls.
+
+    A finished Codex process does not mean a write task is finished: contract
+    validation, commit and integration still own its checkout.  Those states
+    must queue interventions even when the process registries are empty.
+    """
+    task = one("SELECT status FROM tasks WHERE id=?", (task_id,))
+    with config.MANUAL_FOLLOWUP_DRAINS_LOCK:
+        if task_id in config.MANUAL_FOLLOWUP_DRAINS:
+            return "queued"
+    if task and task.get("status") in config.TASK_INTERVENTION_QUEUE_STATUSES:
+        return "queued"
     with config.APP_SERVER_CONTROLS_LOCK:
         if task_id in config.APP_SERVER_CONTROLS:
             return "sending"
@@ -116,21 +145,28 @@ def send_task_followup(task_id, prompt, attachments=None):
             )
             image_paths.append(saved["path"])
     message_id = str(uuid.uuid4())[:10]
-    status = manual_followup_delivery_status(task_id)
-    with config.APP_SERVER_CONTROLS_LOCK:
-        app_server_active = task_id in config.APP_SERVER_CONTROLS
-    execute(
-        "INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)",
-        (
-            message_id,
-            task_id,
-            task["plan_id"],
-            config.now(),
-            prompt,
-            json.dumps(image_paths),
-            status,
-        ),
-    )
+    # The task read, durable ownership decision and message insert share the
+    # DB lock.  Therefore the scheduler cannot claim integration between the
+    # state check and the queued-message write.
+    with config.DB_LOCK:
+        task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        if not task:
+            raise ValueError("Task bulunamadı")
+        status = manual_followup_delivery_status(task_id)
+        with config.APP_SERVER_CONTROLS_LOCK:
+            app_server_active = status == "sending" and task_id in config.APP_SERVER_CONTROLS
+        execute(
+            "INSERT INTO task_messages(id,task_id,plan_id,ts,text,attachments_json,status) VALUES(?,?,?,?,?,?,?)",
+            (
+                message_id,
+                task_id,
+                task["plan_id"],
+                config.now(),
+                prompt,
+                json.dumps(image_paths),
+                status,
+            ),
+        )
     if status == "sending":
         if app_server_active:
             # The transport records a race as a visible failed message if the
@@ -145,6 +181,67 @@ def send_task_followup(task_id, prompt, attachments=None):
     else:
         log(task_id, "manual", "user message queued for the next Codex turn")
     return {"ok": True, "queued": status == "queued", "message_id": message_id}
+
+
+def drain_queued_manual_followups(task_id):
+    """Start one durable consumer for queued messages after ownership ends."""
+    with config.MANUAL_FOLLOWUP_DRAINS_LOCK:
+        task = one("SELECT status FROM tasks WHERE id=?", (task_id,))
+        if not task or task.get("status") in config.TASK_INTERVENTION_QUEUE_STATUSES:
+            return False
+        if not one(
+            "SELECT id FROM task_messages WHERE task_id=? AND status='queued' ORDER BY ts,id LIMIT 1",
+            (task_id,),
+        ):
+            return False
+        if task_id in config.MANUAL_FOLLOWUP_DRAINS:
+            return False
+        config.MANUAL_FOLLOWUP_DRAINS.add(task_id)
+    threading.Thread(
+        target=_drain_queued_manual_followups,
+        args=(task_id,),
+        daemon=True,
+    ).start()
+    return True
+
+
+def _drain_queued_manual_followups(task_id):
+    try:
+        while True:
+            with config.DB_LOCK:
+                task = one("SELECT status FROM tasks WHERE id=?", (task_id,))
+                if not task or task.get("status") in config.TASK_INTERVENTION_QUEUE_STATUSES:
+                    return
+                message = one(
+                    "SELECT * FROM task_messages WHERE task_id=? AND status='queued' ORDER BY ts,id LIMIT 1",
+                    (task_id,),
+                )
+                if message:
+                    # Claim the message while the task is known to be outside
+                    # the scheduler-owned states. This prevents a follow-up
+                    # from starting on a checkout that is being reclaimed.
+                    execute(
+                        "UPDATE task_messages SET status=?,error=? WHERE id=? AND status=?",
+                        ("sending", "", message["id"], "queued"),
+                    )
+            if not message:
+                # Re-check while holding the drain lock. A sender that raced
+                # this check waits for the lock and will either be consumed by
+                # this loop or start a fresh drain after the lock is released.
+                with config.MANUAL_FOLLOWUP_DRAINS_LOCK:
+                    task = one("SELECT status FROM tasks WHERE id=?", (task_id,))
+                    pending = one(
+                        "SELECT id FROM task_messages WHERE task_id=? AND status='queued' ORDER BY ts,id LIMIT 1",
+                        (task_id,),
+                    )
+                    if task and task.get("status") not in config.TASK_INTERVENTION_QUEUE_STATUSES and pending:
+                        continue
+                    config.MANUAL_FOLLOWUP_DRAINS.discard(task_id)
+                    return
+            run_manual_followup_message(message["id"])
+    finally:
+        with config.MANUAL_FOLLOWUP_DRAINS_LOCK:
+            config.MANUAL_FOLLOWUP_DRAINS.discard(task_id)
 
 
 def configure_task(task_id, data):
@@ -372,14 +469,26 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
         result = run_task_with_recovery(plan, task, workspace)
         if result.get("paused"):
             log(f"orchestrator:{plan['id']}", "supervisor", f"TASK-{task['seq']+1:03d} paused by user; worktree and worker thread preserved")
-            return {"task": task, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch, **result}
+            return {"task": task, **result, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch}
         # A previous interrupted/failed integration may already have produced
         # a durable worker commit. Keep it as the checkpoint if the resumed
         # turn has no additional file changes.
         commit_hash = str(task.get("commit_hash") or "")
         if result["ok"]:
+            if not claim_task_integration(task["id"]):
+                current = one("SELECT status FROM tasks WHERE id=?", (task["id"],)) or {}
+                if current.get("status") in ("paused_by_user", "pausing"):
+                    return {"task": task, **result, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch}
+                result = {
+                    "ok": False,
+                    "phase": "integration_ownership",
+                    "error": "Task integration ownership could not be acquired safely.",
+                }
+            else:
+                task = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
+        if result["ok"]:
             if (one("SELECT status FROM tasks WHERE id=?", (task["id"],)) or {}).get("status") in ("paused_by_user", "pausing"):
-                return {"task": task, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch, **result}
+                return {"task": task, **result, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch}
             try:
                 changed = validate_worker_changes(wt, task)
                 log(task["id"], "supervisor", f"contract path check passed · files={len(changed)}")
@@ -397,7 +506,19 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
         )
         result = run_task_with_recovery(plan, task, ctx["integration_workspace"], force_mode="read")
         if result.get("paused"):
-            return {"task": task, "ok": False, "paused": True, "write": False, "phase": "worker", **result}
+            return {"task": task, **result, "ok": False, "paused": True, "write": False, "phase": "worker"}
+        if result.get("ok"):
+            if not claim_task_integration(task["id"]):
+                current = one("SELECT status FROM tasks WHERE id=?", (task["id"],)) or {}
+                if current.get("status") in ("paused_by_user", "pausing"):
+                    return {"task": task, **result, "ok": False, "paused": True, "write": False, "phase": "worker"}
+                result = {
+                    "ok": False,
+                    "phase": "integration_ownership",
+                    "error": "Task integration ownership could not be acquired safely.",
+                }
+            else:
+                task = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
         if result.get("ok"):
             try:
                 after = validate_read_workspace(ctx["integration_workspace"], baseline=baseline)
@@ -411,6 +532,7 @@ def mark_read_result_done(result):
     task = result["task"]
     if result.get("ok"):
         execute("UPDATE tasks SET status=?, integration_status=? WHERE id=?", ("done", "read_complete", task["id"]))
+        drain_queued_manual_followups(task["id"])
         return True
     return False
 
@@ -478,6 +600,11 @@ def run_manual_followup(task_id, prompt, image_paths=None):
         raise ValueError("Bu agent için devam ettirilecek Codex conversation bulunamadı.")
     workspace = task.get("workspace") or ""
     mode = task.get("mode") or "read"
+    if task.get("status") == "done":
+        # A completed execution is no longer allowed to mutate the product.
+        # The conversation remains available for explanation and verification,
+        # but it must not reopen write ownership after integration completed.
+        mode = "read"
     if not workspace or not Path(workspace).is_dir():
         # Successful isolated worktrees are cleaned up after integration. A
         # completed worker must still be conversationally resumable, so use

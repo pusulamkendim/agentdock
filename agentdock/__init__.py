@@ -76,6 +76,7 @@ from .config import (
 )
 from .db import (
     claim_plan_run,
+    claim_task_integration,
     create_agent_session,
     doctor_log_id,
     execute,
@@ -169,6 +170,7 @@ from .schemas import (
 from .tasks import (
     cancel_task,
     configure_task,
+    drain_queued_manual_followups,
     manual_followup_delivery_status,
     mark_read_result_done,
     open_task_terminal,
@@ -195,6 +197,7 @@ __all__ = [
     "run_codex", "run_codex_app_server", "run_orchestrator", "run_plan",
     "run_mission_orchestrator_turn", "run_task_once", "run_parallel_task",
     "run_manual_followup", "run_manual_followup_message", "run_single_task",
+    "drain_queued_manual_followups", "claim_task_integration",
     "resolve_merge_conflict", "integrate_write_result",
     "manual_followup_delivery_status", "timeline_for", "task_diff", "validate_task_graph",
     "PreflightBlocked", "PreflightWaitingForUser", "apply_preflight_action",

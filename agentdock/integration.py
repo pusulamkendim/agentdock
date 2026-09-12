@@ -1,18 +1,46 @@
 """Bounded Git integration for completed write-worker results."""
 
+import hashlib
 import json
 from pathlib import Path
 
 from . import config
-from .db import execute, log
+from .db import claim_task_integration, execute, log, one
 from .git_ops import (
     changed_git_paths,
     delete_branch,
     git,
+    git_status_entries,
     path_matches_allowed,
     remove_worktree,
 )
 from .schemas import safe_json
+
+
+def _path_state(root, relative_path):
+    """Return a stable content and metadata snapshot for one workspace path."""
+    path = Path(root) / relative_path
+    try:
+        if path.is_symlink():
+            return ("symlink", path.readlink().as_posix())
+        if path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return ("file", path.stat().st_mode & 0o7777, path.stat().st_size, digest.hexdigest())
+        if path.exists():
+            return ("other", path.is_dir())
+        return ("missing",)
+    except OSError as exc:
+        return ("unreadable", str(exc))
+
+
+def _git_status_map(root):
+    return {
+        entry["path"]: (entry.get("xy", ""), entry.get("old_path", ""))
+        for entry in git_status_entries(root)
+    }
 
 
 def merge_conflict_prompt(plan, task, unresolved, cherry_error):
@@ -65,6 +93,14 @@ def resolve_merge_conflict(plan, ctx, result, cherry_error, orchestrator_turn=No
     ]
     if settings.get("merge_conflicts") != "orchestrator":
         return False, f"Merge conflict requires attention: {', '.join(unresolved) or cherry_error}"
+    unresolved_set = set(unresolved)
+    changed_before = set(changed_git_paths(ctx["integration_dir"]))
+    status_before = _git_status_map(ctx["integration_dir"])
+    protected_paths = changed_before - unresolved_set
+    state_before = {
+        relative_path: _path_state(ctx["integration_dir"], relative_path)
+        for relative_path in protected_paths
+    }
     log(
         f"orchestrator:{plan['id']}",
         "supervisor",
@@ -100,10 +136,20 @@ def resolve_merge_conflict(plan, ctx, result, cherry_error, orchestrator_turn=No
         if marker_files:
             return False, "Orchestrator left conflict markers in: " + ", ".join(marker_files)
         changed = set(changed_git_paths(ctx["integration_dir"]))
-        unresolved_set = set(unresolved)
-        out_of_scope = sorted(changed - unresolved_set)
+        out_of_scope = sorted(changed - changed_before - unresolved_set)
         if out_of_scope:
-            return False, "Orchestrator conflict resolver changed files outside the conflicted set: " + ", ".join(out_of_scope[:20])
+            return False, "Orchestrator conflict resolver changed files outside the conflicted set/integration baseline: " + ", ".join(out_of_scope[:20])
+        status_after = _git_status_map(ctx["integration_dir"])
+        changed_clean_paths = sorted(
+            relative_path
+            for relative_path in protected_paths
+            if (
+                _path_state(ctx["integration_dir"], relative_path) != state_before[relative_path]
+                or status_after.get(relative_path) != status_before.get(relative_path)
+            )
+        )
+        if changed_clean_paths:
+            return False, "Orchestrator conflict resolver changed cleanly-applied files: " + ", ".join(changed_clean_paths[:20])
         contract = safe_json(task.get("contract_json"), {})
         allowed_paths = contract.get("allowed_paths") or []
         disallowed_conflicts = [
@@ -133,10 +179,6 @@ def resolve_merge_conflict(plan, ctx, result, cherry_error, orchestrator_turn=No
             "cherry-pick",
             "--continue",
         )
-        execute(
-            "UPDATE tasks SET status=?, error=?, integration_status=? WHERE id=?",
-            ("done", "", "resolved_by_orchestrator", task["id"]),
-        )
         log(
             f"orchestrator:{plan['id']}",
             "supervisor",
@@ -152,14 +194,25 @@ def integrate_write_result(plan, ctx, result, orchestrator_turn=None):
     task = result["task"]
     if not result.get("ok"):
         return False
+    # Normal scheduler calls claim this before validation/commit. Keep the
+    # integration boundary safe for direct callers and recovery paths too,
+    # while refusing to operate on a task whose ownership has already moved
+    # elsewhere.
+    current = one("SELECT status FROM tasks WHERE id=?", (task["id"],))
+    if current:
+        if current.get("status") in ("running", "executed"):
+            if not claim_task_integration(task["id"]):
+                return False
+        elif current.get("status") != "integrating":
+            return False
     commit_hash = result.get("commit") or ""
     if not commit_hash:
+        remove_worktree(ctx["repo_root"], result["wt"])
+        delete_branch(ctx["repo_root"], result["branch"])
         execute(
             "UPDATE tasks SET status=?, integration_status=? WHERE id=?",
             ("done", "no_changes", task["id"]),
         )
-        remove_worktree(ctx["repo_root"], result["wt"])
-        delete_branch(ctx["repo_root"], result["branch"])
         return True
     try:
         git(
@@ -171,12 +224,12 @@ def integrate_write_result(plan, ctx, result, orchestrator_turn=None):
             "cherry-pick",
             commit_hash,
         )
+        remove_worktree(ctx["repo_root"], result["wt"])
+        delete_branch(ctx["repo_root"], result["branch"])
         execute(
             "UPDATE tasks SET status=?, integration_status=? WHERE id=?",
             ("done", "integrated", task["id"]),
         )
-        remove_worktree(ctx["repo_root"], result["wt"])
-        delete_branch(ctx["repo_root"], result["branch"])
         return True
     except Exception as exc:
         recovered, detail = resolve_merge_conflict(
@@ -189,6 +242,10 @@ def integrate_write_result(plan, ctx, result, orchestrator_turn=None):
         if recovered:
             remove_worktree(ctx["repo_root"], result["wt"])
             delete_branch(ctx["repo_root"], result["branch"])
+            execute(
+                "UPDATE tasks SET status=?, error=?, integration_status=? WHERE id=?",
+                ("done", "", "resolved_by_orchestrator", task["id"]),
+            )
             return True
         git(ctx["integration_dir"], "cherry-pick", "--abort", check=False)
         error = f"Parallel integration conflict could not be self-healed: {detail or exc}"

@@ -51,6 +51,15 @@ APP_SERVER_CONTROLS = {}
 
 APP_SERVER_CONTROLS_LOCK = threading.RLock()
 
+# A worker's Codex turn can finish before validation, commit and integration
+# have finished. Manual interventions must stay queued while that durable
+# execution ownership is active; the process registry alone is not enough.
+TASK_INTERVENTION_QUEUE_STATUSES = frozenset({"running", "executed", "integrating"})
+
+MANUAL_FOLLOWUP_DRAINS = set()
+
+MANUAL_FOLLOWUP_DRAINS_LOCK = threading.RLock()
+
 ACTIVE_PLAN_RUNS = set()
 
 ACTIVE_PLAN_RUNS_LOCK = threading.RLock()

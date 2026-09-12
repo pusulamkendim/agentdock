@@ -9,7 +9,7 @@ const planReviewDisclosure=new Map();
 const DEFAULT_ORCHESTRATOR='gpt-5.6-sol',DEFAULT_WORKER='gpt-5.6-luna',DEFAULT_ORCHESTRATOR_EFFORT='high',DEFAULT_WORKER_EFFORT='medium';
 const $=id=>document.getElementById(id);
 const decisionLabels={already_satisfied:'No work needed',answer_only:'Answer only',needs_user_input:'Needs your decision',blocked:'Blocked for safety or authority',execute:'Work required'};
-const statusLabels={planning:'Planning',planned:'Plan ready',approved:'Approved',preflight:'Checking workspace',running:'Running',pausing:'Pausing',paused:'Paused',resuming:'Resuming',awaiting_apply:'Review changes',ready:'Complete',completed:'Complete',queued:'Queued',idle:'Idle',done:'Complete',attention:'Needs attention',waiting_for_user:'Waiting for you',blocked:'Blocked',cancelled:'Cancelled',failed:'Failed',paused_by_user:'Paused by you',waiting_for_orchestrator:'Waiting for orchestrator'};
+const statusLabels={planning:'Planning',planned:'Plan ready',approved:'Approved',preflight:'Checking workspace',running:'Running',integrating:'Integrating',pausing:'Pausing',paused:'Paused',resuming:'Resuming',awaiting_apply:'Review changes',ready:'Complete',completed:'Complete',queued:'Queued',idle:'Idle',done:'Complete',attention:'Needs attention',waiting_for_user:'Waiting for you',blocked:'Blocked',cancelled:'Cancelled',failed:'Failed',paused_by_user:'Paused by you',waiting_for_orchestrator:'Waiting for orchestrator'};
 
 async function api(path,opts={}){
   const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});
@@ -97,7 +97,7 @@ function renderOverview(){
   const plans=state.plans||[], workspaces=state.workspaces||[];
   const active=plans.filter(p=>['running','planning','preflight','planned','approved','awaiting_apply','waiting_for_user','pausing','paused','resuming'].includes(p.status));
   const attention=plans.filter(p=>['attention','failed','blocked'].includes(p.status));
-  const taskCount=active.reduce((n,p)=>n+(p.tasks||[]).filter(t=>t.status==='running').length,0);
+  const taskCount=active.reduce((n,p)=>n+(p.tasks||[]).filter(t=>['running','integrating'].includes(t.status)).length,0);
   $('overviewSummary').innerHTML=[
     ['ACTIVE MISSIONS',active.length,'across all workspaces',''],
     ['RUNNING AGENTS',taskCount,'workers currently executing',''],
@@ -109,7 +109,7 @@ function renderOverview(){
   $('overviewWorkspaces').innerHTML=workspaces.length?workspaces.map(w=>overviewWorkspaceCard(w)).join(''):'<div class="empty-soft">Add a repository workspace to begin.</div>';
 }
 function overviewMissionCard(p){
-  const w=(state.workspaces||[]).find(x=>x.id===p.workspace_id),tasks=p.tasks||[],running=tasks.filter(t=>t.status==='running').length,done=tasks.filter(t=>['done','executed'].includes(t.status)).length;
+  const w=(state.workspaces||[]).find(x=>x.id===p.workspace_id),tasks=p.tasks||[],running=tasks.filter(t=>['running','integrating'].includes(t.status)).length,done=tasks.filter(t=>['done','executed'].includes(t.status)).length;
   return `<button class="overview-mission-card" onclick="selectPlan('${p.id}')"><span class="mission-state ${statusClass(p.status)}"></span><span class="mission-main"><b>${p.demo_mode?'<span class="demo-badge">DEMO</span> ':''}${esc(short(missionTitle(p),72))}</b><small>${esc(w?.name||'workspace')} · ${esc(p.decision?decisionLabel(p.decision):p.orchestrator_model)} · ${running} running · ${done}/${tasks.length||0} done</small></span><span class="mission-meta ${statusClass(p.status)}">${esc(statusLabel(p.status))}</span></button>`
 }
 function overviewWorkspaceCard(w){
@@ -128,14 +128,14 @@ function renderGlobalMissions(){
   $('globalMissionBoard').innerHTML=plans.length?plans.map(p=>globalMissionRow(p)).join(''):'<div class="empty-soft">No missions match this filter.</div>';
 }
 function globalMissionRow(p){
-  const w=(state.workspaces||[]).find(x=>x.id===p.workspace_id),tasks=p.tasks||[],running=tasks.filter(t=>t.status==='running').length,queued=tasks.filter(t=>t.status==='pending').length,done=tasks.filter(t=>['done','executed'].includes(t.status)).length;
+  const w=(state.workspaces||[]).find(x=>x.id===p.workspace_id),tasks=p.tasks||[],running=tasks.filter(t=>['running','integrating'].includes(t.status)).length,queued=tasks.filter(t=>t.status==='pending').length,done=tasks.filter(t=>['done','executed'].includes(t.status)).length;
   return `<div class="global-mission-row" onclick="selectPlan('${p.id}')"><span class="mission-state ${statusClass(p.status)}"></span><div class="global-mission-title"><b>${p.demo_mode?'<span class="demo-badge">DEMO</span> ':''}${esc(short(missionTitle(p),110))}</b><small>${running} running · ${queued} queued · ${done}/${tasks.length||0} done${p.decision?` · ${esc(decisionLabel(p.decision))}`:''}</small></div><div class="global-mission-workspace">${esc(w?.name||'—')}</div><div class="global-mission-runtime">${esc(p.orchestrator_model)} → ${esc(p.worker_model)}</div><div class="global-mission-time">${elapsed(p.started_at,p.finished_at)}</div><div class="global-mission-status ${statusClass(p.status)}">${esc(statusLabel(p.status))}</div></div>`
 }
 
 function renderWorkspaceBoard(){
   $('workspaceBoard').innerHTML=(state.workspaces||[]).map(w=>{const plans=(state.plans||[]).filter(p=>p.workspace_id===w.id);return `<section class="workspace-card"><div class="workspace-card-head"><div><span class="workspace-kicker">${esc(w.default_branch||'git')}</span><h3>${esc(w.name)}</h3><code>${esc(w.repo_path)}</code></div><button class="ghost compact" onclick="selectWorkspace('${w.id}',true)">New mission</button></div><div class="workspace-stats"><span><b>${plans.filter(p=>['running','planning','preflight','approved','awaiting_apply','waiting_for_user','pausing','paused','resuming'].includes(p.status)).length}</b>live</span><span><b>${plans.filter(p=>['attention','blocked','failed'].includes(p.status)).length}</b>attention</span><span><b>${plans.filter(p=>p.status==='done').length}</b>done</span></div><div class="mission-list">${plans.map(p=>missionListCard(p)).join('')||'<div class="empty-state">No missions in this workspace.</div>'}</div></section>`}).join('')||'<div class="empty-terminal"><span>agentdock@local:~$</span> add a workspace to begin_</div>';
 }
-function missionListCard(p){const tasks=p.tasks||[],run=tasks.filter(t=>t.status==='running').length,queue=tasks.filter(t=>t.status==='pending').length,done=tasks.filter(t=>t.status==='done').length;return `<button class="mission-list-card" onclick="selectPlan('${p.id}')"><span class="mission-state ${statusClass(p.status)}"></span><span class="mission-list-main"><b>${p.demo_mode?'<span class="demo-badge">DEMO</span> ':''}${esc(short(missionTitle(p),80))}</b><small>${esc(p.decision?decisionLabel(p.decision):p.orchestrator_model)} · ${run} running · ${queue} queued · ${done} done</small></span><span class="mission-list-status ${statusClass(p.status)}">${esc(statusLabel(p.status))}</span></button>`}
+function missionListCard(p){const tasks=p.tasks||[],run=tasks.filter(t=>['running','integrating'].includes(t.status)).length,queue=tasks.filter(t=>t.status==='pending').length,done=tasks.filter(t=>t.status==='done').length;return `<button class="mission-list-card" onclick="selectPlan('${p.id}')"><span class="mission-state ${statusClass(p.status)}"></span><span class="mission-list-main"><b>${p.demo_mode?'<span class="demo-badge">DEMO</span> ':''}${esc(short(missionTitle(p),80))}</b><small>${esc(p.decision?decisionLabel(p.decision):p.orchestrator_model)} · ${run} running · ${queue} queued · ${done} done</small></span><span class="mission-list-status ${statusClass(p.status)}">${esc(statusLabel(p.status))}</span></button>`}
 
 function renderNoMission(){$('liveTitle').textContent=planning?'Orchestrator is planning…':'No mission selected';$('runStats').innerHTML='';$('missionDetails').hidden=true;$('missionDetailsBody').innerHTML='';$('missionBar').className='mission-bar empty';$('missionBar').innerHTML=planning?'<span>Sol/Astra is analyzing the mission and workspace…</span>':'<span>Select or create a mission to see the swarm.</span>';$('liveGrid').innerHTML=planning?planningTerminal():`<div class="empty-terminal"><span>agentdock@local:~$</span> waiting for mission_</div>`;$('usagePanel').innerHTML='';$('decisionPanel').hidden=true;$('decisionPanel').innerHTML=''}
 function planningTerminal(){return `<article class="agent-terminal running"><div class="agent-titlebar"><span class="status-led"></span><span class="agent-name">orchestrator</span><span class="agent-index">planning</span><span class="agent-model">${esc(configLabel($('orchestratorModel').value,$('orchestratorEffort').value,$('orchestratorTier').value))}</span></div><div class="agent-task"><div class="task-path">mission / decomposition</div><strong>${esc(short($('goal').value,120))}</strong><p>Finding independent work, dependencies and safe parallel write boundaries.</p></div><div class="mini-terminal"><div class="term-line system">$ inspect goal and workspace</div><div class="term-line system">$ build dependency graph</div><div class="term-line"><span class="term-caret">▋</span> orchestrating...</div></div><div class="agent-footer"><span>read-only</span><span class="footer-spacer"></span><span>Sol/Astra</span></div></article>`}
@@ -188,7 +188,7 @@ function missionActions(p,tasks){
 }
 function renderLive(){
   const p=live.plan,tasks=live.tasks||[],counts={running:0,pending:0,paused:0,done:0,failed:0};
-  tasks.forEach(t=>{if(['running','resuming'].includes(t.status))counts.running++;else if(t.status==='pending')counts.pending++;else if(['paused_by_user','pausing'].includes(t.status))counts.paused++;else if(['done','executed'].includes(t.status))counts.done++;else if(['failed','blocked','cancelled','attention'].includes(t.status))counts.failed++});
+  tasks.forEach(t=>{if(['running','resuming','integrating'].includes(t.status))counts.running++;else if(t.status==='pending')counts.pending++;else if(['paused_by_user','pausing'].includes(t.status))counts.paused++;else if(['done','executed'].includes(t.status))counts.done++;else if(['failed','blocked','cancelled','attention'].includes(t.status))counts.failed++});
   $('liveTitle').textContent=missionTitle(p);
   const pausedForPreflight=['waiting_for_user','blocked'].includes(p.status)&&['waiting_for_user','blocked'].includes(p.preflight_status);
   $('runStats').innerHTML=`<span class="stat"><strong>${counts.running}</strong>running</span><span class="stat"><strong>${counts.pending}</strong>${pausedForPreflight||counts.paused?'paused':'queued'}</span><span class="stat"><strong>${counts.done}</strong>done</span>${counts.failed?`<span class="stat status-failed"><strong>${counts.failed}</strong>issues</span>`:''}`;
@@ -237,13 +237,14 @@ function renderOrchestrator(o){
 function renderTerminal(t){
   const d=deps(t),logs=['waiting_for_orchestrator','waiting_for_user'].includes(t.status)?[]:(t.recent_logs||[]);let lines='';
   const pausedForPreflight=['waiting_for_user','blocked'].includes(live.plan?.status)&&['waiting_for_user','blocked'].includes(live.plan?.preflight_status);
-  const working=t.status==='running'?`<div class="classic-working"><i></i><b>Working</b><span>(${elapsed(t.started_at,null,live.server_time)} · pause to interrupt)</span></div>`:t.status==='resuming'?`<div class="classic-working"><i></i><b>Continuing</b><span>same conversation</span></div>`:t.status==='pausing'?`<div class="classic-working"><i></i><b>Pausing</b><span>saving checkpoint</span></div>`:'';
+  const working=t.status==='running'?`<div class="classic-working"><i></i><b>Working</b><span>(${elapsed(t.started_at,null,live.server_time)} · pause to interrupt)</span></div>`:t.status==='integrating'?`<div class="classic-working"><i></i><b>Integrating</b><span>protecting the worker result</span></div>`:t.status==='resuming'?`<div class="classic-working"><i></i><b>Continuing</b><span>same conversation</span></div>`:t.status==='pausing'?`<div class="classic-working"><i></i><b>Pausing</b><span>saving checkpoint</span></div>`:'';
   if(logs.length)lines=working+logs.slice(-7).map(l=>`<div class="term-line ${esc(l.stream)}">${l.stream==='stderr'?'! ':l.stream==='manual'?'> ':'$ '}${esc(short(displayLogLine(l.line),220))}</div>`).join('');
   else if(t.status==='running')lines=working+`<div class="term-line"><span class="term-caret">▋</span></div>`;
   else if(t.status==='waiting_for_orchestrator')lines='<div class="term-line system">> waiting for orchestrator</div><div class="term-line">'+esc(short(t.waiting_reason||'A worker decision is being resolved.',360))+'</div>';
   else if(t.status==='waiting_for_user')lines='<div class="term-line system">> waiting for your answer</div><div class="term-line">'+esc(short(t.waiting_reason||'The mission needs information before continuing.',360))+'</div>';
   else if(t.status==='pending'&&pausedForPreflight)lines=`<div class="term-line system">$ paused · waiting for your workspace decision</div><div class="term-line"><span class="term-caret">_</span> preflight resolution required</div>`;
   else if(t.status==='pending')lines=`<div class="term-line system">$ queued${d.length?` · waiting for task ${d.map(x=>x+1).join(', ')}`:' · ready'}</div><div class="term-line"><span class="term-caret">_</span></div>`;
+  else if(t.status==='integrating')lines=working+`<div class="term-line system">$ integration in progress · follow-ups are queued</div><div class="term-line"><span class="term-caret">▋</span></div>`;
   else if(['done','executed'].includes(t.status))lines=`<div class="term-line system">$ task complete</div><div class="term-line">${esc(short(t.output||'No textual output.',300))}</div>`;
   else if(t.status==='pausing')lines=`<div class="term-line system">$ pausing · saving checkpoint</div><div class="term-line"><span class="term-caret">_</span> same conversation will resume</div>`;
   else if(t.status==='resuming')lines=`<div class="term-line system">$ continuing the same conversation</div><div class="term-line"><span class="term-caret">▋</span></div>`;
@@ -256,7 +257,7 @@ function renderTerminal(t){
 function taskScopeSummary(t){const c=t.contract||{},sc=c.scope||{},ins=Array.isArray(sc.in_scope)?sc.in_scope:[],outs=Array.isArray(sc.out_of_scope)?sc.out_of_scope:[],paths=Array.isArray(c.allowed_paths)?c.allowed_paths:[];return `<div class="review-scope"><div><span>OBJECTIVE</span><p>${esc(c.objective||t.instructions||'—')}</p></div>${ins.length?`<div><span>IN SCOPE</span><p>${ins.slice(0,3).map(esc).join(' · ')}</p></div>`:''}${paths.length?`<div><span>PATHS</span><p>${paths.slice(0,4).map(esc).join(' · ')}</p></div>`:''}${outs.length?`<div><span>OUT OF SCOPE</span><p>${outs.slice(0,2).map(esc).join(' · ')}</p></div>`:''}</div>`}
 function planReviewStateKey(p,tasks){
   if(['planned','approved','awaiting_apply','waiting_for_user','blocked','attention','failed','paused','pausing','resuming'].includes(p.status))return `mission:${p.status}`;
-  const task=tasks.find(t=>['failed','blocked','attention','waiting_for_user','paused_by_user','resuming'].includes(t.status));
+  const task=tasks.find(t=>['failed','blocked','attention','waiting_for_user','paused_by_user','resuming','integrating'].includes(t.status));
   return task?`task:${task.id}:${task.status}`:`quiet:${p.status}`;
 }
 function planReviewDefaultOpen(p,tasks){return !planReviewStateKey(p,tasks).startsWith('quiet:')}

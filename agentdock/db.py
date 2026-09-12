@@ -272,7 +272,7 @@ def recover_orphaned_runs(write_docs=None):
         )
         con.execute(
             f"UPDATE tasks SET status='attention', error=?, finished_at=? "
-            f"WHERE plan_id IN ({placeholders}) AND status IN ('running','pausing','resuming')",
+            f"WHERE plan_id IN ({placeholders}) AND status IN ('running','pausing','resuming','integrating')",
             (message, interrupted_at, *plan_ids),
         )
         con.execute(
@@ -412,6 +412,23 @@ def release_plan_run(plan_id):
         config.ACTIVE_PLAN_RUNS.discard(plan_id)
 
 
+def claim_task_integration(task_id):
+    """Atomically take ownership of post-worker validation and integration."""
+    with config.DB_LOCK:
+        con = db()
+        try:
+            cur = con.execute(
+                """UPDATE tasks
+                   SET status='integrating', error='', waiting_reason='', finished_at=NULL
+                   WHERE id=? AND status IN ('running','executed')""",
+                (task_id,),
+            )
+            con.commit()
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+
 def plan_is_paused(plan_id):
     plan = one("SELECT status,paused FROM plans WHERE id=?", (plan_id,)) or {}
     return plan.get("status") in ("paused", "pausing") or int(plan.get("paused") or 0) == 1
@@ -449,7 +466,7 @@ def workspace_summary(workspace):
     running = queued = attention = done = 0
     for pl in plans:
         stats = one("""SELECT
-            SUM(CASE WHEN status IN ('running','resuming','pausing') THEN 1 ELSE 0 END) running,
+            SUM(CASE WHEN status IN ('running','resuming','pausing','integrating') THEN 1 ELSE 0 END) running,
             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) queued,
             SUM(CASE WHEN status IN ('failed','blocked','cancelled','attention','paused_by_user') THEN 1 ELSE 0 END) issues,
             SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) done
