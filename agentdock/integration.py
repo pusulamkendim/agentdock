@@ -11,7 +11,6 @@ from .git_ops import (
     delete_branch,
     git,
     git_status_entries,
-    path_matches_allowed,
     remove_worktree,
 )
 from .schemas import safe_json
@@ -150,15 +149,6 @@ def resolve_merge_conflict(plan, ctx, result, cherry_error, orchestrator_turn=No
         )
         if changed_clean_paths:
             return False, "Orchestrator conflict resolver changed cleanly-applied files: " + ", ".join(changed_clean_paths[:20])
-        contract = safe_json(task.get("contract_json"), {})
-        allowed_paths = contract.get("allowed_paths") or []
-        disallowed_conflicts = [
-            relative_path
-            for relative_path in unresolved
-            if not any(path_matches_allowed(relative_path, pattern) for pattern in allowed_paths)
-        ]
-        if disallowed_conflicts:
-            return False, "Conflict files fall outside the task contract: " + ", ".join(disallowed_conflicts[:20])
         if not unresolved:
             return False, "Git reported no conflicted files to resolve"
         # Stage only the files Git reported as unmerged.  The resolver cannot

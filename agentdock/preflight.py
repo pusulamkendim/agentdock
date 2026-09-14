@@ -29,6 +29,7 @@ from .git_ops import (
     git,
     git_read,
     git_status_entries,
+    initialize_git_repository,
     repo_info,
     workspace_snapshot,
 )
@@ -54,8 +55,15 @@ class PreflightBlocked(RuntimeError):
         super().__init__(message)
         self.report = report or {}
 
-def preflight_action_options(has_write, affected_paths, has_read=False):
+def preflight_action_options(has_write, affected_paths, has_read=False, missing_git=False):
     options = []
+    if missing_git:
+        options.append({
+            "id": "initialize_git",
+            "label": "Initialize Git repository",
+            "description": "Creates local Git metadata and an empty base commit. Existing files are not staged or committed.",
+            "requires_paths": False,
+        })
     if affected_paths:
         options.extend([
             {
@@ -130,9 +138,29 @@ def run_preflight(plan, has_write, phase="execution"):
     task_modes = [t.get("mode") for t in rows("SELECT mode FROM tasks WHERE plan_id=?", (plan_id,))]
     has_read = any(mode == "read" for mode in task_modes)
     if has_write and not info["is_git"]:
-        report["blockers"].append("Write execution needs a Git repository for isolated worktrees")
-        report["action_options"] = preflight_action_options(has_write, [], has_read)
-    elif info["is_git"]:
+        # Creating local Git metadata and an empty base commit is a reversible,
+        # mission-local preparation step. It does not stage or alter existing
+        # files, so the root orchestrator can perform it under the mission's
+        # existing workspace authority without pausing for a separate form.
+        branch = "main"
+        workspace_row = one(
+            "SELECT default_branch FROM workspaces WHERE id=?",
+            (plan.get("workspace_id") or "",),
+        ) or {}
+        branch = workspace_row.get("default_branch") or branch
+        snapshot = initialize_git_repository(workspace, branch)
+        info = repo_info(workspace)
+        report["snapshot"] = snapshot
+        report["repairs"].append("Initialized a local Git repository with an empty base commit")
+        report["checks"].append("Existing workspace files were not staged or modified")
+        record_control_event(plan_id, "agentdock.workspace_initialized", {
+            "repo_root": snapshot.get("repo_root"),
+            "branch": snapshot.get("branch"),
+            "head": snapshot.get("head"),
+            "automatic": True,
+        })
+        log(doctor_log_id(plan_id), "supervisor", "orchestrator initialized local Git metadata; existing files were not added")
+    if info["is_git"]:
         repo_root = Path(info["root"])
         report["checks"].append(f"Git repository: {repo_root}")
         log(doctor_log_id(plan_id), "system", f"✓ Git repository {repo_root}")
@@ -162,7 +190,7 @@ def run_preflight(plan, has_write, phase="execution"):
             owner = "active" if opened else ("ownership unknown" if opened is None else f"{int(age)}s old")
             message = f"Git lock detected ({owner}): {lock}"
             if has_write:
-                report["blockers"].append(message + "; write execution requires explicit resolution")
+                report["warnings"].append(message + "; the orchestrator will retry or diagnose the Git operation if it is still active")
             else:
                 report["warnings"].append(message + "; read-only execution will not remove or modify it")
 
@@ -173,13 +201,11 @@ def run_preflight(plan, has_write, phase="execution"):
         report["affected_paths"] = affected[:100]
         accepted_paths = set(safe_json(plan.get("workspace_choice_json"), []))
         if has_write and affected:
-            if phase == "execution" and set(affected).issubset(accepted_paths):
-                report["warnings"].append("User explicitly accepted the current changed paths for isolated execution.")
-                report["checks"].append("Working tree choice recorded; isolated writes will use a clean worktree base")
-                log(doctor_log_id(plan_id), "system", "✓ explicit workspace choice recorded for current changes")
-            else:
-                report["blockers"].append("User changes detected; isolated write execution needs an explicit workspace choice: " + "; ".join(affected[:12]))
-                report["action_options"] = preflight_action_options(has_write, affected, has_read)
+            report["warnings"].append(
+                "Workspace has existing changes; AgentDock will snapshot the visible files in a temporary index and preserve the user's real index."
+            )
+            report["checks"].append("Existing changes will be used as the isolated worker baseline")
+            log(doctor_log_id(plan_id), "system", "✓ current workspace captured as the mission baseline; no explicit file choice required")
         elif has_write:
             report["checks"].append("Working tree clean")
             log(doctor_log_id(plan_id), "system", "✓ working tree clean")
@@ -195,20 +221,28 @@ def run_preflight(plan, has_write, phase="execution"):
         # problem is not tied to a selectable file (for example a missing
         # Codex binary or a Git lock).
         if not report["action_options"]:
-            report["action_options"] = preflight_action_options(has_write, report["affected_paths"], has_read)
+            report["action_options"] = preflight_action_options(
+                has_write,
+                report["affected_paths"],
+                has_read,
+                missing_git=snapshot.get("classification") == "NOT_GIT",
+            )
         if not codex:
             for option in report["action_options"]:
                 if option.get("id") == "continue_read_only":
                     option["disabled"] = True
-        hard_blocker = any("Git lock" in item or "Codex CLI" in item or "needs a Git repository" in item for item in report["blockers"])
-        report["status"] = "blocked" if hard_blocker else "waiting_for_user"
+        report["status"] = "attention" if not codex else "waiting_for_permission"
         for b in report["blockers"]:
             log(doctor_log_id(plan_id), "stderr", b)
         update_preflight(plan_id, report["status"], report)
-        record_control_event(plan_id, "agentdock.preflight", {"status": report["status"], "message": "Preflight needs an explicit user decision before execution."})
-        message = "Preflight waiting for user: " if report["status"] == "waiting_for_user" else "Preflight blocked: "
-        exc = PreflightWaitingForUser if report["status"] == "waiting_for_user" else PreflightBlocked
-        raise exc(message + " | ".join(report["blockers"]), report)
+        record_control_event(plan_id, "agentdock.permission_required" if codex else "agentdock.preflight_failed", {
+            "status": report["status"],
+            "message": "The orchestrator needs additional authority before continuing.",
+            "reasons": report["blockers"],
+        })
+        if not codex:
+            raise RuntimeError("Codex runtime unavailable: " + " | ".join(report["blockers"]))
+        raise PreflightWaitingForUser("Permission required: " + " | ".join(report["blockers"]), report)
     report["status"] = "ready"
     update_preflight(plan_id, "ready", report)
     record_control_event(plan_id, "agentdock.preflight", {"status": "ready", "message": "Read-only workspace checks complete."})
@@ -238,10 +272,10 @@ def apply_preflight_action(plan_id, action, selected=None):
     if not plan:
         raise ValueError("Mission bulunamadı")
     report = safe_json(plan.get("preflight_json"), {})
-    if plan.get("status") not in ("waiting_for_user", "blocked"):
+    if plan.get("status") not in ("waiting_for_user", "waiting_for_permission", "blocked"):
         raise ValueError("Bu mission şu anda bir preflight kararı beklemiyor")
     action = str(action or "").strip()
-    if action not in {"ignore", "stage", "move", "continue_read_only", "verify_again", "cancel"}:
+    if action not in {"initialize_git", "ignore", "stage", "move", "continue_read_only", "verify_again", "cancel"}:
         raise ValueError("Geçersiz preflight aksiyonu")
 
     if action == "cancel":
@@ -249,6 +283,30 @@ def apply_preflight_action(plan_id, action, selected=None):
         log(f"orchestrator:{plan_id}", "supervisor", "mission cancelled by user during preflight")
         write_mission_docs(plan_id)
         return {"ok": True, "status": "cancelled"}
+
+    if action == "initialize_git":
+        workspace_row = one("SELECT default_branch FROM workspaces WHERE id=?", (plan.get("workspace_id") or "",)) or {}
+        branch = workspace_row.get("default_branch") or "main"
+        log(f"orchestrator:{plan_id}", "manual", f"$ git init -b {branch}")
+        snapshot = initialize_git_repository(plan["workspace"], branch)
+        execute(
+            "UPDATE plans SET workspace_snapshot_json=?,error='' WHERE id=?",
+            (json.dumps(snapshot, ensure_ascii=False), plan_id),
+        )
+        record_control_event(plan_id, "agentdock.workspace_initialized", {
+            "repo_root": snapshot.get("repo_root"),
+            "branch": snapshot.get("branch"),
+            "head": snapshot.get("head"),
+        })
+        log(f"orchestrator:{plan_id}", "system", "✓ local Git repository initialized with an empty base commit; existing files were not added")
+        task_count = one("SELECT COUNT(*) count FROM tasks WHERE plan_id=?", (plan_id,))["count"]
+        if not task_count:
+            from .mission import replan_mission
+            return replan_mission(
+                plan_id,
+                mode="reconsider",
+                user_note="The user initialized this workspace as a local Git repository. Continue planning the requested repository output.",
+            )
 
     info = repo_info(plan["workspace"])
     if not info.get("is_git"):

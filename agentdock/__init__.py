@@ -19,6 +19,7 @@ from . import (
     handoffs,
     integration,
     mission,
+    mission_context,
     orchestrator,
     platform,
     preflight,
@@ -96,6 +97,7 @@ from .git_ops import (
     canonical_allowed_pattern,
     changed_git_paths,
     fingerprint_diff,
+    initialize_git_repository,
     path_matches_allowed,
     repo_info,
     validate_read_workspace,
@@ -134,6 +136,7 @@ from .mission import (
     stored_integration_context,
     workspace_browse,
 )
+from .mission_context import build_mission_context, mission_context_data, render_mission_context
 from .handoffs import (
     consultation_payload,
     create_worker_consultation,
@@ -156,6 +159,7 @@ from .orchestrator import (
     run_mission_orchestrator_turn,
     run_orchestrator_followup,
     start_orchestrator_followup,
+    start_runtime_recovery,
     start_reconstruct,
 )
 from .preflight import PreflightBlocked, PreflightWaitingForUser, apply_preflight_action, run_preflight
@@ -193,7 +197,7 @@ from .version import VERSION
 
 
 __all__ = [
-    "api", "app", "codex", "config", "db", "git_ops", "handoffs", "integration", "mission", "orchestrator", "platform",
+    "api", "app", "codex", "config", "db", "git_ops", "handoffs", "integration", "mission", "mission_context", "orchestrator", "platform",
     "preflight", "schemas", "tasks", "timeline", "Handler", "main", "init_db",
     "run_codex", "run_codex_app_server", "run_orchestrator", "run_plan",
     "run_mission_orchestrator_turn", "run_task_once", "run_parallel_task",
@@ -204,6 +208,7 @@ __all__ = [
     "PreflightBlocked", "PreflightWaitingForUser", "apply_preflight_action",
     "build_plan", "apply_plan", "pause_plan", "resume_plan", "pause_task", "resume_task",
     "replan_mission", "restart_as_new_mission", "mission_config", "answer_consultation",
+    "build_mission_context", "mission_context_data", "render_mission_context",
     "recover_orphaned_runs", "migrate_legacy_orchestrator_state", "rows", "one", "execute", "log", "now", "safe_json",
     "VERSION",
     "STATE_ROOT", "DB", "WORKTREE_ROOT", "MISSION_ROOT", "ATTACHMENT_ROOT", "LEGACY_DB",

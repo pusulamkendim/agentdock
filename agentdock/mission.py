@@ -68,25 +68,26 @@ from .db import (
 from .git_ops import (
     delete_branch,
     git,
+    initialize_git_repository,
     plan_paths,
     prepare_integration,
     remove_worktree,
     repo_info,
-    validate_read_workspace,
-    workspace_fingerprint,
     workspace_snapshot,
 )
 from .orchestrator import (
     orchestrator_log_id,
+    plan_consultations,
     planner_prompt,
     plan_is_paused,
     resolve_worker_consultation,
     resolve_worker_failure,
     run_mission_orchestrator_turn,
+    start_runtime_recovery,
 )
 from .handoffs import same_worker_resume_handoff
 from .integration import integrate_write_result
-from .preflight import PreflightBlocked, PreflightWaitingForUser, run_preflight
+from .preflight import run_preflight  # compatibility export; mission execution no longer calls it
 from .schemas import (
     deterministic_mission_title,
     extract_json,
@@ -136,6 +137,15 @@ def migrate_legacy_orchestrator_state(write_docs=None):
     return migrate_storage_legacy_state(write_docs=write_docs)
 
 
+def visible_pending_question(plan):
+    """Expose a durable question only while the mission is actually waiting."""
+    if plan.get("status") not in ("waiting_for_user", "waiting_for_permission"):
+        return {}
+    if not plan.get("pending_question_id"):
+        return {}
+    return safe_json(plan.get("pending_question_json"), {})
+
+
 def state_payload():
     """Build the dashboard state snapshot used by the HTTP adapter."""
     plans = rows("SELECT * FROM plans ORDER BY created_at DESC LIMIT 100")
@@ -149,7 +159,7 @@ def state_payload():
         plan["evidence"] = safe_json(plan.get("evidence_json"), [])
         plan["questions"] = safe_json(plan.get("questions_json"), [])
         plan["workspace_snapshot"] = safe_json(plan.get("workspace_snapshot_json"), {})
-        plan["pending_question"] = safe_json(plan.get("pending_question_json"), {})
+        plan["pending_question"] = visible_pending_question(plan)
         plan["consultations"] = plan_consultations(plan["id"])
     workspaces = [
         workspace_summary(workspace)
@@ -188,7 +198,7 @@ def live_payload(plan_id):
     plan["evidence"] = safe_json(plan.get("evidence_json"), [])
     plan["questions"] = safe_json(plan.get("questions_json"), [])
     plan["workspace_snapshot"] = safe_json(plan.get("workspace_snapshot_json"), {})
-    plan["pending_question"] = safe_json(plan.get("pending_question_json"), {})
+    plan["pending_question"] = visible_pending_question(plan)
     consultations = plan_consultations(plan_id)
     task_rows = rows(
         """SELECT t.*, a.name AS agent_name, a.role AS agent_role, a.model AS agent_model,
@@ -217,17 +227,18 @@ def live_payload(plan_id):
         "SELECT id,ts,stream,line FROM logs WHERE task_id=? ORDER BY id DESC LIMIT 24",
         (orchestrator_id,),
     )
+    orchestrator_turn_status = plan.get("orchestrator_turn_status") or ""
     orchestrator = {
         "id": orchestrator_id,
         "status": "running"
-        if plan.get("status") in ("planning", "preflight", "running")
-        else plan.get("status"),
+        if orchestrator_turn_status in ("queued", "running")
+        else ("idle" if plan.get("status") in ("planning", "preflight", "running") else plan.get("status")),
         "model": plan.get("orchestrator_used") or plan.get("orchestrator_model"),
         "reasoning_effort": plan.get("orchestrator_effort"),
         "service_tier": plan.get("orchestrator_tier"),
         "thread_id": plan.get("orchestrator_thread_id") or "",
         "generation": int(plan.get("orchestrator_generation") or 1),
-        "turn_status": plan.get("orchestrator_turn_status") or "",
+        "turn_status": orchestrator_turn_status,
         "last_turn_id": plan.get("orchestrator_last_turn_id") or "",
         "last_error": plan.get("orchestrator_last_error") or "",
         "legacy_state": plan.get("legacy_orchestrator_status") or "",
@@ -443,7 +454,7 @@ def start_plan(plan_id):
     plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
     if not plan:
         raise ValueError("Mission bulunamadı")
-    if plan.get("status") not in ("approved", "attention", "waiting_for_user"):
+    if plan.get("status") not in ("approved", "attention", "waiting_for_user", "waiting_for_permission"):
         raise ValueError("Planı önce review edip onayla.")
     if not claim_plan_run(plan_id):
         return {"ok": False, "status": "busy", "error": "Bu mission için başka bir işlem zaten çalışıyor."}
@@ -630,7 +641,7 @@ def reset_plan_for_retry(plan, preserve_completed=False):
 def ready_tasks(plan_id, pending):
     ready = []
     for seq, task in sorted(pending.items()):
-        if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user", "pausing", "resuming", "integrating"):
+        if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "waiting_for_permission", "attention", "paused_by_user", "pausing", "resuming", "integrating"):
             continue
         deps = json.loads(task.get("depends_json") or "[]")
         if not deps:
@@ -638,7 +649,7 @@ def ready_tasks(plan_id, pending):
             continue
         dep_states = [one("SELECT status FROM tasks WHERE plan_id=? AND seq=?", (plan_id, d)) for d in deps]
         if any(d and d["status"] in ("failed", "blocked", "cancelled") for d in dep_states):
-            execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("blocked", "Dependency failed", now(), task["id"]))
+            execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("attention", "A dependency failed; the mission supervisor must repair or revise this task before it can run.", now(), task["id"]))
             pending.pop(seq, None)
             continue
         if all(d and d["status"] == "done" for d in dep_states):
@@ -707,16 +718,35 @@ Do not invent checks or results.
 
 def apply_integration_to_user_workspace(plan, ctx):
     repo_root = ctx["repo_root"]
-    current = repo_info(plan["workspace"])
-    if not current["is_git"] or current["head"] != ctx["base_commit"]:
-        raise RuntimeError("Ana workspace HEAD plan çalışırken değişti; otomatik apply güvenli olmadığı için yapılmadı.")
-    if current["dirty"]:
-        raise RuntimeError("Ana workspace plan çalışırken değiştirildi; otomatik apply güvenli olmadığı için yapılmadı.")
     patch = git(ctx["integration_dir"], "diff", "--binary", f"{ctx['base_commit']}..HEAD").stdout
     if not patch.strip():
         return False
-    git(repo_root, "apply", "--check", "-", input_text=patch)
-    git(repo_root, "apply", "-", input_text=patch)
+    check = git(repo_root, "apply", "--check", "-", input_text=patch, check=False)
+    if check.returncode == 0:
+        git(repo_root, "apply", "-", input_text=patch)
+        return True
+
+    log(orchestrator_log_id(plan["id"]), "supervisor", "live workspace diverged; supervisor is reconciling the integrated result")
+    turn = run_mission_orchestrator_turn(
+        plan["id"],
+        "failure_recovery",
+        f"""Reconcile the completed mission result into the live workspace.
+
+LIVE WORKSPACE: {plan['workspace']}
+INTEGRATED RESULT: {ctx['integration_workspace']}
+
+The direct patch did not apply cleanly:
+{(check.stderr or check.stdout or 'git apply check failed')[-4000:]}
+
+Inspect both locations and apply the mission's completed changes directly to
+the live workspace. Preserve unrelated current user work. You own all Git,
+untracked-file and in-workspace path decisions for this recovery. Do not ask
+the user about local workspace state. Finish the reconciliation and report
+what you changed.""",
+        mode="write",
+        transient_retries=1,
+    )
+    log(orchestrator_log_id(plan["id"]), "supervisor", "workspace reconciliation completed · " + str(turn.get("text") or "")[-1000:])
     return True
 
 def cleanup_successful_plan(ctx, plan_id):
@@ -774,7 +804,7 @@ def build_plan(plan_id, claimed=False):
         valid_ids = {a["id"] for a in agents}
         disposition = obj["decision"]
         if disposition == "execute":
-            validate_task_graph(items, valid_ids)
+            validate_task_graph(items, valid_ids, workspace=plan["workspace"])
         disposition_label = {
             "already_satisfied": "Already satisfied",
             "answer_only": "Answer only",
@@ -806,16 +836,25 @@ def build_plan(plan_id, claimed=False):
         })
 
         if disposition in NO_TASK_DECISIONS:
-            status = "done" if disposition in ("already_satisfied", "answer_only") else ("waiting_for_user" if disposition == "needs_user_input" else "blocked")
+            status = "done" if disposition in ("already_satisfied", "answer_only") else "waiting_for_permission"
             summary = obj["final_response"] or obj["reason"]
-            error = obj["reason"] if disposition == "blocked" else ""
+            error = ""
             finished = now() if status == "done" else None
+            pending_id = "" if status == "done" else str(uuid.uuid4())
+            pending = {} if status == "done" else {
+                "kind": "permission_request",
+                "id": pending_id,
+                "question": (obj["questions"] or [obj["reason"]])[0],
+                "questions": obj["questions"] or [obj["reason"]],
+                "reason": obj["reason"],
+            }
             execute(
-                "UPDATE plans SET title=?,decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,summary=?,error=?,status=?,orchestrator_used=?,finished_at=? WHERE id=?",
+                "UPDATE plans SET title=?,decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,summary=?,error=?,status=?,orchestrator_used=?,finished_at=?,pending_question_id=?,pending_question_json=? WHERE id=?",
                 (
                     mission_title, disposition, obj["reason"], json.dumps(obj["evidence"], ensure_ascii=False),
                     json.dumps(obj["questions"], ensure_ascii=False), obj["final_response"], summary,
-                    error, status, used_model, finished, plan_id,
+                    error, status, used_model, finished, pending_id,
+                    json.dumps(pending, ensure_ascii=False), plan_id,
                 ),
             )
             log(orchestrator_log_id(plan_id), "supervisor", f"no execution needed · {len(items)} tasks created")
@@ -860,8 +899,10 @@ def build_plan(plan_id, claimed=False):
             execute("UPDATE plans SET status=?,error='',finished_at=NULL WHERE id=?", ("paused", plan_id))
             log(orchestrator_log_id(plan_id), "supervisor", "mission planning paused; no new task graph was created")
         else:
-            execute("UPDATE plans SET status=?, error=? WHERE id=?", ("attention", str(e), plan_id))
+            execute("UPDATE plans SET status=?, error=?,restart_recovery_pending=1 WHERE id=?", ("attention", str(e), plan_id))
             log(orchestrator_log_id(plan_id), "supervisor", f"planning failed: {e}")
+            release_plan_run(plan_id)
+            start_runtime_recovery(plan_id, str(e))
         write_mission_docs(plan_id)
     finally:
         release_plan_run(plan_id)
@@ -885,7 +926,7 @@ def replan_mission(plan_id, mode="reconsider", user_note=""):
     if user_note:
         note += "\nUser note:\n" + str(user_note).strip()[:6000]
     execute(
-        "UPDATE consultations SET status=?,resolved_at=? WHERE plan_id=? AND status IN ('queued','resolving','waiting_for_user')",
+        "UPDATE consultations SET status=?,resolved_at=? WHERE plan_id=? AND status IN ('queued','resolving','waiting_for_user','waiting_for_permission')",
         ("superseded", now(), plan_id),
     )
     execute(
@@ -896,6 +937,12 @@ def replan_mission(plan_id, mode="reconsider", user_note=""):
         "UPDATE plans SET status=?,decision=?,decision_reason=?,evidence_json=?,questions_json=?,final_response=?,summary=?,error=?,replan_note=?,finished_at=NULL,started_at=NULL,apply_status='',apply_error='' WHERE id=?",
         ("planning", "", "", "[]", "[]", "", "", "", note, plan_id),
     )
+    if user_note:
+        log(
+            orchestrator_log_id(plan_id),
+            "manual",
+            "user → orchestrator (update plan): " + str(user_note).strip()[:6000],
+        )
     log(orchestrator_log_id(plan_id), "supervisor", f"new disposition pass requested · {mode}")
     write_mission_docs(plan_id)
     threading.Thread(target=build_plan, args=(plan_id,), daemon=True).start()
@@ -1079,9 +1126,12 @@ def stored_integration_context(plan):
         integration_workspace.relative_to(integration_dir.resolve())
     except ValueError as exc:
         raise RuntimeError("Persisted integration workspace güvenli sınırın dışında.") from exc
+    snapshot = safe_json(plan.get("workspace_snapshot_json"), {})
     return {
         "repo_root": Path(info["root"]),
         "base_commit": plan["base_commit"],
+        "source_head": snapshot.get("execution_source_head") or plan["base_commit"],
+        "baseline_fingerprint": snapshot.get("execution_fingerprint") or {},
         "workspace_rel": integration_workspace.relative_to(integration_dir.resolve()),
         "integration_dir": integration_dir.resolve(),
         "integration_workspace": integration_workspace,
@@ -1103,29 +1153,19 @@ def apply_plan(plan_id):
         plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
         if not plan:
             raise ValueError("Mission bulunamadı")
-        if plan.get("status") != "awaiting_apply":
+        recovering_apply = plan.get("status") == "attention" and plan.get("apply_status") == "failed"
+        if plan.get("status") != "awaiting_apply" and not recovering_apply:
             raise ValueError("Mission apply için hazır değil")
         tasks = rows("SELECT status FROM tasks WHERE plan_id=?", (plan_id,))
         if not tasks or not all(t["status"] == "done" for t in tasks):
             raise ValueError("Tüm task'lar tamamlanmadan apply yapılamaz")
         ctx = stored_integration_context(plan)
-        execute("UPDATE plans SET apply_status=?, apply_error=? WHERE id=?", ("checking", "", plan_id))
-        try:
-            run_preflight(plan, True, phase="apply")
-        except PreflightWaitingForUser as exc:
-            execute("UPDATE plans SET status=?,apply_status=?,apply_error=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", "waiting_for_user", str(exc), str(exc), plan_id))
-            log(orchestrator_log_id(plan_id), "supervisor", "apply paused · waiting for an explicit preflight choice")
-            write_mission_docs(plan_id)
-            return {"ok": False, "waiting_for_user": True, "status": "waiting_for_user", "report": exc.report}
-        except PreflightBlocked as exc:
-            execute("UPDATE plans SET status=?,apply_status=?,apply_error=?,error=?,finished_at=? WHERE id=?", ("blocked", "blocked", str(exc), str(exc), now(), plan_id))
-            log(orchestrator_log_id(plan_id), "supervisor", "apply stopped by a safety preflight blocker")
-            write_mission_docs(plan_id)
-            return {"ok": False, "blocked": True, "status": "blocked", "report": exc.report}
+        execute("UPDATE plans SET apply_status=?, apply_error=?, error=? WHERE id=?", ("checking", "", "", plan_id))
         patch = integration_patch(ctx)
         if not patch.strip():
             execute(
-                "UPDATE plans SET status=?, applied=0, apply_status=?, apply_error=?, finished_at=? WHERE id=?",
+                """UPDATE plans SET status=?, applied=0, apply_status=?, apply_error=?,
+                          pending_question_id='',pending_question_json='{}',finished_at=? WHERE id=?""",
                 ("done", "no_changes", "", now(), plan_id),
             )
             cleanup_successful_plan(ctx, plan_id)
@@ -1134,8 +1174,9 @@ def apply_plan(plan_id):
             return {"ok": True, "applied": False}
         applied = apply_integration_to_user_workspace(plan, ctx)
         execute(
-            "UPDATE plans SET status=?, applied=?, apply_status=?, apply_error=?, finished_at=? WHERE id=?",
-            ("done", 1 if applied else 0, "applied" if applied else "no_changes", "", now(), plan_id),
+            """UPDATE plans SET status=?, applied=?, apply_status=?, apply_error=?, error=?,
+                      pending_question_id='',pending_question_json='{}',finished_at=? WHERE id=?""",
+            ("done", 1 if applied else 0, "applied" if applied else "no_changes", "", "", now(), plan_id),
         )
         cleanup_successful_plan(ctx, plan_id)
         log(orchestrator_log_id(plan_id), "supervisor", "reviewed integration diff applied to user workspace")
@@ -1144,12 +1185,14 @@ def apply_plan(plan_id):
     except Exception as exc:
         message = str(exc)
         execute(
-            "UPDATE plans SET status=?, apply_status=?, apply_error=?, error=?, finished_at=? WHERE id=?",
+            "UPDATE plans SET status=?, apply_status=?, apply_error=?, error=?, finished_at=?,restart_recovery_pending=1 WHERE id=?",
             ("attention", "failed", message, message, now(), plan_id),
         )
         log(orchestrator_log_id(plan_id), "supervisor", f"apply requires attention: {message}")
         write_mission_docs(plan_id)
-        raise
+        release_plan_run(plan_id)
+        start_runtime_recovery(plan_id, message)
+        return {"ok": False, "status": "supervisor_recovering", "message": "Supervisor is resolving the integration issue."}
     finally:
         release_plan_run(plan_id)
 
@@ -1167,7 +1210,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             return
         if int(plan.get("demo_mode") or 0):
             return run_demo_execution(plan_id)
-        if plan.get("status") not in ("approved", "attention", "waiting_for_user"):
+        if plan.get("status") not in ("approved", "attention", "waiting_for_user", "waiting_for_permission"):
             raise ValueError("Planı önce Plan Review ekranından onayla.")
         all_tasks = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
         if not all_tasks:
@@ -1177,8 +1220,8 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             log(orchestrator_log_id(plan_id), "supervisor", "no tasks in mission; execution preflight skipped")
             write_mission_docs(plan_id)
             return
-        if plan.get("status") == "waiting_for_user" and plan.get("pending_question_id"):
-            log(orchestrator_log_id(plan_id), "supervisor", "mission is waiting for a persisted user answer; execution remains paused")
+        if plan.get("status") in ("waiting_for_user", "waiting_for_permission") and plan.get("pending_question_id"):
+            log(orchestrator_log_id(plan_id), "supervisor", "mission is waiting for a persisted permission answer; orchestrator conversation remains active")
             write_mission_docs(plan_id)
             return
         tasks = all_tasks
@@ -1225,34 +1268,20 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
             tasks = rows("SELECT * FROM tasks WHERE plan_id=? ORDER BY seq", (plan_id,))
             has_write = any(t["mode"] == "write" for t in tasks)
-        execute("UPDATE plans SET status=?, error=?, summary=?, applied=?, apply_status=?, apply_error=?, started_at=?, finished_at=NULL WHERE id=?", ("preflight", "", "", 0, "", "", now(), plan_id))
-        log(orchestrator_log_id(plan_id), "supervisor", "mission execution requested; running read-only preflight")
-        try:
-            run_preflight(plan, has_write, phase="execution")
-        except PreflightWaitingForUser as exc:
-            execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", str(exc), plan_id))
-            log(orchestrator_log_id(plan_id), "supervisor", "execution paused · waiting for an explicit preflight choice")
-            write_mission_docs(plan_id)
-            return
-        except PreflightBlocked as exc:
-            execute("UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?", ("blocked", str(exc), now(), plan_id))
-            log(orchestrator_log_id(plan_id), "supervisor", "execution stopped by a safety preflight blocker")
-            write_mission_docs(plan_id)
-            return
-        if plan_is_paused(plan_id):
-            log(orchestrator_log_id(plan_id), "supervisor", "mission pause arrived during preflight; no worker wave was started")
-            write_mission_docs(plan_id)
-            return
-        execute("UPDATE plans SET status=? WHERE id=?", ("running", plan_id))
-        log(orchestrator_log_id(plan_id), "supervisor", "mission execution started")
+        execute("UPDATE plans SET status=?, error=?, summary=?, applied=?, apply_status=?, apply_error=?, started_at=?, finished_at=NULL WHERE id=?", ("running", "", "", 0, "", "", now(), plan_id))
+        log(orchestrator_log_id(plan_id), "supervisor", "mission execution started · workspace and Git operations are owned by the supervisor")
         write_mission_docs(plan_id)
         if has_write:
+            if not repo_info(plan["workspace"]).get("is_git"):
+                initialize_git_repository(plan["workspace"])
+                log(orchestrator_log_id(plan_id), "supervisor", "local Git workspace initialized automatically for worker isolation")
+                plan = one("SELECT * FROM plans WHERE id=?", (plan_id,)) or plan
             checkpoint_exists = bool(
                 plan.get("base_commit")
                 and plan.get("integration_workspace")
                 and Path(str(plan.get("integration_workspace"))).is_dir()
                 and any(
-                    task.get("status") in ("done", "executed", "integrating", "waiting_for_orchestrator", "waiting_for_user")
+                    task.get("status") in ("done", "executed", "integrating", "waiting_for_orchestrator", "waiting_for_user", "waiting_for_permission")
                     for task in tasks
                 )
             )
@@ -1300,12 +1329,12 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     tasks = [one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task for task in tasks]
                     pending = {task["seq"]: task for task in tasks if task.get("status") not in ("done", "executed")}
                     continue
-                if queued_resolution.get("waiting_for_user") or queued_resolution.get("attention") or queued_resolution.get("blocked"):
+                if queued_resolution.get("waiting_for_user") or queued_resolution.get("waiting_for_permission") or queued_resolution.get("attention"):
                     write_mission_docs(plan_id)
                     return
                 waiting = [
                     task for task in pending.values()
-                    if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "paused_by_user", "integrating")
+                    if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "waiting_for_permission", "attention", "paused_by_user", "integrating")
                 ]
                 if waiting:
                     if any(task.get("status") == "paused_by_user" for task in waiting):
@@ -1316,7 +1345,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     break
                 if pending:
                     for task in pending.values():
-                        execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("blocked", "Dependency cycle or missing dependency", now(), task["id"]))
+                        execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("attention", "Dependency cycle or missing dependency; the mission supervisor must revise the task graph.", now(), task["id"]))
                 break
 
             wave = ready[:max_parallel]
@@ -1372,7 +1401,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                         log(orchestrator_log_id(plan_id), "supervisor", "mission pause preserved the active worker consultation")
                         write_mission_docs(plan_id)
                         return
-                    elif resolution.get("waiting_for_user"):
+                    elif resolution.get("waiting_for_user") or resolution.get("waiting_for_permission"):
                         pause_for_user = True
                     elif resolution.get("attention"):
                         pause_for_user = True
@@ -1387,7 +1416,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                         log(orchestrator_log_id(plan_id), "supervisor", "mission pause preserved the active worker consultation")
                         write_mission_docs(plan_id)
                         return
-                    elif resolution.get("waiting_for_user"):
+                    elif resolution.get("waiting_for_user") or resolution.get("waiting_for_permission"):
                         pause_for_user = True
                     elif resolution.get("attention"):
                         pause_for_user = True
@@ -1398,6 +1427,11 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
                     retry = resolve_worker_failure(plan, task, result, ctx)
                     if retry:
                         pending[task["seq"]] = one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+                        continue
+                    current_task = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or {}
+                    if current_task.get("status") == "waiting_for_permission":
+                        pending[task["seq"]] = current_task
+                        pause_for_user = True
                         continue
                 if result["write"]:
                     integrate_write_result(plan, ctx, result)
@@ -1419,10 +1453,10 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
 
         waiting_rows = [
             task for task in task_rows
-            if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user")
+            if task.get("status") in ("waiting_for_orchestrator", "waiting_for_user", "waiting_for_permission")
         ]
         if waiting_rows:
-            has_user_question = any(task.get("status") == "waiting_for_user" for task in waiting_rows)
+            has_user_question = any(task.get("status") in ("waiting_for_user", "waiting_for_permission") for task in waiting_rows)
             summary = (
                 "Independent work completed. One or more workers are waiting for your information."
                 if has_user_question
@@ -1430,7 +1464,7 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             )
             execute(
                 "UPDATE plans SET status=?,summary=?,finished_at=NULL WHERE id=?",
-                ("waiting_for_user" if has_user_question else "running", summary, plan_id),
+                ("waiting_for_permission" if has_user_question else "running", summary, plan_id),
             )
             log(orchestrator_log_id(plan_id), "supervisor", summary)
             write_mission_docs(plan_id)
@@ -1492,32 +1526,34 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             execute("UPDATE plans SET summary=? WHERE id=?", (summary, plan_id))
 
         if all_done and has_write:
-            # Re-check the user's working tree before presenting the integrated patch.
-            try:
-                run_preflight(plan, True, phase="apply")
-            except PreflightWaitingForUser as exc:
-                execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("waiting_for_user", str(exc), plan_id))
-                log(orchestrator_log_id(plan_id), "supervisor", "integration ready but waiting for an explicit workspace choice before apply")
-                write_mission_docs(plan_id)
-                return
-            except PreflightBlocked as exc:
-                execute("UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?", ("blocked", str(exc), now(), plan_id))
-                log(orchestrator_log_id(plan_id), "supervisor", "apply stopped by a safety preflight blocker")
-                write_mission_docs(plan_id)
-                return
             if not integration_patch(ctx).strip():
                 execute("UPDATE plans SET status=?, applied=0, apply_status=?, apply_error=?, finished_at=? WHERE id=?", ("done", "no_changes", "", now(), plan_id))
                 cleanup_successful_plan(ctx, plan_id)
                 log(orchestrator_log_id(plan_id), "supervisor", "mission completed without an integration diff")
             else:
-                end_usage = quota_status(force=True, wait=True)
-                execute("UPDATE plans SET status=?, apply_status=?, apply_error=?, usage_end_json=?, finished_at=? WHERE id=?", ("awaiting_apply", "ready", "", json.dumps(end_usage), now(), plan_id))
-                log(orchestrator_log_id(plan_id), "supervisor", "integration diff ready; waiting for user Apply changes approval")
-                write_mission_docs(plan_id)
-                return
+                applied = apply_integration_to_user_workspace(plan, ctx)
+                execute(
+                    "UPDATE plans SET status=?,applied=?,apply_status=?,apply_error=?,error=?,finished_at=? WHERE id=?",
+                    ("done", 1 if applied else 0, "applied" if applied else "no_changes", "", "", now(), plan_id),
+                )
+                cleanup_successful_plan(ctx, plan_id)
+                log(orchestrator_log_id(plan_id), "supervisor", "integration applied automatically to the live workspace")
 
         end_usage = quota_status(force=True, wait=True)
-        execute("UPDATE plans SET status=?, usage_end_json=?, finished_at=? WHERE id=?", ("done" if all_done else "attention", json.dumps(end_usage), now(), plan_id))
+        execute(
+            """UPDATE plans SET status=?,usage_end_json=?,finished_at=?,
+                      pending_question_id=CASE WHEN ?='done' THEN '' ELSE pending_question_id END,
+                      pending_question_json=CASE WHEN ?='done' THEN '{}' ELSE pending_question_json END
+               WHERE id=?""",
+            (
+                "done" if all_done else "attention",
+                json.dumps(end_usage),
+                now(),
+                "done" if all_done else "attention",
+                "done" if all_done else "attention",
+                plan_id,
+            ),
+        )
         log(orchestrator_log_id(plan_id), "supervisor", "mission finished: " + ("done" if all_done else "attention"))
         write_mission_docs(plan_id)
     except Exception as e:
@@ -1528,9 +1564,11 @@ def run_plan(plan_id, claimed=False, read_only_only=False):
             write_mission_docs(plan_id)
             return
         end_usage = quota_status(force=True, wait=True)
-        execute("UPDATE plans SET status=?, error=?, apply_status=?, apply_error=?, usage_end_json=?, finished_at=? WHERE id=?", ("attention", str(e), "failed" if plan.get("status") == "awaiting_apply" else "", str(e), json.dumps(end_usage), now(), plan_id))
+        execute("UPDATE plans SET status=?, error=?, apply_status=?, apply_error=?, usage_end_json=?, finished_at=?,restart_recovery_pending=1 WHERE id=?", ("attention", str(e), "failed" if plan.get("status") == "awaiting_apply" else "", str(e), json.dumps(end_usage), now(), plan_id))
         log(orchestrator_log_id(plan_id), "supervisor", f"mission attention: {e}")
         write_mission_docs(plan_id)
+        release_plan_run(plan_id)
+        start_runtime_recovery(plan_id, str(e))
     finally:
         release_plan_run(plan_id)
 
@@ -1576,7 +1614,7 @@ def resume_plan(plan_id):
     plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
     if not plan:
         raise ValueError("Mission bulunamadı")
-    if plan.get("status") not in ("paused", "attention", "waiting_for_user"):
+    if plan.get("status") not in ("paused", "attention", "waiting_for_user", "waiting_for_permission"):
         raise ValueError("Bu mission şu anda devam ettirilebilir durumda değil")
     if plan.get("pending_question_id"):
         raise ValueError("Mission önce bekleyen kullanıcı sorusunun cevabını bekliyor")
@@ -1743,7 +1781,7 @@ def resume_task(task_id):
     task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not task:
         raise ValueError("Task bulunamadı")
-    if task.get("status") not in ("paused_by_user", "failed", "attention"):
+    if task.get("status") not in ("paused_by_user", "failed", "attention", "waiting_for_permission"):
         raise ValueError("Bu task devam ettirilebilir durumda değil")
     plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],))
     if plan and plan.get("pending_question_id"):
@@ -1765,7 +1803,7 @@ def resume_task(task_id):
     if plan:
         log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} resume requested on the same worker thread")
         write_mission_docs(plan["id"])
-        if plan.get("status") in ("attention", "waiting_for_user"):
+        if plan.get("status") in ("attention", "waiting_for_user", "waiting_for_permission"):
             execute("UPDATE plans SET status=?,error=?,finished_at=NULL WHERE id=?", ("approved", "", plan["id"]))
         if plan.get("status") not in ("running", "paused", "pausing") and claim_plan_run(plan["id"]):
             threading.Thread(target=run_plan, args=(plan["id"],), kwargs={"claimed": True}, daemon=True).start()

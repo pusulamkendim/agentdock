@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 
 from . import config
 from .db import execute, doctor_log_id, latest_agent_session, one, rows
-from .git_ops import git, repo_info
+from .git_ops import changed_git_paths, git, repo_info
 from .schemas import safe_json
 from .handoffs import format_contract_md
 
@@ -75,7 +75,6 @@ def write_mission_docs(plan_id):
         execute("UPDATE plans SET mission_dir=? WHERE id=?", (str(d), plan_id))
     usage = mission_usage(plan)
     recovery = config.recovery_settings(plan)
-    preflight = safe_json(plan.get("preflight_json"), {})
     evidence = safe_json(plan.get("evidence_json"), [])
     questions = safe_json(plan.get("questions_json"), [])
     snapshot = safe_json(plan.get("workspace_snapshot_json"), {})
@@ -135,14 +134,6 @@ def write_mission_docs(plan_id):
 {json.dumps(pending_question, ensure_ascii=False, indent=2)}
 ```
 
-## Preflight
-
-- Status: `{plan.get('preflight_status') or 'not run'}`
-
-```json
-{json.dumps(preflight, ensure_ascii=False, indent=2)}
-```
-
 ## Usage snapshots
 
 ```json
@@ -182,14 +173,7 @@ def write_mission_docs(plan_id):
 {t.get('output') or t.get('error') or 'Not run yet.'}
 """
         (td / f"TASK-{t['seq']+1:03d}.md").write_text(content)
-    preflight_md = ["# Preflight & Recovery", "", f"Status: `{plan.get('preflight_status') or 'not run'}`", ""]
-    for title, key in (("Checks", "checks"), ("Warnings", "warnings"), ("Repairs", "repairs"), ("Blockers", "blockers"), ("Action options", "action_options")):
-        preflight_md += [f"## {title}", ""]
-        values = preflight.get(key) or []
-        preflight_md += [f"- {x}" for x in values] or ["- None"]
-        preflight_md += [""]
-    preflight_md += ["## Policy", "", "```json", json.dumps(recovery, ensure_ascii=False, indent=2), "```", ""]
-    (d / "PREFLIGHT.md").write_text("\n".join(preflight_md))
+    (d / "PREFLIGHT.md").unlink(missing_ok=True)
     (d / "FINAL.md").write_text(f"# Final Synthesis\n\n{plan.get('summary') or 'Mission has not finished yet.'}\n")
     log_rows = rows("SELECT id,task_id,ts,stream,line FROM logs WHERE task_id IN (?,?) OR task_id IN (SELECT id FROM tasks WHERE plan_id=?) ORDER BY id", (f"orchestrator:{plan_id}", doctor_log_id(plan_id), plan_id))
     with (d / "events.jsonl").open("w") as f:
@@ -279,3 +263,96 @@ def diff_payload(task_id):
     if not task:
         raise KeyError("task not found")
     return {"diff": task_diff(task)}
+
+
+def task_files_payload(task_id):
+    """List previewable files from a task checkpoint without trusting UI events."""
+    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise KeyError("task not found")
+    plan = one("SELECT * FROM plans WHERE id=?", (task["plan_id"],)) or {}
+    paths = set()
+    task_workspace = Path(task.get("workspace") or "").expanduser()
+    if task_workspace.is_dir():
+        try:
+            paths.update(changed_git_paths(task_workspace))
+        except Exception:
+            pass
+    commit_hash = str(task.get("commit_hash") or "").strip()
+    info = repo_info(plan.get("workspace") or "")
+    if commit_hash and info.get("is_git"):
+        result = git(
+            info["root"], "show", "--format=", "--name-only", commit_hash,
+            check=False,
+        )
+        paths.update(line.strip() for line in result.stdout.splitlines() if line.strip())
+    return {
+        "files": [
+            {
+                "path": path,
+                "preview_url": f"/preview.html?plan={task['plan_id']}&task={task_id}&path={path}",
+            }
+            for path in sorted(paths)
+        ]
+    }
+
+
+def _preview_roots(plan, task=None):
+    roots = []
+    for raw in (
+        (task or {}).get("workspace"),
+        plan.get("integration_workspace"),
+        plan.get("workspace"),
+    ):
+        if not raw:
+            continue
+        path = Path(raw).expanduser().resolve()
+        if path.is_dir() and path not in roots:
+            roots.append(path)
+    return roots
+
+
+def file_preview_payload(plan_id, relative_path, task_id=""):
+    """Read one mission-owned file for the in-app preview page."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        raise KeyError("plan not found")
+    task = None
+    if task_id:
+        task = one("SELECT * FROM tasks WHERE id=? AND plan_id=?", (task_id, plan_id))
+        if not task:
+            raise KeyError("task not found")
+    raw = str(relative_path or "").strip()
+    if not raw:
+        raise ValueError("file path is required")
+    roots = _preview_roots(plan, task)
+    target = Path(raw).expanduser()
+    candidates = [target.resolve()] if target.is_absolute() else [(root / target).resolve() for root in roots]
+    selected = None
+    selected_root = None
+    for candidate in candidates:
+        for root in roots:
+            if candidate != root and root in candidate.parents and candidate.is_file():
+                selected, selected_root = candidate, root
+                break
+        if selected:
+            break
+    if not selected:
+        raise KeyError("file is unavailable in this mission checkpoint")
+    size = selected.stat().st_size
+    if size > 8 * 1024 * 1024:
+        raise ValueError("file is too large to preview")
+    mime = mimetypes.guess_type(selected.name)[0] or "application/octet-stream"
+    data = selected.read_bytes()
+    is_text = mime.startswith("text/") or selected.suffix.lower() in {
+        ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".htm",
+        ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".txt",
+        ".sh", ".zsh", ".sql", ".xml", ".svg",
+    }
+    relative = selected.relative_to(selected_root).as_posix()
+    payload = {"path": relative, "name": selected.name, "mime": mime, "size": size}
+    if is_text:
+        payload.update({"kind": "text", "content": data.decode("utf-8", errors="replace")})
+    else:
+        payload.update({"kind": "binary", "content_base64": base64.b64encode(data).decode("ascii")})
+    return payload

@@ -13,6 +13,7 @@ import shlex
 import sys
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -62,6 +63,33 @@ def git_read(cwd, *args, check=True, input_text=None):
     env = os.environ.copy()
     env["GIT_OPTIONAL_LOCKS"] = "0"
     return shell([exe, "-C", str(cwd), *args], input_text=input_text, check=check, env=env)
+
+def initialize_git_repository(workspace, branch="main"):
+    """Initialize a local repository with an empty base commit.
+
+    Existing workspace files are deliberately left untracked.  The empty
+    commit gives AgentDock a stable HEAD from which isolated worktrees can be
+    created without claiming ownership of user files.
+    """
+    root = Path(workspace).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError("Workspace directory does not exist")
+    branch = str(branch or "main").strip() or "main"
+    if git(root, "check-ref-format", "--branch", branch, check=False).returncode != 0:
+        raise ValueError(f"Invalid default Git branch: {branch}")
+
+    probe = git_read(root, "rev-parse", "--show-toplevel", check=False)
+    if probe.returncode != 0:
+        git(root, "init", "-b", branch)
+    head = git_read(root, "rev-parse", "HEAD", check=False)
+    if head.returncode != 0:
+        git(
+            root,
+            "-c", "user.name=AgentDock",
+            "-c", "user.email=agentdock@local",
+            "commit", "--allow-empty", "-m", "Initialize AgentDock workspace",
+        )
+    return workspace_snapshot(root)
 
 def repo_info(workspace):
     workspace = Path(workspace).expanduser().resolve()
@@ -130,8 +158,11 @@ def workspace_snapshot(workspace):
         "captured_at": config.now(),
     }
     if not info.get("is_git"):
-        snapshot["write_safety"]["requires_user_resolution"] = True
-        snapshot["write_safety"]["reason"] = "A write task needs a Git repository for AgentDock isolation."
+        snapshot["write_safety"].update({
+            "isolated_write": "auto_initializable",
+            "requires_user_resolution": False,
+            "reason": "AgentDock can initialize local Git metadata with an empty base, then snapshot visible files without staging them.",
+        })
         return snapshot
 
     root = Path(info["root"])
@@ -154,8 +185,8 @@ def workspace_snapshot(workspace):
         "write_safety": {
             "read_only_inspection": "available",
             "isolated_write": "available",
-            "requires_user_resolution": bool(entries),
-            "reason": "Working tree changes need an explicit user choice before isolated writes." if entries else "Clean base is available for isolated writes.",
+            "requires_user_resolution": False,
+            "reason": "Existing changes will be captured through a temporary index without modifying the user's index." if entries else "Clean base is available for isolated writes.",
         },
     })
     return snapshot
@@ -213,6 +244,20 @@ def _git_patch_hash(repo_root, *args):
     result = git_read(repo_root, "diff", *args, check=False)
     return hashlib.sha256((result.stdout or "").encode("utf-8", errors="replace")).hexdigest()
 
+
+def _is_safe_generated_rel_path(path):
+    """Identify disposable tool/OS artifacts that are not user work."""
+    rel = Path(str(path or ""))
+    if any(part in config.SAFE_GENERATED_DIRS for part in rel.parts):
+        return True
+    name = rel.name
+    return (
+        name in config.SAFE_GENERATED_FILES
+        or name.endswith((".pyc", ".pyo"))
+        or name.startswith(".coverage.")
+    )
+
+
 def workspace_fingerprint(workspace):
     """Capture the workspace state before/after a read worker without requiring a clean tree."""
     resolved = Path(workspace).expanduser().resolve()
@@ -228,6 +273,7 @@ def workspace_fingerprint(workspace):
         entries = [
             entry for entry in git_status_entries(root)
             if not _is_agentdock_state_path(root / entry.get("path", ""))
+            and not _is_safe_generated_rel_path(entry.get("path", ""))
         ]
         manifest = []
         for entry in entries:
@@ -258,14 +304,21 @@ def workspace_fingerprint(workspace):
         for current, dirs, files in os.walk(resolved, followlinks=False):
             dirs[:] = sorted(
                 d for d in dirs
-                if d not in FINGERPRINT_SKIP_DIRS and not _is_agentdock_state_path(Path(current) / d)
+                if d not in FINGERPRINT_SKIP_DIRS
+                and d not in config.SAFE_GENERATED_DIRS
+                and not _is_agentdock_state_path(Path(current) / d)
             )
             files = sorted(files)
             for name in files:
                 if len(manifest) >= FINGERPRINT_MAX_FILES:
                     break
                 path = Path(current) / name
-                if (path.is_symlink() or path.is_file()) and not _is_agentdock_state_path(path):
+                rel_path = path.relative_to(resolved)
+                if (
+                    (path.is_symlink() or path.is_file())
+                    and not _is_agentdock_state_path(path)
+                    and not _is_safe_generated_rel_path(rel_path)
+                ):
                     manifest.append(_path_metadata(resolved, path, budget))
             if len(manifest) >= FINGERPRINT_MAX_FILES:
                 break
@@ -303,8 +356,7 @@ def safe_generated_target(repo_root, rel_path):
     for idx, part in enumerate(parts):
         if part in config.SAFE_GENERATED_DIRS:
             return (root / Path(*parts[: idx + 1])).resolve()
-    name = rel.name
-    if name in config.SAFE_GENERATED_FILES or name.endswith((".pyc", ".pyo")) or name.startswith(".coverage."):
+    if _is_safe_generated_rel_path(rel):
         return (root / rel).resolve()
     return None
 
@@ -380,32 +432,89 @@ def prepare_integration(plan):
     info = repo_info(plan["workspace"])
     if not info["is_git"]:
         raise RuntimeError("Paralel write agent'ları için workspace bir Git repository içinde olmalı.")
-    if info["dirty"]:
-        # The explicit execution preflight choice protects these changes in the
-        # user's checkout. Worker isolation starts from HEAD and never writes
-        # into this dirty checkout; the final apply gate still rechecks it.
-        log(f"orchestrator:{plan['id']}", "supervisor", "working tree is dirty but explicitly accepted; isolated workers start from HEAD")
     repo_root = Path(info["root"])
+    source_head = info["head"]
+    baseline_fingerprint = workspace_fingerprint(plan["workspace"])
+    base_commit = source_head
+    if info["dirty"]:
+        # Capture the exact visible workspace in a temporary index and an
+        # unreferenced commit object. This neither changes the user's index nor
+        # stages/commits their files, but gives every isolated worker the same
+        # complete baseline, including current tracked and untracked work.
+        base_commit = create_workspace_snapshot_commit(repo_root, source_head)
+        log(
+            f"orchestrator:{plan['id']}",
+            "supervisor",
+            "captured the current working tree as an isolated execution baseline; user files and index were not changed",
+        )
     base_dir, integration_dir = plan_paths(plan["id"])
     base_dir.mkdir(parents=True, exist_ok=True)
     branch = f"agentdock/{plan['id']}/integration"
     remove_worktree(repo_root, integration_dir)
     delete_branch(repo_root, branch)
-    git(repo_root, "worktree", "add", "-b", branch, str(integration_dir), info["head"])
+    git(repo_root, "worktree", "add", "-b", branch, str(integration_dir), base_commit)
     work_rel = Path(info["rel"])
     integration_workspace = (integration_dir / work_rel).resolve()
     execute(
-        "UPDATE plans SET base_commit=?, integration_workspace=?, error=? WHERE id=?",
-        (info["head"], str(integration_workspace), "", plan["id"]),
+        "UPDATE plans SET base_commit=?, integration_workspace=?, workspace_snapshot_json=?, error=? WHERE id=?",
+        (
+            base_commit,
+            str(integration_workspace),
+            json.dumps({
+                **workspace_snapshot(plan["workspace"]),
+                "execution_source_head": source_head,
+                "execution_base_commit": base_commit,
+                "execution_fingerprint": baseline_fingerprint,
+            }, ensure_ascii=False),
+            "",
+            plan["id"],
+        ),
     )
     return {
         "repo_root": repo_root,
-        "base_commit": info["head"],
+        "base_commit": base_commit,
+        "source_head": source_head,
+        "baseline_fingerprint": baseline_fingerprint,
         "workspace_rel": work_rel,
         "integration_dir": integration_dir,
         "integration_workspace": integration_workspace,
         "integration_branch": branch,
     }
+
+
+def create_workspace_snapshot_commit(repo_root, source_head):
+    """Create an isolated commit object from the visible worktree.
+
+    A temporary index is used so the user's real index, branch and files are
+    untouched. Ignored files remain ignored; tracked changes and ordinary
+    untracked files are represented in the resulting tree.
+    """
+    root = Path(repo_root).expanduser().resolve()
+    config.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    fd, index_name = tempfile.mkstemp(prefix="agentdock-index-", dir=str(config.STATE_ROOT))
+    os.close(fd)
+    Path(index_name).unlink(missing_ok=True)
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = index_name
+    env.update({
+        "GIT_AUTHOR_NAME": "AgentDock",
+        "GIT_AUTHOR_EMAIL": "agentdock@local",
+        "GIT_COMMITTER_NAME": "AgentDock",
+        "GIT_COMMITTER_EMAIL": "agentdock@local",
+    })
+    exe = shutil.which("git")
+    if not exe:
+        raise RuntimeError("git PATH içinde bulunamadı")
+    try:
+        shell([exe, "-C", str(root), "read-tree", source_head], env=env)
+        shell([exe, "-C", str(root), "add", "-A", "--", "."], env=env)
+        tree = shell([exe, "-C", str(root), "write-tree"], env=env).stdout.strip()
+        return shell(
+            [exe, "-C", str(root), "commit-tree", tree, "-p", source_head, "-m", "AgentDock execution snapshot"],
+            env=env,
+        ).stdout.strip()
+    finally:
+        Path(index_name).unlink(missing_ok=True)
 
 def create_worker_worktree(ctx, plan, task, base_commit):
     base_dir, _ = plan_paths(plan["id"])
@@ -465,7 +574,10 @@ def changed_git_paths(repo_root):
         found.update(x for x in result.stdout.split("\0") if x)
     return sorted(found)
 
-def canonical_allowed_pattern(pattern):
+OUTSIDE_WORKSPACE_PATTERN = "__agentdock_outside_workspace__"
+
+
+def canonical_allowed_pattern(pattern, workspace=None):
     """Normalize planner path language before validation or enforcement.
 
     Planner contracts often annotate a path with human guidance, while the
@@ -479,6 +591,25 @@ def canonical_allowed_pattern(pattern):
         previous = value
         value = re.sub(r"\s*\([^)]*\)\s*$", "", value).strip()
         value = re.sub(r"\s+only\s+when\b.*$", "", value, flags=re.I).strip()
+    # Planner output may use an absolute path rooted at the mission workspace,
+    # while worker Git status always reports paths relative to its isolated
+    # worktree. Translate both forms into the same language. An absolute path
+    # without a trusted workspace (or outside it) is never a valid capability.
+    if value.startswith("/"):
+        if not workspace:
+            return OUTSIDE_WORKSPACE_PATTERN
+        # Resolve both sides. On macOS, for example, temporary paths may be
+        # presented as /var/... while Path.resolve() reports /private/var/....
+        # Comparing one resolved side with one lexical side incorrectly turns
+        # a valid in-workspace capability into an outside-workspace sentinel.
+        workspace_path = Path(workspace).expanduser().resolve()
+        candidate_path = Path(value).expanduser().resolve()
+        if candidate_path == workspace_path:
+            value = "**"
+        elif workspace_path in candidate_path.parents:
+            value = candidate_path.relative_to(workspace_path).as_posix()
+        else:
+            return OUTSIDE_WORKSPACE_PATTERN
     value = value.lstrip("./")
     while value.startswith("workspace/"):
         value = value[len("workspace/"):].lstrip("./")
@@ -488,17 +619,17 @@ def canonical_allowed_pattern(pattern):
         return "**"
     return value
 
-def path_matches_allowed(rel_path, pattern):
+def path_matches_allowed(rel_path, pattern, workspace=None):
     rel = str(rel_path).replace("\\", "/").lstrip("./")
-    pat = canonical_allowed_pattern(pattern)
-    if pat == "**":
+    pat = canonical_allowed_pattern(pattern, workspace=workspace)
+    if pat in ("**", OUTSIDE_WORKSPACE_PATTERN):
         return False
     if pat.endswith("/**"):
         prefix = pat[:-3].rstrip("/")
         return rel == prefix or rel.startswith(prefix + "/")
     return rel == pat or fnmatch.fnmatchcase(rel, pat)
 
-def validate_worker_changes(worktree, task):
+def validate_worker_changes(worktree, task, workspace=None):
     try:
         contract = json.loads(task.get("contract_json") or "{}")
     except Exception:
@@ -509,7 +640,10 @@ def validate_worker_changes(worktree, task):
     if isinstance(allowed, str):
         allowed = [allowed]
     changed = changed_git_paths(worktree)
-    violations = [path for path in changed if not any(path_matches_allowed(path, p) for p in allowed)]
+    violations = [
+        path for path in changed
+        if not any(path_matches_allowed(path, pattern, workspace=workspace) for pattern in allowed)
+    ]
     if violations:
         raise RuntimeError(
             "Worker contract dışındaki dosyaları değiştirdi: " + ", ".join(violations[:20])

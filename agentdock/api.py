@@ -8,7 +8,7 @@ decisions live in the domain modules.
 import json
 from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import config
 from .mission import (
@@ -44,8 +44,10 @@ from .tasks import cancel_task, configure_task, open_task_terminal, send_task_fo
 from .timeline import (
     diff_payload,
     events_payload,
+    file_preview_payload,
     logs_payload,
     messages_payload,
+    task_files_payload,
     timeline_for,
 )
 class Handler(SimpleHTTPRequestHandler):
@@ -66,7 +68,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # Browser polling/navigation may close a request after the payload
+            # was prepared. That is a normal client disconnect, not a server
+            # failure worth printing as an exception traceback.
+            return
 
     def body(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -102,6 +110,23 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": str(exc.args[0])}, 404)
             except Exception as exc:
                 return self.send_json({"error": str(exc)}, 409)
+        if path.startswith("/api/task-files/"):
+            try:
+                return self.send_json(task_files_payload(path.rsplit("/", 1)[-1]))
+            except KeyError as exc:
+                return self.send_json({"error": str(exc.args[0])}, 404)
+        if path.startswith("/api/file-preview/"):
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                return self.send_json(file_preview_payload(
+                    path.rsplit("/", 1)[-1],
+                    (query.get("path") or [""])[0],
+                    (query.get("task") or [""])[0],
+                ))
+            except KeyError as exc:
+                return self.send_json({"error": str(exc.args[0])}, 404)
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
         if path.startswith("/api/plan-diff/"):
             try:
                 return self.send_json(plan_diff_payload(path.split("/api/plan-diff/", 1)[1]))
@@ -185,7 +210,7 @@ class Handler(SimpleHTTPRequestHandler):
                 prompt = (data.get("prompt") or "").strip()
                 return self.send_json(
                     start_orchestrator_followup(
-                        path.split("/api/orchestrator-follow-up/", 1)[1], prompt, []
+                        path.split("/api/orchestrator-follow-up/", 1)[1], prompt, data.get("attachments") or []
                     )
                 )
             if path.startswith("/api/task-config/"):

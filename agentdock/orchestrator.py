@@ -39,7 +39,16 @@ from .db import (
     rows,
     save_attachment,
 )
-from .schemas import CONSULTATION_SCHEMA, consultation_schema_path, extract_json, extract_worker_consultation, normalize_consultation_result, safe_json
+from .schemas import (
+    CONSULTATION_SCHEMA,
+    consultation_schema_path,
+    extract_json,
+    extract_worker_consultation,
+    normalize_consultation_result,
+    orchestrator_control_schema_path,
+    safe_json,
+    validate_task_graph,
+)
 from .handoffs import (
     consultation_payload,
     create_worker_consultation,
@@ -47,6 +56,7 @@ from .handoffs import (
     task_dependency_context,
     worker_resume_message,
 )
+from .mission_context import build_mission_context
 from .timeline import write_mission_docs
 
 def orchestrator_log_id(plan_id):
@@ -90,9 +100,14 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
         raise ValueError("Mission bulunamadı")
     lock = _orchestrator_lock(plan_id)
     turn_record_id = str(uuid.uuid4())
+    mission_context = build_mission_context(plan_id, purpose=purpose)
+    turn_input = str(context or "")[-120000:]
+    effective_context = f"{mission_context}\n\nTURN-SPECIFIC INPUT\n{turn_input}"
     context_payload = {
         "purpose": purpose,
-        "context": str(context or "")[-120000:],
+        "context": effective_context,
+        "mission_context": mission_context,
+        "turn_input": turn_input,
         "expected_output_schema": str(expected_output_schema or ""),
     }
     with lock:
@@ -130,7 +145,7 @@ def run_mission_orchestrator_turn(plan_id, purpose, context, expected_output_sch
             ("running", config.now(), turn_record_id),
         )
         try:
-            prompt = _orchestrator_turn_prompt(purpose, context)
+            prompt = _orchestrator_turn_prompt(purpose, effective_context)
             model = requested_model or plan.get("orchestrator_model") or config.DEFAULT_ORCHESTRATOR
             recovery = config.recovery_settings(plan)
             text, used_model = run_orchestrator(
@@ -241,7 +256,7 @@ GOAL:
 MISSION DISPOSITION FIRST:
 Before creating any worker task, inspect the workspace and decide what this mission actually requires. Creating tasks is optional. A mission that is already satisfied, asks only for an explanation, needs a missing user/product decision, or cannot be performed safely must have zero tasks.
 
-DETERMINISTIC WORKSPACE SNAPSHOT (read-only, captured before this model call):
+CURRENT WORKSPACE CONTEXT (captured before this model call):
 {json.dumps(snapshot, ensure_ascii=False, indent=2)}
 {extra}
 
@@ -292,8 +307,14 @@ Rules:
 - `tasks` may contain 0-12 tasks.
 - Use `already_satisfied` only when evidence proves the requested outcome already holds.
 - Use `answer_only` for a direct explanation/report that does not require a worker.
-- Use `needs_user_input` when a product, scope, priority, credential, or other user decision is missing. Include 1-3 concrete questions and keep tasks empty.
-- Use `blocked` for a safety, authority, permission, or destructive-operation boundary. Never present a blocked mission as complete; keep tasks empty.
+- Make product, architecture, scope and priority decisions yourself when they
+  are reasonably implied by the mission goal and workspace evidence.
+- Use `needs_user_input` only when new authority is required, such as credentials,
+  an external account, publishing, spending, workspace-external access or a
+  destructive operation. Phrase every question as a precise permission request.
+- `blocked` is legacy-only. Prefer `needs_user_input`; the runtime keeps the
+  supervisor conversation active instead of placing the mission in a terminal state.
+- Git state, untracked files, local modifications and a missing local repository are operational details owned by AgentDock and the mission supervisor. They must never produce `needs_user_input` or `blocked`. If files must change, choose `execute`; the runtime prepares isolation and preserves visible workspace content automatically.
 - Use `execute` only when work is actually required, and then include at least one task. A simple change or verification may use exactly one task.
 - If the user explicitly asks to create an execution plan anyway, honor that request with the smallest honest read or write task graph; do not invent changes.
 - Decompose aggressively when independent work can run in parallel.
@@ -305,7 +326,7 @@ Rules:
 - Include integration-aware verification after implementation when appropriate.
 - Include a final independent review task for code-changing goals when it materially improves safety; do not manufacture a second task for a simple change.
 - Every contract must be sufficiently detailed for a smaller worker model to execute without re-planning the task.
-- Give bounded allowed_paths. If an exact file is not yet known, specify a narrow directory/pattern and the exact symbol/behavior to locate.
+- Use allowed_paths to communicate expected task focus, not as a permission boundary. A worker may discover related in-workspace files and the supervisor may broaden scope without asking the user.
 - Acceptance criteria must be testable. Avoid vague requirements such as "make it robust" without defining what robust means here.
 - Workers may make low-level implementation choices only when they preserve the stated interfaces and acceptance criteria.
 - Architecture, scope expansion, product tradeoffs, dependency changes, destructive operations, and ambiguous behavior are reserved for you, the orchestrator.
@@ -355,11 +376,21 @@ OPTIONS REPORTED BY WORKER:
 Return ONLY this JSON shape:
 {json.dumps(CONSULTATION_SCHEMA, ensure_ascii=False, indent=2)}
 
+MISSION AUTHORITY:
+- You may inspect the workspace and use web research without asking the user.
+- You may revise this task's contract and expand allowed_paths anywhere inside
+  the mission workspace when that is necessary for the existing mission goal.
+- Make product, architecture, prioritization and implementation decisions from
+  the mission goal and available evidence; do not stop merely to delegate a
+  decision back to the user.
+- Ask the user only for NEW AUTHORITY: access outside the mission workspace,
+  credentials/accounts, publishing/external side effects, spending, destructive
+  operations, or another capability the mission did not grant.
+
 Choose exactly one action:
 - answer_worker: give a concrete bounded instruction without changing the contract.
 - revise_contract: give a complete revised contract and the worker instruction.
-- ask_user: ask the user for missing product/factual information; do not guess.
-- block_mission: the requested work is unsafe, unauthorized or impossible to decide.
+- request_permission: request only the precise new authority that is missing.
 
 Never create a new task or a new orchestrator thread in this turn.
 """
@@ -398,7 +429,7 @@ def _defer_consultation_for_paused_plan(plan, task, consultation, payload=None):
 def _set_pending_consultation(plan_id, task, consultation, response):
     questions = response.get("questions") or [consultation.get("question") or "Additional information is required."]
     pending = {
-        "kind": "execution_question",
+        "kind": "permission_request",
         "consultation_id": consultation["id"],
         "task_id": task["id"],
         "task_title": task["title"],
@@ -414,16 +445,16 @@ def _set_pending_consultation(plan_id, task, consultation, response):
     execute(
         """UPDATE consultations SET status=?,orchestrator_response_json=?,
            user_questions_json=? WHERE id=?""",
-        ("waiting_for_user", json.dumps(response, ensure_ascii=False), json.dumps(questions, ensure_ascii=False), consultation["id"]),
+        ("waiting_for_permission", json.dumps(response, ensure_ascii=False), json.dumps(questions, ensure_ascii=False), consultation["id"]),
     )
     execute(
         """UPDATE tasks SET status=?,waiting_reason=?,consultation_id=? WHERE id=?""",
-        ("waiting_for_user", pending["question"], consultation["id"], task["id"]),
+        ("waiting_for_permission", pending["question"], consultation["id"], task["id"]),
     )
     execute(
         """UPDATE plans SET status=?,pending_question_id=?,pending_question_json=?,
            error=?,finished_at=NULL WHERE id=?""",
-        ("waiting_for_user", consultation["id"], json.dumps(pending, ensure_ascii=False), response.get("reason") or "", plan_id),
+        ("waiting_for_permission", consultation["id"], json.dumps(pending, ensure_ascii=False), response.get("reason") or "", plan_id),
     )
     return pending
 
@@ -518,32 +549,16 @@ def resolve_worker_consultation(plan, task, result=None, ctx=None, user_answer=N
                 "worker_message": response["worker_message"],
                 "task": one("SELECT * FROM tasks WHERE id=?", (fresh["id"],)),
             }
-        if response["action"] == "ask_user":
+        if response["action"] == "request_permission":
             pending = _set_pending_consultation(plan["id"], fresh, payload, response)
             pending["orchestrator_thread_id"] = response["orchestrator_thread_id"]
             execute(
                 "UPDATE plans SET pending_question_json=? WHERE id=?",
                 (json.dumps(pending, ensure_ascii=False), plan["id"]),
             )
-            log(orchestrator_log_id(plan["id"]), "supervisor", "mission paused · worker requires user information")
+            log(orchestrator_log_id(plan["id"]), "supervisor", "permission requested · orchestrator remains available in the mission conversation")
             write_mission_docs(plan["id"])
-            return {"ok": False, "waiting_for_user": True, "pending": pending}
-        reason = response["reason"] or "Orchestrator blocked the mission."
-        execute(
-            "UPDATE consultations SET status=?,resolved_at=? WHERE id=?",
-            ("blocked", config.now(), consultation["id"]),
-        )
-        execute(
-            "UPDATE tasks SET status=?,error=?,waiting_reason=? WHERE id=?",
-            ("blocked", reason, "", fresh["id"]),
-        )
-        execute(
-            "UPDATE plans SET status=?,error=?,finished_at=? WHERE id=?",
-            ("blocked", reason, config.now(), plan["id"]),
-        )
-        log(orchestrator_log_id(plan["id"]), "supervisor", f"mission blocked by orchestrator decision · {reason}")
-        write_mission_docs(plan["id"])
-        return {"ok": False, "blocked": True, "error": reason}
+            return {"ok": False, "waiting_for_permission": True, "pending": pending}
     except Exception as exc:
         message = f"Worker consultation could not be resolved: {exc}"
         if plan_is_paused(plan["id"]):
@@ -613,7 +628,7 @@ def resolve_worker_escalation(plan, task, result, workspace, ctx=None):
             return True
         return False
     except Exception as e:
-        execute("UPDATE tasks SET status=?, error=?, escalation_count=? WHERE id=?", ("blocked", f"Orchestrator escalation resolution failed: {e}", count + 1, task["id"]))
+        execute("UPDATE tasks SET status=?, error=?, escalation_count=? WHERE id=?", ("attention", f"Orchestrator escalation resolution failed: {e}", count + 1, task["id"]))
         log(orchestrator_log_id(plan["id"]), "supervisor", f"escalation resolution failed: {e}")
         write_mission_docs(plan["id"])
         return False
@@ -637,24 +652,29 @@ WORKER FAILURE:
 DEPENDENCY RESULTS:
 {task_dependency_context(task) or 'None.'}
 
-Diagnose only whether the worker can succeed with a more explicit version of the SAME task contract.
-Return ONLY the consultation JSON object with action `revise_contract` or `block_mission`.
+Diagnose whether the worker can succeed with a more explicit version of the SAME task contract.
+Return ONLY the consultation JSON object with action `revise_contract` or `request_permission`.
 For revise_contract, include the COMPLETE revised contract in `revised_contract` and
-a concrete `worker_message`. For block_mission, explain why automatic recovery is unsafe.
+a concrete `worker_message`. For request_permission, ask only for the precise new authority needed.
 
 Rules:
-- Do not broaden scope, change product behavior, add dependencies, alter public APIs, or make destructive changes.
+- You own product, architecture and scope decisions inside the existing mission goal.
+- You may expand allowed_paths to any bounded path inside the mission workspace without asking the user.
+- Web research and read access inside the workspace are already authorized.
+- Do not add dependencies, alter public APIs, or make destructive changes unless the mission explicitly requires them.
 - A revised contract must be complete and more concrete: exact steps, paths, acceptance criteria and verification.
 - Preserve the original task objective unless the failure proves it impossible.
-- If a user/product/architecture decision is required, stop rather than guessing.
+- Request permission only for workspace-external access, credentials/accounts,
+  publishing/external side effects, spending, destructive operations, or a real
+  expansion beyond the user's mission authority.
 """
 
 def resolve_worker_failure(plan, task, result, ctx=None):
-    if result.get("phase") != "worker" or result.get("blocked"):
+    if result.get("paused") or result.get("cancelled"):
         return False
     fresh = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
     count = int(fresh.get("repair_count") or 0)
-    if count >= 1:
+    if count >= 3:
         return False
     worker_thread_id = str(fresh.get("worker_thread_id") or (latest_agent_session(fresh["id"]) or {}).get("thread_id") or "").strip()
     if fresh.get("worker_resume_message") and not worker_thread_id:
@@ -666,7 +686,7 @@ def resolve_worker_failure(plan, task, result, ctx=None):
     # Preserve the worker checkout and thread while the orchestrator diagnoses
     # a bounded failure. If the contract is revised, run_parallel_task will
     # reuse this task's worktree and resume the same Codex conversation.
-    log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} failed; root orchestrator is diagnosing one bounded recovery attempt")
+    log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} stopped; root orchestrator is diagnosing and repairing the issue")
     execute("UPDATE plans SET recovery_count=recovery_count+1 WHERE id=?", (plan["id"],))
     try:
         turn = run_mission_orchestrator_turn(
@@ -681,8 +701,23 @@ def resolve_worker_failure(plan, task, result, ctx=None):
         used = turn.get("model") or plan.get("orchestrator_used") or plan["orchestrator_model"]
         if obj.get("action") in ("revise_contract", "answer_worker") and isinstance(obj.get("revised_contract"), dict) and obj.get("revised_contract"):
             contract = obj["revised_contract"]
+            # A revised contract is still constrained to the mission
+            # workspace. The orchestrator may broaden a worker's local
+            # capability, but cannot manufacture authority outside it.
+            from .schemas import validate_task_graph
+            validate_task_graph(
+                [{
+                    "title": fresh["title"],
+                    "agent_id": fresh["agent_id"],
+                    "mode": fresh["mode"],
+                    "depends_on": [],
+                    "contract": contract,
+                }],
+                {fresh["agent_id"]},
+                workspace=plan["workspace"],
+            )
             execute(
-                "UPDATE tasks SET contract_json=?, instructions=?, status='pending', error='', output='', started_at=NULL, finished_at=NULL, repair_count=?, worker_thread_id=?, worker_resume_message=? WHERE id=?",
+                "UPDATE tasks SET contract_json=?, instructions=?, status='pending', error='', started_at=NULL, finished_at=NULL, repair_count=?, worker_thread_id=?, worker_resume_message=? WHERE id=?",
                 (
                     json.dumps(contract, ensure_ascii=False),
                     contract.get("objective") or fresh.get("instructions") or "",
@@ -695,9 +730,42 @@ def resolve_worker_failure(plan, task, result, ctx=None):
             log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} recovery contract revised by {used}; worker will retry once")
             write_mission_docs(plan["id"])
             return True
-        reason = obj.get("reason") or "Orchestrator found no safe automatic recovery."
-        execute("UPDATE tasks SET repair_count=?, error=? WHERE id=?", (count + 1, reason, task["id"]))
-        log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} automatic recovery stopped: {reason}")
+        reason = obj.get("reason") or "Additional authority is required."
+        questions = obj.get("questions") or [reason]
+        consultation_id = str(uuid.uuid4())
+        execute(
+            """INSERT INTO consultations(
+                id,plan_id,task_id,status,question,reason,evidence_json,options_json,
+                orchestrator_response_json,user_questions_json,worker_thread_id,
+                orchestrator_thread_id,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                consultation_id, plan["id"], fresh["id"], "waiting_for_permission",
+                questions[0], reason, json.dumps(obj.get("evidence") or [], ensure_ascii=False),
+                "[]", json.dumps(obj, ensure_ascii=False), json.dumps(questions, ensure_ascii=False),
+                worker_thread_id, turn.get("thread_id") or "", config.now(),
+            ),
+        )
+        pending = {
+            "kind": "permission_request",
+            "consultation_id": consultation_id,
+            "task_id": fresh["id"],
+            "task_title": fresh["title"],
+            "question": questions[0],
+            "questions": questions,
+            "reason": reason,
+            "evidence": obj.get("evidence") or [],
+            "options": [],
+        }
+        execute(
+            "UPDATE tasks SET status=?,repair_count=?,error='',waiting_reason=?,consultation_id=?,finished_at=NULL WHERE id=?",
+            ("waiting_for_permission", count + 1, questions[0], consultation_id, fresh["id"]),
+        )
+        execute(
+            "UPDATE plans SET status=?,error='',pending_question_id=?,pending_question_json=?,finished_at=NULL WHERE id=?",
+            ("waiting_for_permission", consultation_id, json.dumps(pending, ensure_ascii=False), plan["id"]),
+        )
+        log(orchestrator_log_id(plan["id"]), "supervisor", f"TASK-{task['seq']+1:03d} needs additional permission; orchestrator remains available")
         write_mission_docs(plan["id"])
         return False
     except Exception as e:
@@ -738,6 +806,161 @@ def plan_consultations(plan_id):
         item["user_answer"] = safe_json(item.get("user_answer_json"), {})
     return result
 
+def orchestrator_control_prompt(plan, prompt):
+    return f"""You are the active root supervisor for this mission. The user is
+talking to you naturally, like a terminal-based coding agent. Diagnose current
+mission state before answering and take the most useful authorized action.
+
+USER MESSAGE:
+{prompt}
+
+AUTHORITY YOU ALREADY HAVE:
+- Read the mission workspace and use web research.
+- Make product, architecture, prioritization and implementation decisions that
+  are reasonably implied by the existing mission goal.
+- Expand a worker contract to any bounded path INSIDE the mission workspace.
+- Resume the same mission or worker conversation after repairing its contract.
+- Update an unstarted Plan Review graph when the user changes the requested
+  deliverable; use `update_plan` and put the exact instruction in
+  `plan_update_instruction`.
+- Initialize local Git metadata with an empty base commit when isolated writes
+  need it; never stage existing files as part of that initialization.
+
+ASK FOR PERMISSION ONLY FOR:
+- Access outside the mission workspace.
+- Credentials, account connections or secret material.
+- Publishing, deployment, purchases or other external side effects.
+- Destructive operations or an actual expansion beyond the mission goal.
+
+Never answer with a passive suggestion when one of the authorized actions can
+solve the current issue. Never create a second orchestrator conversation.
+For revise_task_contract, return the COMPLETE revised contract and the exact
+persisted task id from mission context. For all other actions return an empty
+revised_contract object. Use update_plan only while the mission is planned,
+approved, paused, waiting for permission or needs attention; do not replace a
+running graph. `message` is the natural user-facing response.
+"""
+
+
+def _resolve_control_task(plan_id, task_id):
+    raw = str(task_id or "").strip()
+    if not raw:
+        return None
+    task = one("SELECT * FROM tasks WHERE id=? AND plan_id=?", (raw, plan_id))
+    if task:
+        return task
+    match = re.fullmatch(r"TASK[- ]?0*(\d+)", raw, re.I)
+    if match:
+        return one(
+            "SELECT * FROM tasks WHERE plan_id=? AND seq=?",
+            (plan_id, int(match.group(1)) - 1),
+        )
+    return None
+
+
+def _start_controlled_resume(plan_id):
+    if not claim_plan_run(plan_id):
+        log(orchestrator_log_id(plan_id), "supervisor", "mission runner is already active; control update will be picked up by the current run")
+        return False
+    from .mission import run_plan
+    threading.Thread(
+        target=run_plan,
+        args=(plan_id,),
+        kwargs={"claimed": True},
+        daemon=True,
+    ).start()
+    return True
+
+
+def apply_orchestrator_control(plan, decision):
+    """Apply one authorized decision from the persistent supervisor thread."""
+    action = str(decision.get("action") or "reply")
+    message = str(decision.get("message") or "").strip()
+    task = _resolve_control_task(plan["id"], decision.get("task_id"))
+    outcome = {"action": action, "message": message}
+
+    if action == "revise_task_contract":
+        if not task:
+            raise ValueError("Orchestrator contract revision did not identify a valid mission task")
+        contract = decision.get("revised_contract")
+        validate_task_graph(
+            [{
+                "title": task["title"], "agent_id": task["agent_id"],
+                "mode": task["mode"], "depends_on": [], "contract": contract,
+            }],
+            {task["agent_id"]},
+            workspace=plan["workspace"],
+        )
+        resume_note = message or "The root orchestrator revised the task contract. Continue from the existing checkpoint."
+        execute(
+            """UPDATE tasks SET contract_json=?,instructions=?,status='resuming',
+               error='',waiting_reason='',consultation_id='',finished_at=NULL,
+               worker_resume_message=? WHERE id=?""",
+            (
+                json.dumps(contract, ensure_ascii=False),
+                contract.get("objective") or task.get("instructions") or task["title"],
+                same_worker_resume_handoff(task, resume_note),
+                task["id"],
+            ),
+        )
+        execute(
+            "UPDATE consultations SET status='resolved',resolved_at=? WHERE id=? AND status IN ('queued','resolving','waiting_for_user','waiting_for_permission','failed')",
+            (config.now(), task.get("consultation_id") or ""),
+        )
+        execute(
+            "UPDATE plans SET status='approved',error='',pending_question_id='',pending_question_json='{}',finished_at=NULL WHERE id=?",
+            (plan["id"],),
+        )
+        outcome["resuming"] = _start_controlled_resume(plan["id"])
+        outcome["task_id"] = task["id"]
+    elif action == "resume_task":
+        if not task:
+            raise ValueError("Orchestrator resume did not identify a valid mission task")
+        from .mission import resume_task
+        outcome.update(resume_task(task["id"]))
+    elif action == "resume_mission":
+        from .mission import resume_plan
+        outcome.update(resume_plan(plan["id"]))
+    elif action == "update_plan":
+        if plan.get("status") in ("planning", "preflight", "running", "integrating", "resuming", "pausing"):
+            raise ValueError("A running mission graph cannot be replaced; revise the affected task contract or pause the mission first")
+        instruction = str(decision.get("plan_update_instruction") or message).strip()
+        if not instruction:
+            raise ValueError("Orchestrator plan update did not include an instruction")
+        from .mission import replan_mission
+        outcome.update(replan_mission(plan["id"], mode="reconsider", user_note=instruction))
+    elif action == "initialize_git":
+        from .git_ops import initialize_git_repository
+        snapshot = initialize_git_repository(plan["workspace"], "main")
+        execute(
+            "UPDATE plans SET workspace_snapshot_json=?,status='approved',error='',finished_at=NULL WHERE id=?",
+            (json.dumps(snapshot, ensure_ascii=False), plan["id"]),
+        )
+        record_control_event(plan["id"], "agentdock.workspace_initialized", {
+            "repo_root": snapshot.get("repo_root"), "branch": snapshot.get("branch"),
+            "head": snapshot.get("head"), "automatic": True,
+        })
+        outcome["resuming"] = _start_controlled_resume(plan["id"])
+    elif action == "request_permission":
+        question = str(decision.get("permission_question") or message or "Additional permission is required.").strip()
+        request_id = str(uuid.uuid4())
+        pending = {
+            "kind": "permission_request", "id": request_id,
+            "question": question, "reason": message, "task_id": task["id"] if task else "",
+        }
+        execute(
+            "UPDATE plans SET status='waiting_for_permission',pending_question_id=?,pending_question_json=?,error='',finished_at=NULL WHERE id=?",
+            (request_id, json.dumps(pending, ensure_ascii=False), plan["id"]),
+        )
+        outcome["permission_required"] = True
+
+    record_control_event(plan["id"], "agentdock.orchestrator_control", outcome, task_id=(task or {}).get("id", ""))
+    if message:
+        log(orchestrator_log_id(plan["id"]), "supervisor", message)
+    write_mission_docs(plan["id"])
+    return outcome
+
+
 def run_orchestrator_followup(plan_id, prompt, image_paths=None):
     plan=one("SELECT * FROM plans WHERE id=?", (plan_id,))
     if not plan:
@@ -752,7 +975,8 @@ def run_orchestrator_followup(plan_id, prompt, image_paths=None):
     turn = run_mission_orchestrator_turn(
         plan_id,
         "manual_message",
-        prompt,
+        orchestrator_control_prompt(plan, prompt),
+        expected_output_schema=orchestrator_control_schema_path(),
         mode="read",
         images=image_paths or [],
         # This is a new orchestrator turn, so use the current mission setting.
@@ -761,20 +985,86 @@ def run_orchestrator_followup(plan_id, prompt, image_paths=None):
         requested_model=plan.get("orchestrator_model"),
         transient_retries=1 if config.recovery_settings(plan).get("auto_retry_transient") else 0,
     )
+    decision = extract_json(turn["text"])
+    outcome = apply_orchestrator_control(
+        one("SELECT * FROM plans WHERE id=?", (plan_id,)) or plan,
+        decision,
+    )
     log(
         orchestrator_log_id(plan_id),
         "manual",
         "orchestrator answered the conversation message on the same mission thread",
     )
+    return outcome
 
 
-def start_orchestrator_followup(plan_id, prompt, image_paths=None):
+def run_runtime_recovery(plan_id, error):
+    """Ask the persistent supervisor to diagnose and recover a mission fault."""
+    plan = one("SELECT * FROM plans WHERE id=?", (plan_id,))
+    if not plan:
+        return {"ok": False, "error": "Mission bulunamadı"}
+    instruction = f"""A mission runtime operation encountered this issue:
+
+{str(error)[-8000:]}
+
+Inspect the live mission, tasks, workspace and Git state. Resolve every
+in-workspace operational detail yourself. Do not request permission for dirty
+files, untracked files, Git setup, branches, merge state, task paths, web
+research, or ordinary file edits required by the existing goal. Choose the
+concrete control action that continues the existing mission and preserves its
+completed checkpoints. Ask the user only if genuinely new external authority
+is required."""
+    turn = run_mission_orchestrator_turn(
+        plan_id,
+        "failure_recovery",
+        orchestrator_control_prompt(plan, instruction),
+        expected_output_schema=orchestrator_control_schema_path(),
+        mode="read",
+        transient_retries=1 if config.recovery_settings(plan).get("auto_retry_transient") else 0,
+    )
+    decision = extract_json(turn["text"])
+    return apply_orchestrator_control(
+        one("SELECT * FROM plans WHERE id=?", (plan_id,)) or plan,
+        decision,
+    )
+
+
+def start_runtime_recovery(plan_id, error):
+    """Keep the supervisor active while a failed mission operation is repaired."""
+    def recover():
+        try:
+            run_runtime_recovery(plan_id, error)
+        except Exception as exc:
+            log(orchestrator_log_id(plan_id), "supervisor", f"supervisor recovery turn could not start: {exc}")
+
+    threading.Thread(
+        target=recover,
+        daemon=True,
+    ).start()
+    return {"ok": True, "status": "supervisor_recovering"}
+
+
+def start_orchestrator_followup(plan_id, prompt, attachments=None):
     """Queue a manual orchestrator conversation turn in the background."""
-    if not str(prompt or "").strip():
-        raise ValueError("Mesaj gerekli")
+    attachments = attachments or []
+    if not str(prompt or "").strip() and not attachments:
+        raise ValueError("Mesaj veya attachment gerekli")
+    if not one("SELECT id FROM plans WHERE id=?", (plan_id,)):
+        raise ValueError("Mission bulunamadı")
+    image_paths = []
+    for item in attachments[:8]:
+        if isinstance(item, dict) and item.get("data_base64"):
+            saved = save_attachment(
+                plan_id,
+                item.get("name") or "image.png",
+                item.get("mime") or "image/png",
+                item["data_base64"],
+                task_id=orchestrator_log_id(plan_id),
+            )
+            image_paths.append(saved["path"])
     threading.Thread(
         target=run_orchestrator_followup,
-        args=(plan_id, prompt, image_paths or []),
+        args=(plan_id, prompt or "Please inspect the attached image(s) and help with the mission.", image_paths),
         daemon=True,
     ).start()
     return {"ok": True}
@@ -785,8 +1075,8 @@ def answer_consultation(plan_id, consultation_id, answer, attachments=None):
     consultation = one("SELECT * FROM consultations WHERE id=? AND plan_id=?", (consultation_id, plan_id))
     if not plan or not consultation:
         raise ValueError("Consultation bulunamadı")
-    if consultation.get("status") != "waiting_for_user":
-        raise ValueError("Bu consultation artık kullanıcı cevabı beklemiyor")
+    if consultation.get("status") not in ("waiting_for_user", "waiting_for_permission"):
+        raise ValueError("Bu permission request artık kullanıcı cevabı beklemiyor")
     answer_text = str(answer or "").strip()
     attachment_paths = [str(x) for x in (attachments or []) if x and Path(str(x)).is_file()]
     if not answer_text and not attachment_paths:
@@ -830,10 +1120,8 @@ def answer_consultation(plan_id, consultation_id, answer, attachments=None):
                 daemon=True,
             ).start()
         return {"ok": True, "status": "approved", "resuming": True}
-    if resolved.get("waiting_for_user"):
-        return {"ok": True, "status": "waiting_for_user", "pending": resolved.get("pending") or {}}
-    if resolved.get("blocked"):
-        return {"ok": False, "status": "blocked", "error": resolved.get("error") or ""}
+    if resolved.get("waiting_for_user") or resolved.get("waiting_for_permission"):
+        return {"ok": True, "status": "waiting_for_permission", "pending": resolved.get("pending") or {}}
     return {"ok": False, "status": "attention", "error": resolved.get("error") or "Consultation could not be resolved."}
 
 

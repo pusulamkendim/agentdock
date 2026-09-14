@@ -91,8 +91,8 @@ without using Codex quota.
 
 - Planner output is requested with a JSON Schema and the available Codex model catalog is detected from the installed CLI.
 - Duplicate mission starts are rejected and missions interrupted by a server restart move to `attention` for an explicit retry.
-- Worker changes are checked against the task contract's `allowed_paths` before they can be integrated.
-- Write missions stop at `awaiting_apply` so you can inspect the final integration diff and click **Apply changes**.
+- Task contracts describe expected file focus; the persistent mission supervisor owns in-workspace scope changes and Git reconciliation.
+- Completed write missions are integrated into the live workspace automatically. Local Git state does not become a user-facing permission gate.
 - SQLite uses WAL/foreign-key enforcement, and the repository includes a standard-library unittest smoke suite.
 
 ## What changed in v0.11
@@ -116,17 +116,17 @@ Orchestrator disposition
 
 The planner contract is strict and bounded to zero through twelve tasks. An execution disposition requires at least one task; all other dispositions require zero tasks. A simple change can therefore be one task, while independent work can still be represented as a parallel graph.
 
-No-task missions never enter execution preflight or create misleading queued worker cards. The mission view shows **No execution needed**, the final response, the evidence, and friendly actions to create a plan anyway, ask the orchestrator to reconsider, or run verification again.
+No-task missions never create misleading queued worker cards. The mission view shows the final response and keeps the supervisor conversation available.
 
 ### Deterministic workspace analysis
 
 Before the planner is called, AgentDock records a read-only workspace snapshot containing Git classification (`NOT_GIT`, `LOCAL_GIT`, or `GIT_WITH_REMOTE`), repository root, branch, HEAD, upstream, remotes, tracked/untracked changes, and write-safety facts. This lets a Git verification mission finish with zero tasks when the repository already satisfies the request.
 
-### Read-only preflight and explicit recovery
+### Supervisor-owned workspace recovery
 
-Preflight reports state but does not delete files, edit `.git/info/exclude`, remove locks, or prune worktree metadata automatically. If a write mission encounters existing user changes, the UI shows the affected paths and asks for an explicit choice: add selected files to Git, ignore them locally, move untracked files to AgentDock's preservation area, continue read-only when valid, or cancel. The chosen scope is shown before the action and no commit is created automatically.
+Mission execution has no user-facing preflight gate. Missing local Git metadata is prepared automatically, existing visible files are captured as an isolated baseline, and dirty/untracked workspace state is reconciled by the persistent supervisor. Only genuinely new authority—such as credentials, workspace-external access, publishing, purchases, or destructive external effects—is requested from the user.
 
-The Activity view renders workspace analysis, disposition, reasoning summaries, task dependencies, commands, file changes, preflight, and user decisions as readable events. Structured planner JSON remains available in **Raw** for diagnostics.
+The Activity view renders workspace analysis, disposition, reasoning summaries, task dependencies, commands, file changes, supervisor recovery, and user decisions as readable events. Structured planner JSON remains available in **Raw** for diagnostics.
 
 ### Optional Codex App Server transport
 
@@ -273,6 +273,6 @@ Open `http://127.0.0.1:8765` if needed.
 12. Open another worker's worktree with **Terminal** (real macOS missions only; demo opens the root workspace).
 13. Run a second demo and press **Stop** on a worker; the mission should end in `attention`, not silently retry it.
 
-## Safety boundaries
+## Supervisor authority
 
-AgentDock never blanket-runs `git clean -fd`, resets tracked user work, edits `.git/info/exclude`, removes Git locks, or deletes unknown files during preflight. Write workers remain isolated in Git worktrees. Unknown product/architecture decisions are escalated rather than guessed.
+Write workers remain isolated in Git worktrees, while the mission supervisor owns in-workspace Git setup, path expansion, integration, and recovery. The user is interrupted only when the mission requires genuinely new external authority.

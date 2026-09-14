@@ -118,7 +118,15 @@ ORCHESTRATOR_PURPOSES = {
     "reconstruct",
 }
 
-ORCHESTRATOR_ACTIONS = {"answer_worker", "revise_contract", "ask_user", "block_mission"}
+ORCHESTRATOR_ACTIONS = {
+    "answer_worker",
+    "revise_contract",
+    "request_permission",
+    # Legacy values remain parseable, but are normalized to a permission
+    # request instead of putting the mission in a terminal blocked state.
+    "ask_user",
+    "block_mission",
+}
 
 CODEX_TRANSPORT = os.environ.get("AGENTDOCK_CODEX_TRANSPORT", "exec").strip().lower()
 

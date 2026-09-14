@@ -23,7 +23,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config
-from .git_ops import canonical_allowed_pattern
 PLANNER_SCHEMA = {
     "type": "object",
     "properties": {
@@ -83,7 +82,7 @@ PLANNER_SCHEMA = {
             },
         }
     },
-    "required": ["decision", "reason", "evidence", "final_response", "questions", "tasks"],
+    "required": ["title", "decision", "reason", "evidence", "final_response", "questions", "tasks"],
     "additionalProperties": False,
 }
 
@@ -92,7 +91,7 @@ CONSULTATION_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["answer_worker", "revise_contract", "ask_user", "block_mission"],
+            "enum": ["answer_worker", "revise_contract", "request_permission", "ask_user", "block_mission"],
         },
         "reason": {"type": "string"},
         "worker_message": {"type": "string"},
@@ -111,9 +110,34 @@ CONSULTATION_SCHEMA = {
 CONSULTATION_SCHEMA["properties"]["revised_contract"] = {
     "anyOf": [
         json.loads(json.dumps(PLANNER_SCHEMA["properties"]["tasks"]["items"]["properties"]["contract"])),
-        {"type": "object", "maxProperties": 0, "additionalProperties": False},
+        {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         {"type": "null"},
     ]
+}
+
+ORCHESTRATOR_CONTROL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": [
+                "reply", "resume_mission", "resume_task",
+                "revise_task_contract", "update_plan", "initialize_git", "request_permission",
+            ],
+        },
+        "message": {"type": "string"},
+        "task_id": {"type": "string"},
+        "revised_contract": {
+            "anyOf": [
+                json.loads(json.dumps(PLANNER_SCHEMA["properties"]["tasks"]["items"]["properties"]["contract"])),
+                {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+            ]
+        },
+        "permission_question": {"type": "string"},
+        "plan_update_instruction": {"type": "string"},
+    },
+    "required": ["action", "message", "task_id", "revised_contract", "permission_question", "plan_update_instruction"],
+    "additionalProperties": False,
 }
 
 TASK_CONTRACT_FIELDS = (
@@ -157,7 +181,7 @@ def _agent_ids(valid_agents):
     return result
 
 
-def _validate_task_contract(contract, index, mode):
+def _validate_task_contract(contract, index, mode, workspace=None):
     if not isinstance(contract, dict):
         raise _planner_task_error(index, "contract must be an object")
     missing = [field for field in TASK_CONTRACT_FIELDS if field not in contract]
@@ -176,13 +200,12 @@ def _validate_task_contract(contract, index, mode):
         values = contract.get(field)
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise _planner_task_error(index, f"contract.{field} must be an array of strings")
-    if mode == "write":
-        normalized_paths = [canonical_allowed_pattern(path) for path in contract["allowed_paths"]]
-        if not normalized_paths or any(path == "**" for path in normalized_paths):
-            raise _planner_task_error(index, "write tasks require bounded allowed_paths")
+    # allowed_paths is planning context, not a runtime capability boundary.
+    # The mission supervisor owns scope changes and may broaden a worker's
+    # workspace access without stopping execution.
 
 
-def validate_task_graph(tasks, valid_agents):
+def validate_task_graph(tasks, valid_agents, workspace=None):
     """Reject unsafe planner graphs instead of silently repairing them.
 
     Planner output is an authority boundary: an invalid task must stop the
@@ -218,7 +241,7 @@ def validate_task_graph(tasks, valid_agents):
             if dependency in seen:
                 raise _planner_task_error(index, f"duplicate dependency: {dependency}")
             seen.add(dependency)
-        _validate_task_contract(task.get("contract"), index, mode)
+        _validate_task_contract(task.get("contract"), index, mode, workspace=workspace)
     return True
 
 def planner_schema_path():
@@ -233,6 +256,15 @@ def consultation_schema_path():
     config.STATE_ROOT.mkdir(parents=True, exist_ok=True)
     path = config.STATE_ROOT / "orchestrator.consultation.schema.json"
     expected = json.dumps(CONSULTATION_SCHEMA, ensure_ascii=False, indent=2) + "\n"
+    if not path.exists() or path.read_text(errors="replace") != expected:
+        path.write_text(expected)
+    return path
+
+
+def orchestrator_control_schema_path():
+    config.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = config.STATE_ROOT / "orchestrator.control.schema.json"
+    expected = json.dumps(ORCHESTRATOR_CONTROL_SCHEMA, ensure_ascii=False, indent=2) + "\n"
     if not path.exists() or path.read_text(errors="replace") != expected:
         path.write_text(expected)
     return path
@@ -393,8 +425,10 @@ def normalize_consultation_result(obj):
         worker_message = reason
     if action == "revise_contract" and not revised:
         raise ValueError("revise_contract requires a complete revised_contract")
-    if action == "ask_user" and not questions:
-        raise ValueError("ask_user requires at least one question")
+    if action in ("ask_user", "block_mission"):
+        action = "request_permission"
+    if action == "request_permission" and not questions:
+        questions = [reason]
     return {
         "action": action,
         "reason": reason,

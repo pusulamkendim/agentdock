@@ -38,9 +38,6 @@ from .db import (
 from .git_ops import (
     commit_worker_changes,
     create_worker_worktree,
-    validate_read_workspace,
-    validate_worker_changes,
-    workspace_fingerprint,
 )
 from .config import is_transient_error
 from .handoffs import create_worker_consultation, safe_json, task_dependency_context
@@ -348,11 +345,11 @@ DEPENDENCY RESULTS:
 
 NON-NEGOTIABLE WORK RULES:
 - Execute only this contract. Do not expand scope or redesign adjacent systems.
-- Stay inside the provided workspace and the contract's allowed_paths.
+- Treat allowed_paths as task focus, not a permission wall. Work anywhere inside the provided mission workspace when the contract outcome requires it.
 - You are one parallel worker. Do not coordinate via Git branches/commits; the harness handles isolation and integration.
 - Do not make architecture, product, scope, prioritization, dependency, or destructive-operation decisions.
 - Low-level implementation choices are allowed only when the contract's decision_policy permits them and all stated interfaces/invariants remain unchanged.
-- If a reserved decision or material ambiguity is required, STOP before guessing and return a single JSON object in this exact shape:
+- If a reserved decision or material ambiguity is required, return a single JSON object in this exact shape so the supervisor can decide and resume this same conversation:
   {{"type":"needs_orchestrator","question":"...","reason":"...","evidence":["..."],"options":["..."]}}
   Do not invent product, architecture, legal, identity, contact or destructive-operation facts.
 - Do not claim a verification passed unless you actually ran or inspected it.
@@ -506,20 +503,13 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
             if (one("SELECT status FROM tasks WHERE id=?", (task["id"],)) or {}).get("status") in ("paused_by_user", "pausing"):
                 return {"task": task, **result, "ok": False, "paused": True, "write": True, "phase": "worker", "wt": str(wt), "branch": branch}
             try:
-                changed = validate_worker_changes(wt, task)
-                log(task["id"], "supervisor", f"contract path check passed · files={len(changed)}")
                 commit_hash = commit_worker_changes(wt, task) or commit_hash
                 execute("UPDATE tasks SET commit_hash=? WHERE id=?", (commit_hash, task["id"]))
             except Exception as e:
-                result = {"ok": False, "phase": "contract", "error": f"Worker değişiklikleri contract kontrolünden geçemedi: {e}"}
+                result = {"ok": False, "phase": "commit", "error": f"Worker checkpoint oluşturulamadı: {e}"}
                 execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", result["error"], config.now(), task["id"]))
         return {"task": task, "ok": result["ok"], "write": True, "phase": "worker", "wt": str(wt), "branch": branch, "commit": commit_hash, **result}
     else:
-        baseline = workspace_fingerprint(ctx["integration_workspace"])
-        execute(
-            "UPDATE tasks SET baseline_fingerprint_json=? WHERE id=?",
-            (json.dumps(baseline, ensure_ascii=False), task["id"]),
-        )
         result = run_task_with_recovery(plan, task, ctx["integration_workspace"], force_mode="read")
         if result.get("paused"):
             return {"task": task, **result, "ok": False, "paused": True, "write": False, "phase": "worker"}
@@ -536,18 +526,19 @@ def run_parallel_task(plan, task, ctx, wave_base_commit):
             else:
                 task = one("SELECT * FROM tasks WHERE id=?", (task["id"],)) or task
         if result.get("ok"):
-            try:
-                after = validate_read_workspace(ctx["integration_workspace"], baseline=baseline)
-                result["fingerprint"] = after
-            except Exception as e:
-                result = {"ok": False, "phase": "contract", "error": str(e)}
-                execute("UPDATE tasks SET status=?, error=?, finished_at=? WHERE id=?", ("failed", str(e), config.now(), task["id"]))
+            # Read workers already run through the read-only Codex transport.
+            # Mission execution does not add a second workspace-fingerprint
+            # gate that can misclassify unrelated OS/tool activity as failure.
+            mark_read_result_done({"task": task, "ok": True})
         return {"task": task, "ok": result.get("ok", False), "write": False, "phase": "worker", **result}
 
 def mark_read_result_done(result):
     task = result["task"]
     if result.get("ok"):
-        execute("UPDATE tasks SET status=?, integration_status=? WHERE id=?", ("done", "read_complete", task["id"]))
+        execute(
+            "UPDATE tasks SET status=?, integration_status=?, finished_at=COALESCE(finished_at,?) WHERE id=?",
+            ("done", "read_complete", config.now(), task["id"]),
+        )
         drain_queued_manual_followups(task["id"])
         return True
     return False

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AgentDock — Mission Control</title>
-  <link rel="stylesheet" href="/styles.css?v=0.13.1">
+  <link rel="stylesheet" href="/styles.css?v=0.13.12">
 </head>
 <body>
 <div class="app-shell">
@@ -152,7 +152,7 @@
               <div class="advanced-panel">
                 <div class="advanced-section">
                   <h4>Runtime recovery</h4>
-                  <p>Workspace preflight is read-only. If a choice is needed, AgentDock shows the affected files and asks before changing anything.</p>
+                  <p>The mission supervisor owns workspace and Git preparation. Only genuinely new external authority is requested from you.</p>
                   <div class="toggle-grid">
                     <label class="toggle"><input id="autoRetryTransient" type="checkbox" checked><span>Retry transient failures</span></label>
                   </div>
@@ -192,9 +192,11 @@
       </div>
 
       <section id="decisionPanel" class="surface decision-panel" hidden></section>
+      <div class="live-section-head supervisor-head"><div><span class="eyebrow">SUPERVISOR</span><h3>Mission orchestrator</h3></div><span class="section-note">Talk naturally; the supervisor diagnoses issues, updates task authority and resumes work.</span></div>
+      <div id="supervisorDock" class="supervisor-dock"></div>
       <section id="planReviewPanel" class="surface plan-review-panel" hidden></section>
 
-      <div class="live-section-head"><div><span class="eyebrow">AGENTS</span><h3>Orchestrator & workers</h3></div><span class="section-note">Classic working state, Codex-style activity, messages and pause controls.</span></div>
+      <div class="live-section-head"><div><span class="eyebrow">WORKERS</span><h3>Task agents</h3></div><span class="section-note">Each task keeps its own resumable Codex conversation.</span></div>
       <div id="liveGrid" class="terminal-grid"><div class="empty-terminal"><span>agentdock@local:~$</span> waiting for mission_</div></div>
 
     </section>
@@ -229,10 +231,21 @@
 
 <dialog id="agentDialog"><form method="dialog" id="agentForm"><div class="dialog-title"><div><div class="eyebrow">WORKER PROFILE</div><h3>Configure agent</h3></div></div><input type="hidden" id="agentId"><label>NAME<input id="agentName" required></label><label>MODEL OVERRIDE <span>(optional)</span><input id="agentModel" placeholder="gpt-5.6-luna"></label><label>REASONING OVERRIDE <span>(optional)</span><select id="agentEffort"><option value="">Inherit mission</option><option value="none">None</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label><label>SPEED OVERRIDE <span>(optional)</span><select id="agentTier"><option value="">Inherit mission</option><option value="default">Standard</option><option value="fast">Fast</option></select></label><label>PERMISSION<select id="agentMode"><option value="read">Read-only</option><option value="write">Workspace write</option></select></label><label>BRIEF<textarea id="agentRole" required></textarea></label><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="saveAgent" value="default" class="primary">Save</button></div></form></dialog>
 
+<dialog id="planUpdateDialog" class="form-dialog plan-update-dialog">
+  <form method="dialog" id="planUpdateForm">
+    <div class="dialog-title"><div><div class="eyebrow">PLAN REVIEW</div><h3>Update execution plan</h3></div><button value="cancel" class="terminal-close">×</button></div>
+    <input type="hidden" id="planUpdateId">
+    <label>CHANGE REQUEST<textarea id="planUpdatePrompt" placeholder="Describe what should change in the task graph…" required></textarea></label>
+    <p class="plan-update-note">The same orchestrator conversation will revise the pending task graph. No worker will start until you approve the updated plan.</p>
+    <div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="submitPlanUpdate" type="button" class="primary">Update plan ↵</button></div>
+  </form>
+</dialog>
+
 <dialog id="taskDialog" class="inspector-dialog">
   <div class="inspector-head"><div><div class="eyebrow">AGENT INSPECTOR</div><h3 id="taskDialogTitle">Task</h3><div id="taskRuntime" class="inspector-runtime"></div></div><div class="inspector-actions"><button id="openTerminalBtn" class="secondary compact">Open Terminal</button><button id="inspectStop" class="secondary compact danger">Pause</button><button id="inspectResume" class="secondary compact">Resume</button><button onclick="document.getElementById('taskDialog').close()" class="terminal-close">×</button></div></div>
-  <div class="inspector-tabs"><button data-tab="activity" class="active">Activity</button><button data-tab="diff">Diff</button><button data-tab="contract">Contract</button><button data-tab="raw">Raw</button></div>
+  <div class="inspector-tabs"><button data-tab="activity" class="active">Activity</button><button data-tab="files">Files</button><button data-tab="diff">Diff</button><button data-tab="contract">Contract</button><button data-tab="raw">Raw</button></div>
   <div id="activityPane" class="inspector-pane active"><button id="activityLatest" class="activity-latest" hidden>↓ New activity</button><div id="activityFeed" class="activity-feed"></div></div>
+  <div id="filesPane" class="inspector-pane"><div id="taskFiles" class="task-files"></div></div>
   <div id="diffPane" class="inspector-pane"><pre id="diffText" class="diff-view"></pre></div>
   <div id="contractPane" class="inspector-pane"><div id="taskContract" class="contract-body"></div></div>
   <div id="rawPane" class="inspector-pane"><pre id="inspectorRaw" class="full-log inspector-raw"></pre></div>
@@ -246,6 +259,6 @@
 <dialog id="logDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span id="logTitle">task.log</span><button onclick="document.getElementById('logDialog').close()" class="terminal-close">×</button></div><pre id="logText" class="full-log"></pre></dialog>
 <dialog id="planDiffDialog" class="log-dialog"><div class="terminal-titlebar dialog-logbar"><div class="window-dots"><i></i><i></i><i></i></div><span>integration.diff</span><button onclick="document.getElementById('planDiffDialog').close()" class="terminal-close">×</button></div><pre id="planDiffText" class="full-log"></pre></dialog>
 
-<script src="/app.js?v=0.13.1"></script>
+<script src="/app.js?v=0.13.12"></script>
 </body>
 </html>

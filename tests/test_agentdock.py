@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import agentdock
-from agentdock import config, integration, mission, orchestrator, tasks
+from agentdock import config, git_ops, integration, mission, orchestrator, preflight, tasks
 
 
 class AgentDockTestCase(unittest.TestCase):
@@ -78,6 +78,22 @@ class AgentDockTestCase(unittest.TestCase):
 
 
 class ContractAndRecoveryTests(AgentDockTestCase):
+    def test_completed_mission_never_exposes_a_stale_permission_request(self):
+        plan = {
+            "status": "done",
+            "pending_question_id": "old-question",
+            "pending_question_json": json.dumps({
+                "kind": "permission_request",
+                "question": "May I continue?",
+            }),
+        }
+        self.assertEqual(mission.visible_pending_question(plan), {})
+        plan["status"] = "waiting_for_permission"
+        self.assertEqual(
+            mission.visible_pending_question(plan)["question"],
+            "May I continue?",
+        )
+
     def test_allowed_path_matching_is_conservative(self):
         self.assertTrue(agentdock.path_matches_allowed("src/app.py", "src/**"))
         self.assertTrue(agentdock.path_matches_allowed("tests/test_app.py", "tests/** only when fixtures require it"))
@@ -99,6 +115,53 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         self.assertEqual(agentdock.canonical_allowed_pattern("./src/** (generated files)"), "src/**")
         self.assertTrue(agentdock.path_matches_allowed("src/app.py", "./src/** (generated files)"))
         self.assertEqual(agentdock.canonical_allowed_pattern("_fixtures/**"), "_fixtures/**")
+
+    def test_absolute_allowed_path_is_relative_to_mission_workspace(self):
+        workspace = self.tmp / "project"
+        workspace.mkdir()
+        target = workspace / "docs" / "report.md"
+        self.assertEqual(
+            agentdock.canonical_allowed_pattern(str(target), workspace=workspace),
+            "docs/report.md",
+        )
+        self.assertTrue(
+            agentdock.path_matches_allowed(
+                "docs/report.md", str(target), workspace=workspace
+            )
+        )
+        self.assertFalse(
+            agentdock.path_matches_allowed(
+                "docs/report.md", str(self.tmp / "other" / "report.md"), workspace=workspace
+            )
+        )
+
+    def test_worker_validation_accepts_absolute_contract_path_in_workspace(self):
+        workspace = self.tmp / "project"
+        workspace.mkdir()
+        task = {
+            "contract_json": json.dumps(
+                {"allowed_paths": [str(workspace / "docs" / "report.md")]}
+            ),
+        }
+        with patch.object(agentdock.git_ops, "changed_git_paths", return_value=["docs/report.md"]):
+            self.assertEqual(
+                agentdock.validate_worker_changes(self.tmp, task, workspace=workspace),
+                ["docs/report.md"],
+            )
+
+    def test_write_contract_paths_are_descriptive_not_permission_boundaries(self):
+        workspace = self.tmp / "project"
+        workspace.mkdir()
+        graph = [{
+            "title": "Write report",
+            "agent_id": "coder",
+            "mode": "write",
+            "depends_on": [],
+            "contract": self.planner_contract(
+                "Write report", [str(self.tmp / "outside" / "report.md")]
+            ),
+        }]
+        self.assertTrue(agentdock.validate_task_graph(graph, {"coder"}, workspace=workspace))
 
     def test_runtime_rejects_annotated_global_write_pattern(self):
         task = {
@@ -184,7 +247,7 @@ class ContractAndRecoveryTests(AgentDockTestCase):
     def test_planner_schema_is_written_and_valid_json(self):
         path = agentdock.planner_schema_path()
         payload = json.loads(path.read_text())
-        self.assertEqual(payload["required"], ["decision", "reason", "evidence", "final_response", "questions", "tasks"])
+        self.assertEqual(payload["required"], ["title", "decision", "reason", "evidence", "final_response", "questions", "tasks"])
         self.assertEqual(payload["properties"]["decision"]["enum"], ["already_satisfied", "answer_only", "needs_user_input", "blocked", "execute"])
         self.assertEqual(payload["properties"]["tasks"]["minItems"], 0)
         self.assertEqual(payload["properties"]["tasks"]["maxItems"], 12)
@@ -193,14 +256,42 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         self.assertEqual(set(contract["required"]), set(contract["properties"]))
         self.assertFalse(contract["properties"]["scope"]["additionalProperties"])
 
+        def assert_strict_objects(schema):
+            if not isinstance(schema, dict):
+                return
+            if schema.get("type") == "object":
+                properties = schema.get("properties", {})
+                self.assertIn("required", schema)
+                self.assertEqual(set(properties), set(schema["required"]))
+                self.assertFalse(schema.get("additionalProperties", True))
+                for child in properties.values():
+                    assert_strict_objects(child)
+            assert_strict_objects(schema.get("items"))
+            for child in schema.get("anyOf", ()):
+                assert_strict_objects(child)
+
+        assert_strict_objects(payload)
+
     def test_consultation_schema_is_strict_and_supports_null_contract(self):
         payload = json.loads(agentdock.consultation_schema_path().read_text())
         self.assertEqual(payload["required"], ["action", "reason", "worker_message", "revised_contract", "questions", "evidence"])
         self.assertFalse(payload["additionalProperties"])
         revised = payload["properties"]["revised_contract"]["anyOf"]
-        self.assertEqual(revised[1], {"type": "object", "maxProperties": 0, "additionalProperties": False})
+        self.assertEqual(
+            revised[1],
+            {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+        )
         self.assertEqual(revised[2], {"type": "null"})
         self.assertFalse(revised[0]["additionalProperties"])
+
+    def test_response_schemas_do_not_use_unsupported_max_properties(self):
+        schemas = (
+            agentdock.schemas.PLANNER_SCHEMA,
+            agentdock.schemas.CONSULTATION_SCHEMA,
+            agentdock.schemas.ORCHESTRATOR_CONTROL_SCHEMA,
+        )
+        for schema in schemas:
+            self.assertNotIn("maxProperties", json.dumps(schema))
 
     def test_planner_disposition_invariants_reject_invalid_task_counts(self):
         with self.assertRaisesRegex(ValueError, "requires at least one task"):
@@ -241,13 +332,6 @@ class ContractAndRecoveryTests(AgentDockTestCase):
             ([task(), task(depends_on=[0, 0])], "duplicate dependency"),
             ([task(mode="append")], "invalid mode"),
             ([task(contract={"objective": "Incomplete"})], "contract is incomplete"),
-            ([task(contract=self.planner_contract("Write without a boundary", []))], "bounded allowed_paths"),
-            ([task(contract=self.planner_contract("Write everywhere", ["**"]))], "bounded allowed_paths"),
-            ([task(contract=self.planner_contract("Write across the workspace", ["workspace/**"]))], "bounded allowed_paths"),
-            ([task(contract=self.planner_contract("Write across the workspace", ["workspace/** (read-only)"]))], "bounded allowed_paths"),
-            ([task(contract=self.planner_contract("Write across the workspace", ["** only when necessary"]))], "bounded allowed_paths"),
-            ([task(contract=self.planner_contract("Write across the workspace", ["./**"]))], "bounded allowed_paths"),
-            ([task(contract=self.planner_contract("Write across the workspace", ["**/"]))], "bounded allowed_paths"),
         ]
         for graph, message in cases:
             with self.subTest(message=message):
@@ -318,6 +402,26 @@ class ContractAndRecoveryTests(AgentDockTestCase):
         with self.assertRaisesRegex(RuntimeError, "değişen alan/dosyalar"):
             agentdock.validate_read_workspace(repo, baseline=baseline)
 
+    def test_safe_generated_file_does_not_invalidate_workspace_fingerprint(self):
+        repo = self.tmp / "safe-generated-fingerprint-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+        (repo / "README.md").write_text("baseline\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"],
+            check=True, capture_output=True, text=True,
+        )
+
+        baseline = agentdock.workspace_fingerprint(repo)
+        (repo / ".DS_Store").write_bytes(b"disposable macOS metadata")
+        after_generated_file = agentdock.workspace_fingerprint(repo)
+        self.assertEqual(agentdock.fingerprint_diff(baseline, after_generated_file), [])
+
+        (repo / "meaningful.txt").write_text("must be detected\n")
+        after_meaningful_file = agentdock.workspace_fingerprint(repo)
+        self.assertIn("meaningful.txt", agentdock.fingerprint_diff(baseline, after_meaningful_file))
+
 
 class OrchestratorCoordinationTests(AgentDockTestCase):
     def _orchestrator_plan(self, plan_id="orchestrator-plan"):
@@ -330,10 +434,12 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
     def test_mission_gateway_reuses_one_orchestrator_thread(self):
         plan = self._orchestrator_plan()
         calls = []
+        prompts = []
 
         def fake_orchestrator(*args, **kwargs):
             resume = kwargs.get("resume_thread_id") or ""
             calls.append(resume)
+            prompts.append(args[0])
             sid = agentdock.create_agent_session(
                 plan["id"], agentdock.orchestrator_log_id(plan["id"]), "orchestrator",
                 "gpt-5.6-sol", "high", "default", "read", self.tmp,
@@ -353,6 +459,64 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
         self.assertEqual(stored["orchestrator_last_turn_id"], "turn-2")
         self.assertEqual(stored["orchestrator_turn_status"], "completed")
         self.assertEqual(agentdock.one("SELECT COUNT(*) c FROM orchestrator_turns WHERE plan_id=?", (plan["id"],))["c"], 2)
+        self.assertIn("MISSION CONTEXT", prompts[0])
+        self.assertIn("TASK GRAPH", prompts[0])
+        self.assertIn("TURN-SPECIFIC INPUT\ncontinue", prompts[1])
+
+    def test_mission_context_builder_includes_graph_delta_consultations_and_integration(self):
+        plan = self._orchestrator_plan("context-plan")
+        agentdock.execute(
+            "UPDATE plans SET decision=?,apply_status=?,integration_workspace=? WHERE id=?",
+            ("execute", "ready", "/tmp/integration", plan["id"]),
+        )
+        agentdock.execute(
+            """INSERT INTO orchestrator_turns(
+                id,plan_id,purpose,status,context_json,created_at,finished_at
+            ) VALUES(?,?,?,?,?,?,?)""",
+            ("checkpoint", plan["id"], "initial_disposition", "completed", "{}", 90, 100),
+        )
+        agentdock.execute(
+            """INSERT INTO tasks(
+                id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,
+                output,finished_at,integration_status,commit_hash
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "new-result", plan["id"], 0, "Implement engine", "Implement", "coder",
+                "write", "[]", "done", "new worker result", 101, "integrated", "abc123",
+            ),
+        )
+        agentdock.execute(
+            """INSERT INTO tasks(
+                id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,
+                output,finished_at,integration_status
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "old-result", plan["id"], 1, "Old research", "Research", "researcher",
+                "read", "[0]", "done", "old worker result", 99, "read_complete",
+            ),
+        )
+        agentdock.execute(
+            """INSERT INTO consultations(
+                id,plan_id,task_id,status,question,reason,evidence_json,options_json,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                "consultation", plan["id"], "new-result", "waiting_for_user",
+                "Which risk limit?", "No limit was supplied.", '["config missing"]',
+                '["1%", "2%"]', 102,
+            ),
+        )
+
+        context = agentdock.build_mission_context(plan["id"], purpose="worker_consultation")
+
+        self.assertIn("MISSION\n", context)
+        self.assertIn("TASK-001", context)
+        self.assertIn("deps:1", context)
+        self.assertIn("new worker result", context)
+        self.assertNotIn("old worker result", context)
+        self.assertIn("Which risk limit?", context)
+        self.assertIn("TASK-001: integrated commit:abc123", context)
+        self.assertIn("apply: ready", context)
+        self.assertIn("untrusted evidence", context)
 
     def test_worker_consultation_resumes_the_same_worker_thread_with_handoff(self):
         plan = self._orchestrator_plan("consult-plan")
@@ -795,7 +959,12 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
                 agentdock.execute("UPDATE tasks SET status=? WHERE id=?", ("done", task_id))
                 self.assertTrue(tasks.drain_queued_manual_followups(task_id))
                 deadline = time.time() + 2
-                while not delivered and time.time() < deadline:
+                while time.time() < deadline:
+                    current = agentdock.one(
+                        "SELECT status FROM task_messages WHERE id=?", (message_id,)
+                    )["status"]
+                    if current == "delivered":
+                        break
                     time.sleep(0.01)
 
             self.assertEqual(delivered, [message_id])
@@ -997,6 +1166,41 @@ class OrchestratorCoordinationTests(AgentDockTestCase):
 
 
 class MissionDispositionTests(AgentDockTestCase):
+    def test_plan_update_preserves_orchestrator_thread_and_replaces_pending_graph(self):
+        plan_id = self.add_plan("revise-plan", status="planned")
+        agentdock.execute(
+            "UPDATE plans SET decision=?,orchestrator_thread_id=? WHERE id=?",
+            ("execute", "same-orchestrator-thread", plan_id),
+        )
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,status) VALUES(?,?,?,?,?,?)",
+            ("old-task", plan_id, 0, "Old task", "Old task", "pending"),
+        )
+
+        with patch.object(mission.threading, "Thread") as thread:
+            result = mission.replan_mission(
+                plan_id,
+                mode="reconsider",
+                user_note="Create a Markdown report and save it in the repository.",
+            )
+
+        self.assertEqual(result["status"], "planning")
+        revised = agentdock.one(
+            "SELECT status,decision,replan_note,orchestrator_thread_id FROM plans WHERE id=?",
+            (plan_id,),
+        )
+        self.assertEqual(revised["status"], "planning")
+        self.assertEqual(revised["decision"], "")
+        self.assertIn("Create a Markdown report", revised["replan_note"])
+        self.assertEqual(revised["orchestrator_thread_id"], "same-orchestrator-thread")
+        self.assertEqual(agentdock.rows("SELECT * FROM tasks WHERE plan_id=?", (plan_id,)), [])
+        message = agentdock.one(
+            "SELECT line FROM logs WHERE task_id=? AND stream='manual' ORDER BY id DESC LIMIT 1",
+            ("orchestrator:" + plan_id,),
+        )
+        self.assertIn("Create a Markdown report", message["line"])
+        thread.assert_called_once()
+
     def test_already_satisfied_creates_no_tasks(self):
         plan = self.build_disposition(
             "already",
@@ -1021,7 +1225,7 @@ class MissionDispositionTests(AgentDockTestCase):
                 plan_id,
                 {"decision": decision, "reason": "A focused reason.", "evidence": ["Read-only inspection completed."], "final_response": response, "questions": questions, "tasks": []},
             )
-            expected_status = "done" if decision == "answer_only" else ("waiting_for_user" if decision == "needs_user_input" else "blocked")
+            expected_status = "done" if decision == "answer_only" else "waiting_for_permission"
             self.assertEqual(plan["status"], expected_status)
             self.assertEqual(agentdock.rows("SELECT * FROM tasks WHERE plan_id=?", (plan_id,)), [])
 
@@ -1107,6 +1311,17 @@ for line in sys.stdin:
 
 
 class TimelineAndRuntimeControlTests(AgentDockTestCase):
+    def test_plan_update_action_belongs_to_plan_review_not_agent_conversation(self):
+        project_root = Path(__file__).resolve().parents[1]
+        app_js = (project_root / "static" / "app.js").read_text()
+        index_html = (project_root / "static" / "index.html").read_text()
+
+        self.assertIn("openPlanUpdate", app_js)
+        self.assertIn('id="planUpdateDialog"', index_html)
+        self.assertNotIn("manualRevise", app_js)
+        self.assertNotIn('id="manualRevise"', index_html)
+        self.assertIn("Initialize Git repository", app_js)
+
     def test_timeline_merges_agent_events_logs_and_user_messages_in_sequence(self):
         plan_id = self.add_plan("timeline-plan", status="attention")
         task_id = "timeline-task"
@@ -1239,6 +1454,139 @@ class TimelineAndRuntimeControlTests(AgentDockTestCase):
 
 
 class ExecutionTests(AgentDockTestCase):
+    def test_verified_read_task_finishes_before_the_rest_of_its_parallel_wave(self):
+        plan_id = self.add_plan("read-wave-plan", status="running")
+        task_id = "read-wave-fast"
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (task_id, plan_id, 0, "Fast read", "Inspect", "researcher", "read", "[]", "pending", "{}"),
+        )
+        plan = agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,))
+        task = agentdock.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+
+        def completed_turn(*args, **kwargs):
+            agentdock.execute(
+                "UPDATE tasks SET status=?,output=?,finished_at=? WHERE id=?",
+                ("executed", "verified result", agentdock.now(), task_id),
+            )
+            return {"ok": True, "output": "verified result"}
+
+        with patch.object(tasks, "run_task_with_recovery", side_effect=completed_turn), patch.object(
+            tasks, "drain_queued_manual_followups"
+        ):
+            result = tasks.run_parallel_task(
+                plan,
+                task,
+                {"integration_workspace": self.tmp, "base_commit": "base"},
+                "base",
+            )
+
+        persisted = agentdock.one("SELECT status,integration_status,finished_at FROM tasks WHERE id=?", (task_id,))
+        self.assertTrue(result["ok"])
+        self.assertEqual(persisted["status"], "done")
+        self.assertEqual(persisted["integration_status"], "read_complete")
+        self.assertIsNotNone(persisted["finished_at"])
+
+    def test_initialize_git_repository_creates_empty_base_without_adding_user_files(self):
+        workspace = self.tmp / "new-workspace"
+        workspace.mkdir()
+        (workspace / "research-notes.md").write_text("keep me untracked\n")
+
+        snapshot = git_ops.initialize_git_repository(workspace)
+
+        self.assertEqual(snapshot["classification"], "LOCAL_GIT")
+        self.assertEqual(snapshot["branch"], "main")
+        self.assertTrue(snapshot["head"])
+        tracked = subprocess.run(
+            ["git", "-C", str(workspace), "ls-files"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(tracked, "")
+        self.assertIn("research-notes.md", snapshot["untracked_files"])
+
+    def test_dirty_workspace_is_snapshotted_without_mutating_user_index(self):
+        workspace = self.tmp / "dirty-snapshot"
+        workspace.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(workspace)], check=True, capture_output=True, text=True)
+        (workspace / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(workspace), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(workspace), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"],
+            check=True, capture_output=True, text=True,
+        )
+        (workspace / "README.md").write_text("visible user edit\n")
+        (workspace / "notes.txt").write_text("visible untracked note\n")
+        subprocess.run(["git", "-C", str(workspace), "add", "README.md"], check=True, capture_output=True, text=True)
+        status_before = subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain=v1"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        index_before = subprocess.run(
+            ["git", "-C", str(workspace), "diff", "--cached", "--binary"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        plan_id = self.add_plan("dirty-snapshot-plan", status="approved")
+        agentdock.execute("UPDATE plans SET workspace=? WHERE id=?", (str(workspace), plan_id))
+        plan = agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,))
+
+        ctx = git_ops.prepare_integration(plan)
+        try:
+            self.assertEqual((ctx["integration_workspace"] / "README.md").read_text(), "visible user edit\n")
+            self.assertEqual((ctx["integration_workspace"] / "notes.txt").read_text(), "visible untracked note\n")
+            self.assertNotEqual(ctx["base_commit"], ctx["source_head"])
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(workspace), "status", "--porcelain=v1"],
+                    check=True, capture_output=True, text=True,
+                ).stdout,
+                status_before,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(workspace), "diff", "--cached", "--binary"],
+                    check=True, capture_output=True, text=True,
+                ).stdout,
+                index_before,
+            )
+        finally:
+            mission.cleanup_successful_plan(ctx, plan_id)
+
+    def test_missing_git_write_preflight_waits_with_initialize_action(self):
+        workspace = self.tmp / "missing-git"
+        workspace.mkdir()
+        plan_id = self.add_plan("missing-git-plan", status="approved")
+        agentdock.execute("UPDATE plans SET workspace=? WHERE id=?", (str(workspace), plan_id))
+        agentdock.execute(
+            "INSERT INTO tasks(id,plan_id,seq,title,instructions,agent_id,mode,depends_json,status,contract_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("missing-git-write", plan_id, 0, "Write docs", "Write docs", "coder", "write", "[]", "pending", "{}"),
+        )
+        real_which = preflight.shutil.which
+        with patch.object(preflight.shutil, "which", side_effect=lambda name: "/usr/bin/codex" if name == "codex" else real_which(name)):
+            report = agentdock.run_preflight(
+                agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)), True
+            )
+
+        self.assertEqual(report["status"], "ready")
+        self.assertTrue(git_ops.repo_info(workspace)["is_git"])
+        self.assertIn("Initialized a local Git repository with an empty base commit", report["repairs"])
+
+    def test_initialize_git_action_replans_same_blocked_mission(self):
+        workspace = self.tmp / "blocked-workspace"
+        workspace.mkdir()
+        plan_id = self.add_plan("blocked-no-git", status="blocked")
+        agentdock.execute(
+            "UPDATE plans SET workspace=?,decision=?,workspace_snapshot_json=? WHERE id=?",
+            (str(workspace), "blocked", json.dumps({"classification": "NOT_GIT"}), plan_id),
+        )
+        with patch.object(mission, "replan_mission", return_value={"ok": True, "status": "planning"}) as replan:
+            result = agentdock.apply_preflight_action(plan_id, "initialize_git")
+
+        self.assertEqual(result["status"], "planning")
+        self.assertTrue(git_ops.repo_info(workspace)["is_git"])
+        replan.assert_called_once()
+        self.assertEqual(replan.call_args.args[:2], (plan_id,))
+        self.assertEqual(replan.call_args.kwargs["mode"], "reconsider")
+
     def test_parallel_write_claims_integration_before_validation(self):
         plan_id = self.add_plan("integration-ownership-before-validation", status="running")
         task_id = "integration-ownership-before-validation-task"
@@ -1269,19 +1617,19 @@ class ExecutionTests(AgentDockTestCase):
             )
             return {"ok": True, "output": "worker result"}
 
-        def validate_during_integration(*args, **kwargs):
+        def commit_during_integration(*args, **kwargs):
             observed_statuses.append(
                 agentdock.one("SELECT status FROM tasks WHERE id=?", (task_id,))["status"]
             )
-            return []
+            return "worker-commit"
 
         with patch.object(
             tasks,
             "create_worker_worktree",
             return_value=(self.tmp / "worker-worktree", self.tmp / "worker-worktree", "worker-branch"),
         ), patch.object(tasks, "run_task_with_recovery", side_effect=finish_worker), patch.object(
-            tasks, "validate_worker_changes", side_effect=validate_during_integration
-        ), patch.object(tasks, "commit_worker_changes", return_value="worker-commit"):
+            tasks, "commit_worker_changes", side_effect=commit_during_integration
+        ):
             result = tasks.run_parallel_task(
                 plan,
                 task,
@@ -1499,13 +1847,14 @@ class ExecutionTests(AgentDockTestCase):
             read_report = agentdock.run_preflight(
                 agentdock.one("SELECT * FROM plans WHERE id=?", (read_plan_id,)), False
             )
-            with self.assertRaises(agentdock.PreflightBlocked):
-                agentdock.run_preflight(
-                    agentdock.one("SELECT * FROM plans WHERE id=?", (write_plan_id,)), True
-                )
+            write_report = agentdock.run_preflight(
+                agentdock.one("SELECT * FROM plans WHERE id=?", (write_plan_id,)), True
+            )
 
         self.assertEqual(read_report["status"], "ready")
         self.assertTrue(any("read-only execution" in item for item in read_report["warnings"]))
+        self.assertEqual(write_report["status"], "ready")
+        self.assertTrue(any("orchestrator will retry" in item for item in write_report["warnings"]))
         self.assertTrue(lock.exists())
 
     def test_blocked_preflight_exposes_safe_actions_without_file_selection(self):
@@ -1515,12 +1864,13 @@ class ExecutionTests(AgentDockTestCase):
             ("missing-codex-task", plan_id, 0, "Inspect", "Inspect", "architect", "read", "[]", "pending", "{}"),
         )
         with patch.object(agentdock.shutil, "which", return_value=None):
-            with self.assertRaises(agentdock.PreflightBlocked) as caught:
+            with self.assertRaises(RuntimeError):
                 agentdock.run_preflight(agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)), False)
-        options = {x["id"]: x for x in caught.exception.report["action_options"]}
-        self.assertIn("verify_again", options)
-        self.assertIn("cancel", options)
-        self.assertTrue(options["continue_read_only"]["disabled"])
+        persisted = json.loads(agentdock.one(
+            "SELECT preflight_json FROM plans WHERE id=?", (plan_id,)
+        )["preflight_json"])
+        self.assertEqual(persisted["status"], "attention")
+        self.assertTrue(any("Codex CLI" in item for item in persisted["blockers"]))
 
     def test_read_only_continuation_keeps_write_tasks_paused(self):
         repo = self.tmp / "mixed-repo"
@@ -1554,7 +1904,7 @@ class ExecutionTests(AgentDockTestCase):
         self.assertEqual(agentdock.one("SELECT status FROM tasks WHERE id=?", ("mixed-write",))["status"], "pending")
         plan = agentdock.one("SELECT status,preflight_status,summary FROM plans WHERE id=?", (plan_id,))
         self.assertEqual(plan["status"], "waiting_for_user")
-        self.assertEqual(plan["preflight_status"], "ready")
+        self.assertEqual(plan["preflight_status"], "")
         self.assertIn("Write tasks remain paused", plan["summary"])
 
     def test_waiting_consultation_does_not_pause_independent_read_task(self):
@@ -1609,11 +1959,13 @@ class ExecutionTests(AgentDockTestCase):
         )
         real_which = agentdock.shutil.which
         with patch.object(agentdock.shutil, "which", side_effect=lambda name: "codex" if name == "codex" else real_which(name)):
-            with self.assertRaises(agentdock.PreflightWaitingForUser):
-                agentdock.run_preflight(agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)), True)
+            report = agentdock.run_preflight(
+                agentdock.one("SELECT * FROM plans WHERE id=?", (plan_id,)), True
+            )
         self.assertEqual(exclude.read_text(), before)
         self.assertEqual((repo / "user-notes.txt").read_text(), "keep me\n")
-        self.assertEqual(agentdock.one("SELECT preflight_status FROM plans WHERE id=?", (plan_id,))["preflight_status"], "waiting_for_user")
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(agentdock.one("SELECT preflight_status FROM plans WHERE id=?", (plan_id,))["preflight_status"], "ready")
 
     def test_read_task_can_run_in_a_non_git_workspace(self):
         plan_id = self.add_plan(status="approved")
@@ -1651,7 +2003,7 @@ class ExecutionTests(AgentDockTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "read result")
 
-    def test_apply_plan_applies_only_the_pending_integration_diff(self):
+    def test_failed_apply_can_be_retried_without_rerunning_completed_tasks(self):
         repo = self.tmp / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
@@ -1684,7 +2036,7 @@ class ExecutionTests(AgentDockTestCase):
 
         agentdock.execute(
             "INSERT INTO plans(id,goal,workspace,planner_engine,status,created_at,base_commit,integration_workspace,apply_status) VALUES(?,?,?,?,?,?,?,?,?)",
-            (plan_id, "apply", str(repo), "test", "awaiting_apply", agentdock.now(), base_commit, str(integration), "ready"),
+            (plan_id, "apply", str(repo), "test", "attention", agentdock.now(), base_commit, str(integration), "failed"),
         )
         agentdock.execute(
             "INSERT INTO tasks(id,plan_id,seq,title,instructions,status) VALUES(?,?,?,?,?,?)",
@@ -1765,12 +2117,13 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output
             (plan_id, "fake mission", str(repo), "fake", "planning", agentdock.now(), "gpt-5.6-sol", "gpt-5.6-luna", 2, "high", "medium", "default", "default", json.dumps(agentdock.RECOVERY_DEFAULTS)),
         )
         try:
-            with patch.object(mission, "quota_status", return_value={"status": "ok", "available": True}):
+            with patch.object(mission, "run_preflight", side_effect=AssertionError("mission execution entered preflight")), patch.object(
+                mission, "quota_status", return_value={"status": "ok", "available": True}
+            ):
                 agentdock.build_plan(plan_id)
                 agentdock.execute("UPDATE plans SET status='approved',approved_at=? WHERE id=?", (agentdock.now(), plan_id))
                 agentdock.run_plan(plan_id)
-            self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "awaiting_apply")
-            agentdock.apply_plan(plan_id)
+            self.assertEqual(agentdock.one("SELECT status FROM plans WHERE id=?", (plan_id,))["status"], "done")
             plan = agentdock.one("SELECT status,applied,apply_status FROM plans WHERE id=?", (plan_id,))
             self.assertEqual(plan["status"], "done")
             self.assertEqual(plan["applied"], 1)
